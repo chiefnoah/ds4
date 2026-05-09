@@ -1,0 +1,34 @@
+ROCm WMMA_I8 prefill + microquant landed (opt-in)
+
+Status: DONE 2026-05-09 (commit 4b9f225).
+
+WMMA_I8 (v_wmma_i32_16x16x16_iu8) Q8_0 prefill kernel + activation
+microquant landed.  Opt-in via DS4_ROCM_WMMA_I8=1 (lossy: int8 acts
+~7-bit mantissa vs fp16 11-bit).
+
+Microbench gains over WMMA_F16 (the now-default prefill path):
+  n_tok=21:  1.60x faster
+  n_tok=64:  3.62x faster
+  n_tok=256: 2.45x faster
+
+End-to-end gain over WMMA_F16:
+  prefill: 38.92 -> 41.40 t/s (+6.4%; +39% vs pre-WMMA 29.71)
+  decode:  unchanged 13.6 t/s
+
+The smaller end-to-end gain reflects that matmul_q8_0 is only one
+slice of prefill -- routed MoE (IQ2/Q2) and attention dominate the
+remaining time.  Larger session prompts (n_tok>=64 chunk-prefill)
+would amortize the WMMA_I8 win more.
+
+Key finding: original codex sdot4 thesis ("1.2-1.5x decode") does NOT
+hold up.  Q8_0 decode is already at 180/188 GiB/s = 96% of DRAM
+ceiling -- bandwidth-bound, not compute-bound.  Sdot4 wouldn't help.
+The activation microquant infrastructure is preserved and could feed
+a future sdot4 *prefill* path if WMMA_I8 ever needs to be
+disaggregated, but the WMMA_I8 path absorbs that win directly.
+
+Next-biggest unrealized lever (per codex roadmap):
+ - WMMA_F16 LDS staging for n_tok=64 weight reuse (1.4x est)
+ - HIP graph capture for decode launch overhead (1.12-1.25x decode)
+ - Routed MoE WMMA path -- needs weight repack since IQ2/Q2 aren't
+   directly WMMA-compatible.  ~3-5 day work.

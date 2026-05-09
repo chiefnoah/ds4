@@ -1,0 +1,53 @@
+ROCm activation microquant + AMDGCN sdot4 for MoE decode
+
+Status: PROPOSED (codex recommendation 2026-05-09, opt-in)
+
+Goal:
+Approximate-but-fast MoE decode by prequantizing activations to int8 per
+32-element block and replacing the IQ2_XXS / Q2_K float dequant inner loops
+with __builtin_amdgcn_sdot4 / sudot4.  Targets the 13.6 -> 25 t/s decode
+gap (1.8x) without expanding resident MoE weight bandwidth.  Lossy --
+opt-in via DS4_ROCM_MOE_DOT4=1.
+
+Why:
+Decode Q8_0 already at ~185 GiB/s (near 188 GiB/s ceiling).  Remaining
+decode gap is likely MoE dequant/VALU overhead, not generic DRAM bandwidth.
+Codex estimated 1.2-1.5x decode speedup if VALU-limited.
+
+File pointers:
+- IQ2_XXS gate/up wave kernel: /home/noah/repos/ds4/ds4_rocm.c:5337
+- Inner table-byte + 8-lane float loop: ds4_rocm.c:5392-5428
+- Q2_K down wave kernel: ds4_rocm.c:5451
+- 2-bit + 16-float loop: ds4_rocm.c:5485-5503
+- gfx11/RDNA3.5 builtins: __builtin_amdgcn_sdot4(a, b, c, clamp),
+  __builtin_amdgcn_sudot4(a_sign, a, b_sign, b, c, clamp).  LLVM lowers
+  to gfx11 v_dot4_i32_iu8.
+
+Next steps:
+1. Add DS4_ROCM_MOE_DOT4=1 env flag (cached in static).
+2. Add per-token activation quantize kernel: input float[in_dim], output
+   int8 xq[in_dim] + float scale[in_dim/32].  Per 32-element block, find
+   max abs, divide to fit int8.
+3. Add ds4_sdot4_i8 / ds4_sudot4_u8s8 helpers guarded for gfx11/gfx1151.
+4. IQ2_XXS dot4 variant: load rocm_iq2xxs_grid[code] as uint64_t, apply
+   sign bits to pack int8 weights, sdot4 against xq, multiply by activation
+   scale and IQ2 block scale.
+5. Q2_K dot4 variant: unpack q2 values to packed uint8, sudot4 against
+   prequantized mid int8.  May need approximation of sumy min correction.
+6. Microbench: add isolated IQ2/Q2 ms/call + GiB/s reporter.
+7. Validate kernel test (with relaxed tolerance under DS4_ROCM_MOE_DOT4=1)
+   then e2e coherent output.
+
+Validation:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test
+- DS4_ROCM_MOE_DOT4=1 ./ds4_rocm_kernel_test
+- DS4_ROCM_MOE_DOT4=1 ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+
+Complexity: ~600 lines.  1-2 days.  Numerical drift biggest risk.
+
+Related:
+- tsk-22 FlashAttention (committed 7771ea3)
+- tsk-24 EM-MoE (committed 6cc6051, disabled)
+- tsk-16/20 HIP graph capture
+- tsk-21 MoE 2-bit wave kernels (committed)

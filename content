@@ -1,0 +1,51 @@
+ROCm Q8_0 decode matvec: wave-per-row kernel for gfx1151
+
+Status
+- Current DS4_ROCM_TIME=1 DS4_ROCM_SYNC_EACH=1 timing says ds4_metal_matmul_q8_0_tensor is 15100 calls / 6054 ms / 0.401 ms per call.
+- Timing is completed-wrapper wall time because ROCM_TIME_SCOPE exits after rocm_launch_done(), and DS4_ROCM_SYNC_EACH=1 makes rocm_launch_done() call hipDeviceSynchronize().
+- Do not treat 6054 / 14693 = 41% as exclusive GPU share: the histogram is inclusive and double-counts nested wrappers such as matmul_q8_0_hc_expand and shared_gate_up_swiglu_q8_0. The per-call matmul number is still actionable.
+- Arithmetic check: in_dim=4096, out_dim=1024, Q8_0 row_bytes=(4096/32)*34=4352, total bytes=1024*4352=4456448 bytes=4.25 MiB. At 75 GiB/s the pure weight-read lower bound is 55 us, so 0.401 ms is about 7.3x over that bound.
+
+Goal
+Replace legacy one-row/block 256-thread Q8_0 matvec with a gfx1151-specific wave-per-row kernel for decode-time n_tok=1 shapes. Preserve numerical correctness (kernel tests pass within tolerance). Keep legacy as fallback for n_tok>1 prefill or odd dims.
+
+Hardware reasoning
+- 40 CUs, wave32, 4 SIMDs per CU, ~75 GiB/s effective bandwidth.
+- Current kernel: blockDim=256 for one row. For in_dim=4096 only 128 of 256 threads do block work; rest enter loop with b>=blocks. Then 8 waves participate in LDS reduction.
+- Use one wave per row, blockDim=ROWS_PER_BLOCK*32, ROWS_PER_BLOCK=8 (256 threads, 8 rows). Wave32 shuffle reduction via existing rocm_wave32_sum(). No __syncthreads, no LDS reduction.
+
+Design
+- Macro-instantiated kernels (no C++ templates):
+  rocm_matmul_q8_0_wave_8_kernel
+  rocm_matmul_q8_0_wave_4_kernel
+- Grid: dim3 block(NROWS*32), dim3 grid(ceil(out_dim/NROWS), n_tok)
+- Thread map:
+  wave = tid >> 5; lane = tid & 31; row = bid.x*NROWS + wave
+  for (b=lane; b<blocks; b+=32) accumulate one Q8_0 block dot
+  sum = rocm_wave32_sum(sum)
+  if (lane==0) write
+- Numerics: per-block dot order j=0..31 unchanged from legacy. Cross-lane reduction order differs — pass kernel tests within tolerance.
+- Dispatcher: use wave kernel when n_tok==1 and (in_dim & 31)==0. NROWS=8 for out_dim>=1024, NROWS=4 for smaller (e.g. 576). Keep legacy for n_tok>1.
+
+Pitfalls
+- Q8_0 block is 34 bytes, qs offset 2 → not 16B aligned. Do NOT use int4/uint4 vector loads on qs without changing layout. Scalar int8 reads first.
+- fp16 scale: 2-byte read via two uint8_t bytes is safest, matches legacy.
+- LDS-x variant optional second pass; first land no-LDS baseline.
+- Register pressure may rise from inner unroll; benchmark before optimizing further.
+
+Validation
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test  → must end OK
+3. time ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42  → coherent output, prefill/gen t/s
+4. DS4_ROCM_TIME=1 DS4_ROCM_SYNC_EACH=1 ./ds4 ... -n 50  → matmul_q8_0_tensor ms/call should drop
+
+Expected impact
+- attn_q_a (4096->1024): 0.401 ms → 0.12-0.20 ms (2-3x kernel)
+- attn_kv (4096->576): smaller absolute, 1.5-2.5x
+- output head (4096->129280): 2x+ if scalar loads not limiter
+- Whole-run speedup bounded by elapsed decode share, NOT the 14.693s inclusive histogram total.
+
+Launch-fusion note
+Defer attn_q_a+kv fusion until after wave-per-row lands. Fusion saves one launch per layer but does not reduce Q8_0 weight traffic. Re-evaluate when launch overhead is visible.
+
+Source: codex analysis 2026-05-09. See feedback_use_codex.md.

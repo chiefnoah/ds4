@@ -590,6 +590,46 @@ ROCM_DEFINE_MATMUL_Q8_0_LDS(8)
 ROCM_DEFINE_MATMUL_Q8_0_LDS(4)
 ROCM_DEFINE_MATMUL_Q8_0_LDS(1)
 
+/* Wave-per-row Q8_0 matvec, no-LDS variant.  Each wave32 computes one
+ * output row; lane handles q8_0 block b = lane, lane+32, lane+64...
+ * Cross-lane reduction via __shfl_down (rocm_wave32_sum).
+ *
+ * Why this fixes the legacy kernel: legacy launches blockDim=256 for
+ * one row, but for in_dim=4096 there are only 128 q8_0 blocks per row,
+ * so only 128 of 256 threads do real work and the LDS reduction wastes
+ * the other 128.  Wave-per-row is exactly the right granularity for
+ * decode-time matvec (n_tok=1) on gfx1151's wave32. */
+#define ROCM_DEFINE_MATMUL_Q8_0_WAVE(NROWS) \
+__global__ static void rocm_matmul_q8_0_wave_##NROWS##_kernel( \
+        float *out, const uint8_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t tok     = blockIdx.y; \
+    if (row >= out_dim) return; \
+    const uint32_t blocks = in_dim >> 5; \
+    const uint8_t *wr = w + (uint64_t)row * row_bytes; \
+    const float *xr = x + (uint64_t)tok * in_dim; \
+    float sum = 0.0f; \
+    for (uint32_t b = lane; b < blocks; b += 32u) { \
+        const uint8_t *blk = wr + (uint64_t)b * 34u; \
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8); \
+        const int8_t *qs = (const int8_t *)(blk + 2); \
+        const float *xb = xr + ((uint64_t)b << 5); \
+        float dot = 0.0f; \
+        _Pragma("unroll") \
+        for (int j = 0; j < 32; j++) dot += (float)qs[j] * xb[j]; \
+        sum += rocm_f16_to_f32(scale_bits) * dot; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_Q8_0_WAVE(8)
+ROCM_DEFINE_MATMUL_Q8_0_WAVE(4)
+
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,
                                                               float *split,
@@ -1677,15 +1717,46 @@ int ds4_metal_matmul_q8_0_tensor(
     const void *src = (const uint8_t *)model_map + weight_offset;
     if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "Q8_0 weight upload")) return 0;
 
-    const dim3 block(256);
-    const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
-    hipLaunchKernelGGL(rocm_matmul_q8_0_kernel,
-                       grid, block, block.x * sizeof(float), 0,
-                       (float *)tensor_u8(out),
-                       (const uint8_t *)w_dev,
-                       (const float *)tensor_u8_const(x),
-                       in_dim, out_dim, row_bytes);
-    int ok = rocm_launch_done("Q8_0 matmul launch", "Q8_0 matmul completion");
+    int ok;
+    if (n_tok == 1u && (in_dim % 32u) == 0u) {
+        /* Decode-time matvec: wave32-per-row kernel.  See
+         * ROCM_DEFINE_MATMUL_Q8_0_WAVE; one wavefront computes one
+         * output row, lane handles q8_0 block stride 32, in-wave
+         * shuffle reduction, no LDS, no syncthreads.  Picks
+         * ROWS_PER_BLOCK=8 when out_dim is a multiple of 8 and small
+         * enough that the launched block count still saturates 40 CUs;
+         * falls back to NROWS=4 for out_dim that isn't divisible by 8
+         * or is small (e.g. attn_kv at out_dim=576). */
+        const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
+        const dim3 block(nrows * 32u);
+        const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows), (unsigned)n_tok);
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_wave_8_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+        } else {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_wave_4_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+        }
+        ok = rocm_launch_done("Q8_0 matmul wave launch", "Q8_0 matmul wave completion");
+    } else {
+        const dim3 block(256);
+        const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
+        hipLaunchKernelGGL(rocm_matmul_q8_0_kernel,
+                           grid, block, block.x * sizeof(float), 0,
+                           (float *)tensor_u8(out),
+                           (const uint8_t *)w_dev,
+                           (const float *)tensor_u8_const(x),
+                           in_dim, out_dim, row_bytes);
+        ok = rocm_launch_done("Q8_0 matmul launch", "Q8_0 matmul completion");
+    }
     rocm_defer_free(w_host);
     return ok;
 }

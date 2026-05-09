@@ -1,0 +1,38 @@
+ROCm prefill/decode: replace naive matmul/projection kernels
+
+# Status
+Open. Separate from Claude current load-path work.
+
+# Host/platform context
+- Target this host: AMD gfx1151 STRXLGEN, ROCm 7.0.3, 103 GB reported VRAM.
+- gfx1151 uses wave32 and supports modern AMD matrix instructions; investigate rocBLAS/hipBLASLt first, then custom WMMA only where quantized formats require it.
+
+# Bottleneck
+The F16/F32/Q8_0 matmul kernels are scalar row-per-output reductions: one block computes one output row for one token, with 256 threads reducing across input. This leaves the GPU far from peak for both decode and batched prefill, and it rereads activations/weights inefficiently. Pair/group wrappers often just call the same kernel twice. These projections are everywhere: HC mix, Q/KV projections, attention output low/out, FFN router/shared gate/up/down, output head, and MTP.
+
+# Evidence in code
+- ds4_rocm.c:345-430 `rocm_matmul_f16_kernel`, `rocm_matmul_f32_kernel`, `rocm_matmul_q8_0_kernel` are one-row reductions with shared-memory final reduction.
+- ds4_rocm.c:1236-1389 wrappers launch those kernels and synchronize.
+- ds4_rocm.c:1281-1296 `ds4_metal_matmul_f16_pair_tensor` calls F16 matmul twice rather than a fused pair projection.
+- ds4_rocm.c:2200-2292 attention output and GLU paths compose multiple Q8 matmuls rather than using grouped/fused kernels.
+- ds4.c:10656-11273 and 11935-12093 call these repeatedly in prefill; ds4.c:8784-9473 calls them in every decode layer.
+
+# Instructions
+1. Profile first with tsk-4 timing support or temporary HIP events so the matmul work is ranked against MoE/attention.
+2. For dense F16/F32 projections, prefer rocBLAS/hipBLAS GEMM/GEMV if linking is acceptable. Use batched prefill as GEMM (`n_tokens x in_dim` by weight^T) and decode as GEMV or skinny GEMM. Keep numeric drift within existing test tolerances.
+3. For Q8_0 projections, write a tiled kernel that computes multiple output rows per block/wave and reuses activation tiles, or prequantize activations per token and use vectorized int8 dot-style operations if available. Current kernel computes one row independently and reloads `x` for every row.
+4. Fuse obvious pairs: F16 pair projection for comp kv/sc, Q8 shared gate/up, and attention output low/out where shape permits.
+5. Make launches gfx1151-aware: wave32 reductions via shuffles, vectorized aligned loads, occupancy tuned for RDNA iGPU/UMA. Avoid assuming discrete-GPU HBM behavior; device-local UMA allocation from tsk-5 still matters.
+6. Preserve CPU/Metal-compatible ABI names so ds4.c does not need broad scheduler changes.
+
+# Expected impact
+Prefill should improve substantially because it is projection-heavy and currently uses the same row-reduction kernels for large `n_tokens`. Decode should also improve, especially output head, Q/KV/Q projections, HC mix, shared experts, and MTP projection paths.
+
+# Regression gate
+Run tsk-3. For performance, compare `DS4_METAL_GRAPH_PREFILL_PROFILE=1` and `DS4_METAL_GRAPH_TOKEN_PROFILE=1` before/after, plus final `ds4: prefill: X t/s, generation: Y t/s`.
+
+# Files
+- ds4_rocm.c:345-430 kernels.
+- ds4_rocm.c:1236-1389 wrappers.
+- ds4_rocm.c:2200-2328 composed GLU/attention-output wrappers.
+- ds4.c:8784-9473 decode projection call sites; 10656-11273 and 11935-12093 prefill projection call sites.

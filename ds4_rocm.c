@@ -4861,6 +4861,187 @@ __global__ static void rocm_moe_down_matvec_kernel(
     if (active_row) out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* Wave-per-row IQ2_XXS gate_up matvec.  Mirrors the wave32 matmul_q8_0
+ * pattern: one 32-lane wave computes one mid_dim output, with lanes split
+ * across the (nb * 8) ib32 sub-blocks of a row.  Eliminates the serial
+ * inner dot that pinned the generic 64-thread kernel to ~72 GiB/s. */
+#define ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_WAVE(NROWS) \
+__global__ static void rocm_moe_gate_up_iq2xxs_wave_n##NROWS##_kernel( \
+        float *mid, \
+        const uint8_t *gate_pool, \
+        const uint8_t *up_pool, \
+        uint64_t gate_expert_bytes, \
+        uint64_t gate_row_bytes, \
+        uint64_t up_expert_bytes, \
+        uint64_t up_row_bytes, \
+        const float *x, \
+        const int32_t *selected, \
+        const float *weights, \
+        uint32_t in_dim, \
+        uint32_t mid_dim, \
+        uint32_t n_used, \
+        uint32_t n_tokens, \
+        uint32_t n_total_experts, \
+        float clamp) { \
+    const uint32_t slot     = blockIdx.x; \
+    const uint32_t row_base = blockIdx.y * (NROWS); \
+    const uint32_t token    = blockIdx.z; \
+    if (slot >= n_used || token >= n_tokens) return; \
+    const uint32_t lane = threadIdx.x & 31u; \
+    const uint32_t wave = threadIdx.x >> 5; \
+    const uint32_t row  = row_base + wave; \
+    const bool active_row = (row < mid_dim); \
+    const int32_t e = selected[(uint64_t)token * n_used + slot]; \
+    const bool valid_expert = (e >= 0 && (uint32_t)e < n_total_experts); \
+    if (!valid_expert) { \
+        if (active_row && lane == 0) \
+            mid[((uint64_t)token * n_used + slot) * mid_dim + row] = 0.0f; \
+        return; \
+    } \
+    if (!active_row) return; \
+    const uint32_t nb = in_dim / DS4_QK_K; \
+    const uint32_t total_subs = nb * 8u; \
+    const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *) \
+        (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes); \
+    const rocm_block_iq2_xxs *up_row_p = (const rocm_block_iq2_xxs *) \
+        (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)row * up_row_bytes); \
+    const float *x_token_base = x + (uint64_t)token * in_dim; \
+    float gate_v = 0.0f, up_v = 0.0f; \
+    for (uint32_t sub = lane; sub < total_subs; sub += 32u) { \
+        const uint32_t bi   = sub >> 3; \
+        const uint32_t ib32 = sub & 7u; \
+        const float *y = x_token_base + (uint64_t)sub * 32u; \
+        const rocm_block_iq2_xxs *gb = gate_row_p + bi; \
+        const rocm_block_iq2_xxs *ub = up_row_p   + bi; \
+        const float gd = rocm_f16_to_f32(gb->d); \
+        const float ud = rocm_f16_to_f32(ub->d); \
+        const uint16_t *gq = gb->qs + ib32 * 4u; \
+        const uint16_t *uq = ub->qs + ib32 * 4u; \
+        { \
+            const uint32_t ag = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16); \
+            const uint32_t as = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16); \
+            const float dl = gd * (0.5f + (float)(as >> 28)) * 0.25f; \
+            const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0)); \
+            const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8)); \
+            const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16)); \
+            const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24)); \
+            const uint8_t s0 = rocm_ksigns_iq2xs[(as >>  0) & 127u]; \
+            const uint8_t s1 = rocm_ksigns_iq2xs[(as >>  7) & 127u]; \
+            const uint8_t s2 = rocm_ksigns_iq2xs[(as >> 14) & 127u]; \
+            const uint8_t s3 = rocm_ksigns_iq2xs[(as >> 21) & 127u]; \
+            float sub_acc = 0.0f; \
+            for (int j = 0; j < 8; j++) { \
+                const float v0 = (float)g0[j] * (((s0 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v1 = (float)g1[j] * (((s1 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v2 = (float)g2[j] * (((s2 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v3 = (float)g3[j] * (((s3 >> j) & 1u) ? -1.0f : 1.0f); \
+                sub_acc += y[j +  0] * v0 + y[j +  8] * v1 + y[j + 16] * v2 + y[j + 24] * v3; \
+            } \
+            gate_v += dl * sub_acc; \
+        } \
+        { \
+            const uint32_t ag = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16); \
+            const uint32_t as = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16); \
+            const float dl = ud * (0.5f + (float)(as >> 28)) * 0.25f; \
+            const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0)); \
+            const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8)); \
+            const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16)); \
+            const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24)); \
+            const uint8_t s0 = rocm_ksigns_iq2xs[(as >>  0) & 127u]; \
+            const uint8_t s1 = rocm_ksigns_iq2xs[(as >>  7) & 127u]; \
+            const uint8_t s2 = rocm_ksigns_iq2xs[(as >> 14) & 127u]; \
+            const uint8_t s3 = rocm_ksigns_iq2xs[(as >> 21) & 127u]; \
+            float sub_acc = 0.0f; \
+            for (int j = 0; j < 8; j++) { \
+                const float v0 = (float)g0[j] * (((s0 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v1 = (float)g1[j] * (((s1 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v2 = (float)g2[j] * (((s2 >> j) & 1u) ? -1.0f : 1.0f); \
+                const float v3 = (float)g3[j] * (((s3 >> j) & 1u) ? -1.0f : 1.0f); \
+                sub_acc += y[j +  0] * v0 + y[j +  8] * v1 + y[j + 16] * v2 + y[j + 24] * v3; \
+            } \
+            up_v += dl * sub_acc; \
+        } \
+    } \
+    gate_v = rocm_wave32_sum(gate_v); \
+    up_v   = rocm_wave32_sum(up_v); \
+    if (lane == 0) { \
+        if (clamp > 1.0e-6f) { \
+            if (gate_v > clamp) gate_v = clamp; \
+            if (up_v > clamp) up_v = clamp; \
+            if (up_v < -clamp) up_v = -clamp; \
+        } \
+        const float w = weights[(uint64_t)token * n_used + slot]; \
+        mid[((uint64_t)token * n_used + slot) * mid_dim + row] = rocm_silu(gate_v) * up_v * w; \
+    } \
+}
+
+ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_WAVE(8)
+
+/* Wave-per-row Q2_K down matvec.  Each lane handles a subset of the 16
+ * "is" quarter-blocks (16 elements each) per QK_K block, summing across
+ * all active experts before the final wave-shuffle reduction. */
+#define ROCM_DEFINE_MOE_DOWN_Q2K_WAVE(NROWS) \
+__global__ static void rocm_moe_down_q2k_wave_n##NROWS##_kernel( \
+        float *out, \
+        const uint8_t *down_pool, \
+        uint64_t down_expert_bytes, \
+        uint64_t down_row_bytes, \
+        const float *mid, \
+        const int32_t *selected, \
+        uint32_t mid_dim, \
+        uint32_t out_dim, \
+        uint32_t n_used, \
+        uint32_t n_tokens, \
+        uint32_t n_total_experts) { \
+    const uint32_t row_base = blockIdx.x * (NROWS); \
+    const uint32_t token    = blockIdx.y; \
+    if (token >= n_tokens) return; \
+    const uint32_t lane = threadIdx.x & 31u; \
+    const uint32_t wave = threadIdx.x >> 5; \
+    const uint32_t row  = row_base + wave; \
+    const bool active_row = (row < out_dim); \
+    if (!active_row) return; \
+    const uint32_t nb = mid_dim / DS4_QK_K; \
+    const uint32_t total_qb = nb * 16u; \
+    float acc = 0.0f; \
+    for (uint32_t s = 0; s < n_used; s++) { \
+        const int32_t e = selected[(uint64_t)token * n_used + s]; \
+        if (e < 0 || (uint32_t)e >= n_total_experts) continue; \
+        const rocm_block_q2_K *down_row_p = (const rocm_block_q2_K *) \
+            (down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)row * down_row_bytes); \
+        const float *mid_slot = mid + ((uint64_t)token * n_used + s) * mid_dim; \
+        for (uint32_t qb = lane; qb < total_qb; qb += 32u) { \
+            const uint32_t bi  = qb >> 4; \
+            const uint32_t inn = qb & 15u; \
+            const uint32_t k     = inn >> 3; \
+            const uint32_t inneri = inn & 7u; \
+            const uint32_t jstep = inneri >> 1; \
+            const uint32_t half  = inneri & 1u; \
+            const uint32_t shift = jstep * 2u; \
+            const rocm_block_q2_K *xb = down_row_p + bi; \
+            const float d    = rocm_f16_to_f32(xb->d); \
+            const float dmin = rocm_f16_to_f32(xb->dmin); \
+            const uint8_t sc = xb->scales[inn]; \
+            const float scale = (float)(sc & 0x0F); \
+            const float minv  = (float)(sc >> 4); \
+            const uint8_t *q = xb->qs + k * 32u + half * 16u; \
+            const float *y = mid_slot + (uint64_t)bi * DS4_QK_K \
+                                       + k * 128u + jstep * 32u + half * 16u; \
+            float dot = 0.0f, sumy = 0.0f; \
+            for (int i = 0; i < 16; i++) { \
+                const float yv = y[i]; \
+                dot  += yv * (float)((q[i] >> shift) & 0x3); \
+                sumy += yv; \
+            } \
+            acc += d * scale * dot - dmin * minv * sumy; \
+        } \
+    } \
+    acc = rocm_wave32_sum(acc); \
+    if (lane == 0) out[(uint64_t)token * out_dim + row] = acc; \
+}
+
+ROCM_DEFINE_MOE_DOWN_Q2K_WAVE(8)
+
 static int rocm_moe_run(
         ds4_metal_tensor       *out,
         ds4_metal_tensor       *mid,
@@ -4932,7 +5113,26 @@ static int rocm_moe_run(
         return 0;
     }
 
-    {
+    /* Wave-per-row IQ2_XXS gate_up: 8 rows / block, one wave per row.
+     * Falls back to the generic 1-thread-per-row kernel for other
+     * quant-type combinations. */
+    if (gate_type == DS4_TENSOR_TYPE_IQ2_XXS && up_type == DS4_TENSOR_TYPE_IQ2_XXS) {
+        const uint32_t nrows = 8u;
+        const uint32_t row_blocks = (expert_mid_dim + nrows - 1) / nrows;
+        dim3 grid(n_used, row_blocks, n_tokens);
+        dim3 block(nrows * 32u, 1, 1);
+        hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wave_n8_kernel, grid, block, 0, 0,
+                           (float *)tensor_u8(mid),
+                           (const uint8_t *)gate_d,
+                           (const uint8_t *)up_d,
+                           gate_expert_bytes, gate_row_bytes,
+                           up_expert_bytes, up_row_bytes,
+                           (const float *)tensor_u8_const(x),
+                           (const int32_t *)tensor_u8_const(selected),
+                           (const float *)tensor_u8_const(weights),
+                           expert_in_dim, expert_mid_dim, n_used, n_tokens,
+                           (uint32_t)total_experts, clamp);
+    } else {
         const uint32_t threads = 64;
         const uint32_t row_blocks = (expert_mid_dim + threads - 1) / threads;
         dim3 grid(n_used, row_blocks, n_tokens);
@@ -4953,19 +5153,34 @@ static int rocm_moe_run(
     ok = rocm_launch_done("moe gate_up launch", "moe gate_up completion");
 
     if (ok) {
-        const uint32_t threads = 64;
-        const uint32_t row_blocks = (out_dim + threads - 1) / threads;
-        dim3 grid(row_blocks, n_tokens, 1);
-        dim3 block(threads, 1, 1);
-        hipLaunchKernelGGL(rocm_moe_down_matvec_kernel, grid, block, 0, 0,
-                           (float *)tensor_u8(out),
-                           (const uint8_t *)down_d,
-                           down_type,
-                           down_expert_bytes, down_row_bytes,
-                           (const float *)tensor_u8_const(mid),
-                           (const int32_t *)tensor_u8_const(selected),
-                           expert_mid_dim, out_dim, n_used, n_tokens,
-                           (uint32_t)total_experts);
+        if (down_type == DS4_TENSOR_TYPE_Q2_K) {
+            const uint32_t nrows = 8u;
+            const uint32_t row_blocks = (out_dim + nrows - 1) / nrows;
+            dim3 grid(row_blocks, n_tokens, 1);
+            dim3 block(nrows * 32u, 1, 1);
+            hipLaunchKernelGGL(rocm_moe_down_q2k_wave_n8_kernel, grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint8_t *)down_d,
+                               down_expert_bytes, down_row_bytes,
+                               (const float *)tensor_u8_const(mid),
+                               (const int32_t *)tensor_u8_const(selected),
+                               expert_mid_dim, out_dim, n_used, n_tokens,
+                               (uint32_t)total_experts);
+        } else {
+            const uint32_t threads = 64;
+            const uint32_t row_blocks = (out_dim + threads - 1) / threads;
+            dim3 grid(row_blocks, n_tokens, 1);
+            dim3 block(threads, 1, 1);
+            hipLaunchKernelGGL(rocm_moe_down_matvec_kernel, grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint8_t *)down_d,
+                               down_type,
+                               down_expert_bytes, down_row_bytes,
+                               (const float *)tensor_u8_const(mid),
+                               (const int32_t *)tensor_u8_const(selected),
+                               expert_mid_dim, out_dim, n_used, n_tokens,
+                               (uint32_t)total_experts);
+        }
         ok = rocm_launch_done("moe down launch", "moe down completion");
     }
 

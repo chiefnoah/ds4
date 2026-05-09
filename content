@@ -1,0 +1,24 @@
+ROCm top-k: replace single-thread scans with parallel reductions
+
+Status: Open
+
+Goal
+Replace the current one-thread repeated scan top-k/argmax kernels with parallel reductions. This matters both for indexer top-k and for GPU-side greedy logits selection.
+
+Context
+Related: tsk-15. There is already a GPU top path for speculative verification, but ds4_metal_indexer_topk_tensor launches rocm_indexer_topk_kernel with dim3(n_tokens), dim3(1). For DS4_N_VOCAB argmax this avoids CPU readback, but still serially scans the whole vocab on one GPU thread.
+
+Evidence
+- ds4_rocm.c rocm_indexer_topk_kernel comment says the O(n_comp * top_k) loop is correct but slow and should be revisited.
+- ds4.c metal_graph_eval_token_raw_swa_top() reuses ds4_metal_indexer_topk_tensor(g->comp_selected, g->logits, DS4_N_VOCAB, 1, 1).
+
+Next steps
+1. Add a specialized parallel argmax kernel for top_k==1 using block reductions over logits, producing one int32 result.
+2. Add/benchmark a parallel top-k path for indexer top_k > 1; start with small fixed K used by DS4_N_INDEXER_TOP_K.
+3. Keep the existing simple kernel as a debug/reference fallback until tests cover edge cases.
+4. Wire temp=0 greedy decode and speculative verifier to the specialized argmax path.
+
+Validation
+- Add kernel tests for argmax/top-k ties, negative infinities, n_comp not multiple of block size, and batched n_tokens.
+- tsk-3 gate passes.
+- Compare top-k kernel time and full generation t/s before/after.

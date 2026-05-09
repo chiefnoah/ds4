@@ -2429,7 +2429,7 @@ static bool send_all(int fd, const void *p, size_t n) {
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;
-        ssize_t w = send(fd, s, n, 0);
+        ssize_t w = write(fd, s, n);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             long long remaining = deadline - wall_ms();
@@ -6111,6 +6111,15 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
+static ds4_backend parse_backend_arg(const char *s) {
+    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "rocm") || !strcmp(s, "amd")) return DS4_BACKEND_ROCM;
+    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid backend: %s", s);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid backends are: metal, rocm, cpu");
+    exit(2);
+}
+
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
     server_log(DS4_LOG_DEFAULT,
@@ -6206,7 +6215,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  The server requires a GPU session backend. Metal is implemented; ROCm is experimental.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -6218,7 +6227,11 @@ static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
+#ifdef DS4_NO_METAL
+            .backend = DS4_BACKEND_CPU,
+#else
             .backend = DS4_BACKEND_METAL,
+#endif
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -6274,8 +6287,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+        } else if (!strcmp(arg, "--backend")) {
+            c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--rocm") || !strcmp(arg, "--amd")) {
+            c.engine.backend = DS4_BACKEND_ROCM;
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cpu")) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: server requires a GPU session backend");
             exit(2);
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);

@@ -88,11 +88,13 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path and the default.\n"
+        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
+        "  --rocm, --amd\n"
+        "      Request the experimental ROCm graph backend for AMD GPUs.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: metal, rocm, or cpu. Default: metal with Metal support, otherwise cpu\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -202,9 +204,10 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "rocm") || !strcmp(s, "amd")) return DS4_BACKEND_ROCM;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, rocm, cpu\n");
     exit(2);
 }
 
@@ -1155,7 +1158,11 @@ static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
+#ifdef DS4_NO_METAL
+            .backend = DS4_BACKEND_CPU,
+#else
             .backend = DS4_BACKEND_METAL,
+#endif
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -1217,6 +1224,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--rocm") || !strcmp(arg, "--amd")) {
+            c.engine.backend = DS4_BACKEND_ROCM;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--dump-tokens")) {

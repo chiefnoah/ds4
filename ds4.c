@@ -36,7 +36,9 @@
 
 #include "ds4.h"
 
-#ifndef DS4_NO_METAL
+#if defined(DS4_USE_ROCM) && !defined(DS4_NO_METAL)
+#include "ds4_rocm.h"
+#elif !defined(DS4_NO_METAL)
 #include "ds4_metal.h"
 #endif
 #if defined(__ARM_NEON)
@@ -8078,9 +8080,16 @@ static void metal_graph_free(ds4_metal_graph *g) {
 }
 
 static bool metal_tensor_fill_f32(ds4_metal_tensor *t, float v, uint64_t n) {
-    float *p = ds4_metal_tensor_contents(t);
-    if (!p || ds4_metal_tensor_bytes(t) < n * sizeof(float)) return false;
-    for (uint64_t i = 0; i < n; i++) p[i] = v;
+    if (!t || ds4_metal_tensor_bytes(t) < n * sizeof(float)) return false;
+    enum { FILL_CHUNK = 4096 };
+    float tmp[FILL_CHUNK];
+    for (uint32_t i = 0; i < FILL_CHUNK; i++) tmp[i] = v;
+    uint64_t done = 0;
+    while (done < n) {
+        const uint64_t m = n - done > FILL_CHUNK ? FILL_CHUNK : n - done;
+        if (!ds4_metal_tensor_write(t, done * sizeof(float), tmp, m * sizeof(float))) return false;
+        done += m;
+    }
     return true;
 }
 
@@ -13164,7 +13173,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    if (backend == DS4_BACKEND_METAL) {
+    if (backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_ROCM) {
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
@@ -14683,7 +14692,16 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL ? "metal" : "cpu";
+    switch (backend) {
+    case DS4_BACKEND_METAL: return "metal";
+    case DS4_BACKEND_ROCM:  return "rocm";
+    case DS4_BACKEND_CPU:   return "cpu";
+    }
+    return "unknown";
+}
+
+static bool ds4_backend_is_graph(ds4_backend backend) {
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_ROCM;
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -15472,17 +15490,19 @@ int ds4_engine_generate_argmax(
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
 
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (ds4_backend_is_graph(e->backend)) {
 #ifndef DS4_NO_METAL
         if (!e->metal_ready) {
-            fprintf(stderr, "ds4: Metal generation requested but Metal is unavailable\n");
+            fprintf(stderr, "ds4: %s generation requested but backend is unavailable\n",
+                    ds4_backend_name(e->backend));
             return 1;
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality, emit, done, emit_ud,
                                             progress, progress_ud);
 #else
-        fprintf(stderr, "ds4: Metal generation requested but this build has no Metal support\n");
+        fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
+                ds4_backend_name(e->backend));
         return 1;
 #endif
     }
@@ -15688,13 +15708,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    model_open(&e->model, opt->model_path, ds4_backend_is_graph(opt->backend));
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
+        model_open(&e->mtp_model, opt->mtp_path, ds4_backend_is_graph(opt->backend));
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -15703,10 +15723,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
 #ifndef DS4_NO_METAL
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (ds4_backend_is_graph(e->backend)) {
         e->metal_ready = ds4_metal_init() != 0;
         if (!e->metal_ready) {
-            fprintf(stderr, "ds4: Metal backend unavailable; aborting startup\n");
+            fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -15718,8 +15739,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                            e->model.size - e->model.tensor_data_pos))
         {
             fprintf(stderr,
-                    "ds4: Metal failed to map model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                    "ds4: %s failed to map model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or GPU VM budget.\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -15731,17 +15753,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos))
         {
             fprintf(stderr,
-                    "ds4: Metal failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                    "ds4: %s failed to map MTP model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or GPU VM budget.\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics\n");
+        fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
+                ds4_backend_name(e->backend));
     }
 #else
-    if (e->backend == DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: Metal backend requested but this build has no Metal support; aborting startup\n");
+    if (ds4_backend_is_graph(e->backend)) {
+        fprintf(stderr, "ds4: %s backend requested but this build has no graph backend support; aborting startup\n",
+                ds4_backend_name(e->backend));
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -15777,7 +15802,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)ctx_size;
     return 1;
 #else
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) return 1;
+    if (!ds4_backend_is_graph(e->backend) || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
@@ -15825,7 +15850,7 @@ typedef struct {
     void *user_ud;
 } ds4_sync_progress;
 
-static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
+static DS4_MAYBE_UNUSED void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
     ds4_sync_progress *p = ud;
     if (!p || !p->session || !p->prompt) return;
     if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {

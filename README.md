@@ -467,7 +467,7 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+The default backend is Metal on builds that include Metal support:
 
 ```sh
 ./ds4 -p "Hello" --metal
@@ -482,6 +482,12 @@ There is also a CPU reference/debug path:
 Do not treat the CPU path as the production target. The server is Metal-only,
 and the optimized implementation lives in the Metal graph path. This may
 change in the future.
+
+On non-Metal builds, including typical Linux AMD hosts, the CLI defaults to the
+CPU reference path so the binaries remain usable for loading, inspection, and
+debugging. Build with `make DS4_ROCM=1` and run with `--backend rocm` or
+`--amd` to select the experimental ROCm graph backend. The HIP runtime/tensor
+layer is present; compute kernels are being ported from the Metal backend.
 
 ## Test Vectors
 

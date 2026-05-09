@@ -16,6 +16,7 @@
 
 typedef enum {
     DS4_BACKEND_METAL,
+    DS4_BACKEND_ROCM,
     DS4_BACKEND_CPU,
 } ds4_backend;
 

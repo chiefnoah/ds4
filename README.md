@@ -487,7 +487,11 @@ On non-Metal builds, including typical Linux AMD hosts, the CLI defaults to the
 CPU reference path so the binaries remain usable for loading, inspection, and
 debugging. Build with `make DS4_ROCM=1` and run with `--backend rocm` or
 `--amd` to select the experimental ROCm graph backend. The HIP runtime/tensor
-layer is present; compute kernels are being ported from the Metal backend.
+layer is present; the HC, KV, indexer, router, output, compressor, and sink
+attention kernel families are ported and validated against CPU oracles by
+`make ds4_rocm_kernel_test`. The two routed-MoE kernels still stub out, since
+they need HIP IQ2_XXS / Q2_K / Q4_K dequant paths; until those land an
+end-to-end ROCm decode will fall through `rocm_unimplemented`.
 
 ## Test Vectors
 

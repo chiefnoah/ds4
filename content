@@ -1,0 +1,20 @@
+ROCm next: HIP graph capture or weight repack for further matmul wins
+
+Status
+Open.
+
+Context
+After wave-per-row Q8 kernels (tsk-19), matmul_q8_0_tensor is still 3860 ms / 50 tokens decode (0.256 ms/call x 15100 calls). Theoretical lower bound ~55 us at 75 GiB/s, so ~5x left. Three credible approaches:
+
+1. HIP graph capture/replay for one-token decode (codex tsk-16). Eliminates per-call CPU launch overhead. Precondition: stable shapes / pointers between tokens.
+2. Repack Q8_0 weights at load to 4-byte aligned qs[] so the inner loop can use int loads. Requires touching the load path (ds4_rocm.c:1146 set_model_map_range) to permute on the fly, plus a conditional decode in the wave kernel.
+3. Kernel-level fusion of shared_gate + shared_up (currently calls matmul_q8_0_tensor twice; reads x twice). Marginal (~5-10% on those calls only).
+
+Goal
+Pick one and implement. Choice between (1) and (2) depends on whether the bottleneck is launch CPU or kernel ALU/load issue. Need fresh DS4_ROCM_TIME=1 vs DS4_ROCM_TIME=1 DS4_ROCM_SYNC_EACH=1 comparison: if kernel time without sync is much lower than with sync, launches are batched well and graph replay is moot; if they are similar, launch overhead matters and HIP graphs help.
+
+Validation
+Same as tsk-19: kernel tests pass, coherent 200-token output, prefill/decode t/s improved without functional regression.
+
+Related
+tsk-19 (done), tsk-16 (graph capture), tsk-14 (timing), feedback_inclusive_histogram.md.

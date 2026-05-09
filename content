@@ -1,0 +1,52 @@
+ROCm MoE 2-bit wave-per-row kernels (IQ2_XXS gate_up + Q2_K down)
+
+# Status
+
+DONE (2026-05-09).
+
+# Result
+
+Microbench (tests/ds4_rocm_moe_bench, n_tokens=1, in=4096, mid=1024, out=4096, n_used=6, n_total=256):
+
+  baseline (1 thread/row generic kernel): 0.28 ms/call, 71.62 GiB/s
+  wave-per-row (NROWS=8):                 0.11 ms/call, 188.19 GiB/s  (2.6x)
+
+End-to-end (./ds4 --backend rocm -p "...Strix Halo APU..." -n 200 --temp 0 --seed 42):
+
+  generation: 6.87 -> 13.60 t/s  (~2x)
+  prefill:    6.22 -> 9.55 t/s
+
+188 GiB/s is at the practical DRAM ceiling for Strix Halo (codex web research:
+Phoronix clpeak global bw = 187.6 GiB/s on Radeon 8060S, OpenBenchmarking ROCm
+6.4.1 result; cl-mem read peaks at 207 GiB/s but only on idealized read-only
+streaming). Stop optimizing the matvec bandwidth side.
+
+# Implementation
+
+- ds4_rocm.c: ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_WAVE(8) and
+  ROCM_DEFINE_MOE_DOWN_Q2K_WAVE(8) macros define wave-per-row kernels.
+- One 32-lane wave per output row, 8 rows per block (blockDim=256).
+- IQ2_XXS gate_up: each lane handles (nb*8/32) ib32 sub-blocks across the row,
+  computing both gate and up dots in the same loop (shared activation reads).
+- Q2_K down: each lane handles (nb*16/32) quarter-blocks across the row,
+  iterating over all n_used active experts before final wave-shuffle reduction.
+- Reduction via rocm_wave32_sum (existing __shfl_down helper).
+- Dispatch in rocm_moe_run gates on (gate_type==up_type==IQ2_XXS) for gate_up
+  and (down_type==Q2_K) for down; falls back to generic kernel otherwise.
+
+# Validation
+
+- ./ds4_rocm_kernel_test: 40/40 OK (includes routed_moe_one and HC tests that
+  exercise the new kernels).
+- ./ds4_rocm_moe_bench 50 1: 188.19 GiB/s (2.6x baseline).
+- End-to-end coherent thinking-mode reply on the canonical Strix Halo prompt.
+
+# Files
+
+- ds4_rocm.c: ~4866-5060 (kernel definitions), ~5050-5085 (dispatcher).
+- tests/ds4_rocm_moe_bench.c (microbench harness).
+- Makefile: ds4_rocm_moe_bench target.
+
+# Source
+
+This-session implementation; ceiling fact independently confirmed by codex.

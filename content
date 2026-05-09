@@ -1,0 +1,21 @@
+ROCm WMMA prefill landed (+31%)
+
+Status: DONE 2026-05-09 (commit 3dce4e5).
+
+WMMA F32_16x16x16_F16 path landed for Q8_0 prefill matmul.
+Microbench: 7-8x at small n_tok, 1.4-2.4x at larger n_tok.
+End-to-end: prefill 29.71 -> 38.92 t/s (+31%); decode unchanged.
+
+Claim against tsk-26 closed.  Remaining levers from codex roadmap:
+ - WMMA for routed MoE (IQ2_XXS gate_up, Q2_K down) -- complex due
+   to packed grid lookups; not directly WMMA-able without re-quant.
+ - WMMA F16 dense paths (lm_head, qkv proj if any are F16) -- mirror
+   the Q8_0 path with direct fp16 reads, no dequant.
+ - Cooperative LDS staging for the WMMA Q8_0 path -- at n_tok=64 the
+   weight-load pattern (16 strided rows per K-step per wave) is
+   uncoalesced.  LDS staging would let 32 lanes load the 16-row
+   weight block cooperatively (544 bytes/16-row block).
+
+Next biggest known lever per codex ranking:
+ - tsk-25 (activation microquant + AMDGCN sdot4 for MoE decode) --
+   est. 1.2-1.5x decode.

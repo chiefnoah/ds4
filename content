@@ -1,0 +1,43 @@
+ROCm perf: capture reproducible prefill/decode baselines
+
+# Status
+Open. Non-conflicting measurement task; no source edits required.
+
+# Goal
+Create a repeatable baseline notebook in task comments or follow-up task updates before anyone changes kernels. The current queue has optimization tasks, but we need comparable numbers for prefill, decode, per-stage profile, and per-wrapper ROCm timing on this exact host.
+
+# Host/platform facts to record with each run
+- Date/time and git status. Note that ds4_rocm.c may be dirty due to Claude.
+- `rocm-smi --showdriverversion --showmeminfo vram --showbus --showclocks --showpower --showproductname`.
+- `DS4_ROCM_ARCH` from Makefile auto-detection or explicit value. This host reports gfx1151 / STRXLGEN under ROCm 7.0.3.
+- Whether another model/server process is resident; `rocm-smi` showed about 87 GB VRAM used during inspection.
+
+# Commands to run
+1. Build/test gate:
+   `DS4_ROCM=1 make ds4_rocm_kernel_test && ./ds4_rocm_kernel_test`
+2. Plain throughput baseline:
+   `DS4_ROCM=1 make ds4 && ./ds4 --backend rocm -p "Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip." -n 200 --temp 0 --seed 42`
+3. Decode graph profile:
+   same prompt with `DS4_METAL_GRAPH_TOKEN_PROFILE=1 DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_ROCM_TIME=1`.
+4. Prefill graph profile:
+   run a long prompt with `DS4_METAL_GRAPH_PREFILL_PROFILE=1 DS4_METAL_LAYER_STAGE_PROFILE=1 DS4_ROCM_TIME=1`; test at `DS4_METAL_PREFILL_CHUNK=512`, `1024`, `2048`, and default.
+5. Optional deeper attention/indexer profile:
+   add `DS4_METAL_INDEXER_STAGE_PROFILE=1 DS4_METAL_Q_STAGE_PROFILE=1` for one run only, because these add synchronization and perturb timing.
+
+# Metrics to capture
+- Final line: `ds4: prefill: X.XX t/s, generation: Y.YY t/s`.
+- Load time/model copy GiB/s if startup copies the GGUF.
+- Decode token profile: encode ms, execute ms, read ms, total ms.
+- Prefill profile: per-layer encode/execute and total.
+- `DS4_ROCM_TIME` bucket counts/total/avg once per run; sort manually by total time.
+- Any coherent-output drift from tsk-3 seed-42 expectation.
+
+# Why this avoids conflict
+This task only runs commands and records numbers. It does not touch `ds4_rocm.c`, Makefile, load-path code, or Claude's current changes.
+
+# Related tasks
+- tsk-3 regression gate.
+- tsk-4 command batching.
+- tsk-5 device-local tensors.
+- tsk-6 matmul/projection kernels.
+- tsk-7 router/compressor prefill.

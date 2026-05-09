@@ -1,0 +1,35 @@
+Repack-and-WMMA prefill MoE killed: GPU 3% utilized, CPU-bound
+
+Status: DEAD (decided 2026-05-09).
+
+Result
+DS4_ROCM_TIME=1 prefill-only run shows total GPU kernel time = 21 ms vs
+prefill wall = 773 ms (38.81 t/s on a 30-token prompt). GPU is ~2.7%
+utilized during prefill. routed_moe_batch_tensor reports 0 ms (under
+rounding) over 43 calls -- even instantaneous WMMA_I8 prefill MoE could
+save at most ~0.13 ms out of 773 ms.
+
+Repack alone was measured at 3.7 ms/layer for IQ2_XXS gate at 120 active
+experts (166 GiB/s, near DRAM ceiling). x3 matrices x58 layers = ~640 ms
+repack overhead per prefill batch -- already exceeds current total prefill
+wall, with no offsetting savings since MoE compute isn't the bottleneck.
+
+Decode side: 50 tokens / 14.12 t/s = 3.54 sec wall, ~123 ms GPU kernels =
+~3.5% utilization. Per-token: ~70 ms wall - ~2.5 ms GPU = 67.5 ms CPU,
+mostly hipDeviceSynchronize after each wrapper.
+
+Graph probe (tests/ds4_rocm_graph_probe.cpp) shows raw HIP graph capture
+only delivers 1.10x at the noop level on gfx1151 (1.97 us -> 1.80 us per
+launch), confirming launch overhead per se is small; the dominant CPU cost
+is sync, not launch.
+
+Direction
+Further GPU-side optimization wasted until CPU sync is eliminated.
+See tsk-13 (stream batching: existing infra, currently corrupting output)
+and tsk-16 (HIP graph capture for decode). Either path should target
+moving from "sync-after-every-call" to "sync-once-per-token" or better.
+
+Microbench: /tmp/repack_probe.cpp (kept for reference).
+
+Related
+tsk-13, tsk-15, tsk-16, tsk-20.

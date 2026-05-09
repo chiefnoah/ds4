@@ -1,0 +1,85 @@
+ROCm decode at 125 GB/s effective vs 220 GB/s target — 1.6x headroom
+
+Status: OPEN (measured 2026-05-09).
+
+Measurements (decode of canonical 30-token Strix Halo prompt, --temp 0)
+- Wall: 71.0 ms/token = 14.10 t/s decode.
+- DS4_TOP_PROFILE breakdown of metal_graph_eval_token_raw_swa_top:
+    begin       : 0.000 ms
+    encode (CPU): 7.0 ms (CPU enqueueing kernels)
+    topk        : 0.001 ms
+    end (sync)  : 65.0 ms  <-- GPU drain dominates
+    read_top    : 0.000 ms (4-byte readback)
+  total       : 72.0 ms
+- Per-decode-token model reads: 8.9 GiB (gguf inventory):
+    attention  4.88 GiB  (55%)
+    routed MoE 1.70 GiB  (19%)
+    shared FFN 1.07 GiB  (12%)
+    HC         0.63 GiB  ( 7%)
+    embed/out  0.52 GiB  ( 6%)
+    other      < 0.10 GiB
+- Effective decode bandwidth = 8.9 / 0.071 = 125 GB/s.
+- Target (per user 2026-05-09): 220 GB/s effective + 100% GPU utilization.
+- Ceiling at 220 GB/s = 23 t/s decode (43 ms/token). Headroom 1.6x.
+
+Root cause
+GPU is the bottleneck, not CPU sync. End_commands waits ~65 ms for GPU
+to drain queued kernels. Per-kernel real GPU time (DS4_ROCM_SYNC_EACH=1
+sync_each forces ROCM_TIME_SCOPE to measure actual GPU time):
+  - matmul_q8_0_tensor          0.104 ms/call x 302/tok = 31 ms/token
+  - matmul_f16_tensor           0.066 ms/call x 258/tok = 17 ms/token
+  - routed_moe_one_tensor       0.299 ms/call x  42/tok = 12 ms/token
+  - router_select_tensor        0.244 ms/call x  42/tok = 10 ms/token
+  - matmul_q8_0_hc_expand       0.212 ms/call x  42/tok =  9 ms/token
+  - attention_output_low_q8     0.181 ms/call x  42/tok =  8 ms/token
+  - shared_gate_up_swiglu_q8    0.134 ms/call x  42/tok =  6 ms/token
+  - matmul_f16_pair             0.109 ms/call x  60/tok =  7 ms/token
+  - shared_down_hc_expand       0.066 ms/call x  42/tok =  3 ms/token
+  - attention_decode_heads      0.073 ms/call x  42/tok =  3 ms/token
+  Sum sync_each = ~106 ms/token; deferred-sync overlap recovers ~35 ms
+  to reach the 71 ms wall. So overlap is ~33% gain already.
+
+Levers to reach 220 GB/s
+1. Per-kernel bandwidth audit (BIGGEST). Most kernels run at 70-85% of
+   the 220 GB/s target. Audit each top-N kernel: measure achieved GB/s,
+   identify cause of shortfall (unaligned loads, over-broadcast, etc.).
+   - matmul_q8_0_tensor: 302 calls/token, biggest aggregate. Different
+     call sites have different shapes (q_a, q_b, kv, attn_output_a/b,
+     output, etc.). Need per-site timing.
+   - routed_moe_one: per microbench at 188 GiB/s = 85% of 220 GB/s.
+     ~17% headroom from in-block decode optimization or memory layout.
+   - matmul_q8_0_hc_expand_tensor at 0.212 ms/call: HC expand is doing
+     16384*24 fp16 matmul = 768 KB read. At 220 GB/s = 3.5 us.
+     Observed 212 us = 60x slower. Massive per-call overhead.
+2. Kernel fusion (SECOND-BIGGEST). Many small kernels with high per-call
+   overhead are fusion candidates. router_select (244 us each, 42x/tok =
+   10 ms/tok) could fuse into the matmul that produces router_logits.
+   compressor_update (17 us each, 130x/tok = 2.2 ms) and rope_tail
+   (10 us, 150x = 1.5 ms) are also high call-count.
+3. CPU encode (smallest). 7 ms/token of CPU encoding. HIP graph capture
+   (tsk-16) could cut this to <1 ms but only saves 6 ms = 8.5%.
+
+Target breakdown (rough, to reach 23 t/s)
+- Per-kernel optimization to 90% of 220 GB/s ceiling: -10 ms (1.16x)
+- Top-3 kernel fusion: -8 ms (1.13x)
+- HIP graph capture: -6 ms (1.09x)
+- Combined: 71 -> ~47 ms = 21 t/s. Within striking distance of 23 t/s
+  ceiling.
+
+Helpful flags / files
+- DS4_ROCM_SYNC_EACH=1 forces real GPU time in DS4_ROCM_TIME=1 histogram.
+- Per-token wall via DS4_TOKEN_TIMING=1 (existing).
+- Per-stage breakdown via DS4_TOP_PROFILE patch: see git log this session
+  for the diff (already reverted; re-apply if needed).
+- Decode driver: ds4.c:14635 metal_graph_eval_token_raw_swa_top -> ds4.c:12201.
+- llama.cpp baseline impossible: model is general.architecture=deepseek4,
+  llama.cpp supports through deepseek2 only.
+
+Next steps (in order)
+1. Measure achieved GB/s per matmul_q8_0_tensor call site (need per-site
+   timing or microbench at each shape). Pick worst offenders.
+2. Try fusing router_select into matmul_q8_0_tensor producing router_logits.
+3. Try HIP graph capture for steady-state decode (tsk-16/tsk-20).
+
+Related
+tsk-16, tsk-17, tsk-18, tsk-19, tsk-20, tsk-21.

@@ -1,0 +1,58 @@
+Stream-batch wins (TSK-4): kernels now 0.001 ms/call but corrupted output
+
+# Status
+
+In progress. Per-launch sync removal works for kernels but introduces a CPU/GPU race in `ds4_metal_router_select_tensor` (and likely a few peers). Need to plug those before this can ship.
+
+# What changed
+
+ds4_rocm.c:
+- Added `rocm_launch_done(launch_label, sync_label)` helper near line 970. When `g_batch_open` and `DS4_ROCM_SYNC_EACH != 1`, it skips `hipDeviceSynchronize` after each launch and relies on default-stream FIFO ordering for inter-kernel correctness.
+- Replaced 31 wrapper-tail `hipGetLastError && hipDeviceSynchronize` pairs with `rocm_launch_done(...)`.
+- `ds4_metal_tensor_read` now drains in-flight kernels (single sync) before reading.
+- DS4_ROCM_SYNC_EACH=1 restores the original per-kernel sync as a debug fallback.
+
+# Profiling impact (DS4_ROCM_TIME=1, 50 generated tokens)
+
+Total in-batch wall time fell from 8.9s baseline → 8.3s, but the bigger story is per-call latency dropping from ~50us to ~1us for everything except matmul_q8_0 (which actually does work). Top buckets:
+- matmul_q8_0_tensor: 4.097s -> 2.160s (47% drop)
+- attention_output_low_q8: 0.732s -> 1.927s (more total, fewer calls weren't inflated by sync)
+- routed_moe_one: 0.562s -> 0.005s (most time was sync overhead!)
+- shared_*_q8_0 family: now sub-ms each
+The matmul-heavy paths (matmul_q8_0, attn_output_low/batch, compressor_prefill) are now the entire budget.
+
+# Bug
+
+Inference output is gibberish: "the you is a a helpful for the that is a for the that ..." -- recognizable token vocabulary, broken composition. Root cause:
+
+ds4_rocm.c:2879-2890 `ds4_metal_router_select_tensor` does CPU-side computation directly on `tensor_u8` (== host_ptr for mapped memory):
+
+```c
+const float *src = (const float *)tensor_u8_const(logits);
+float *dst       = (float *)tensor_u8(probs);
+for (uint32_t i = 0; i < n_expert_groups; i++) {
+    const float l = src[i];                          // CPU read of dev_ptr
+    const float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+    dst[i] = sqrtf(sp > 0.0f ? sp : 0.0f);           // CPU write to dev_ptr
+}
+```
+
+A previous kernel writes `logits`. Without the per-kernel sync the CPU reads stale data from the host-mapped page. Subsequent kernel reads `dst` and gets a partially-stale mix.
+
+# Plan to fix
+
+1. In `router_select_tensor` (and any peer that does CPU compute on a mapped tensor), drain the stream once before the CPU loop. Cheap because router_select fires only ~6 times per layer per call.
+2. Move the softplus/sqrt + select work onto the GPU. tsk-7 already calls this out as the right path -- the CPU loop is also why router_select_batch is O(n_tokens) launches.
+3. Audit all wrappers for `tensor_u8(*)` / `tensor_u8_const(*)` outside `hipLaunchKernelGGL` arg lists; flag any that read or write the bytes from CPU.
+
+# Files
+
+- ds4_rocm.c:970-993 (rocm_launch_done helper)
+- ds4_rocm.c:2879-2890 (router_select CPU loop, the race)
+- ds4_rocm.c:2946-2972 (router_select_batch, also runs CPU loop per token via the one-token wrapper)
+
+# Regression gate
+
+Tsk-3:
+- ds4_rocm_kernel_test still passes (tests don't open a batch, so they hit the per-kernel sync path and are unaffected).
+- End-to-end coherent inference: BROKEN until the router_select race is plugged.

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/mman.h>
 
 #include <hip/hip_fp16.h>
@@ -68,6 +69,9 @@ int ds4_metal_rms_norm_weight_rows_tensor(ds4_metal_tensor *out,
                                            uint32_t rows,
                                            float eps);
 
+static int rocm_sync_each(void);
+static int rocm_launch_done(const char *launch_label, const char *sync_label);
+
 static int rocm_ok(hipError_t rc, const char *what) {
     if (rc == hipSuccess) return 1;
     fprintf(stderr, "ds4: ROCm %s failed: %s\n", what, hipGetErrorString(rc));
@@ -77,6 +81,98 @@ static int rocm_ok(hipError_t rc, const char *what) {
 static int rocm_trace(void) {
     const char *v = getenv("DS4_ROCM_TRACE");
     return v && v[0] && v[0] != '0';
+}
+
+/* Per-kernel timing.  Enabled by setting DS4_ROCM_TIME=1.  Each wrapper
+ * brackets its work with rocm_time_begin / rocm_time_end_named, which
+ * accumulates wall-clock time per kernel name.  At exit, ds4_metal_cleanup
+ * dumps a sorted histogram to stderr so we can see where the GPU time is
+ * actually going.  Kept minimal so the disabled path is just an env-var
+ * read per call. */
+#define ROCM_TIME_MAX_BUCKETS 64
+struct rocm_time_bucket {
+    const char *name;       /* string literal; no copy */
+    uint64_t    count;
+    double      total_sec;
+};
+static struct rocm_time_bucket g_time_buckets[ROCM_TIME_MAX_BUCKETS];
+static int                     g_time_n_buckets;
+static int                     g_time_enabled = -1;  /* -1 = unchecked */
+
+static int rocm_time_on(void) {
+    if (g_time_enabled < 0) {
+        const char *v = getenv("DS4_ROCM_TIME");
+        g_time_enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return g_time_enabled;
+}
+
+static double rocm_now_sec(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + 1.0e-9 * (double)t.tv_nsec;
+}
+
+static void rocm_time_record(const char *name, double seconds) {
+    if (!rocm_time_on()) return;
+    /* Linear search is fine: <50 unique names total. */
+    int i = 0;
+    for (; i < g_time_n_buckets; i++) {
+        if (g_time_buckets[i].name == name) break;  /* literal-pointer compare */
+    }
+    if (i == g_time_n_buckets) {
+        if (g_time_n_buckets >= ROCM_TIME_MAX_BUCKETS) return;
+        g_time_buckets[i].name = name;
+        g_time_buckets[i].count = 0;
+        g_time_buckets[i].total_sec = 0.0;
+        g_time_n_buckets++;
+    }
+    g_time_buckets[i].count++;
+    g_time_buckets[i].total_sec += seconds;
+}
+
+/* RAII-style scope: instances are auto-cleaned via __attribute__((cleanup)),
+ * recording elapsed time against the bound label as soon as control leaves
+ * the enclosing block (including via early `return`).  All wrappers can
+ * therefore opt in with a single `ROCM_TIME_SCOPE("name");` line. */
+struct rocm_time_scope {
+    const char *name;
+    double      t0;
+};
+static inline void rocm_time_scope_end(struct rocm_time_scope *s) {
+    if (rocm_time_on()) rocm_time_record(s->name, rocm_now_sec() - s->t0);
+}
+#define ROCM_TIME_SCOPE(label) \
+    __attribute__((cleanup(rocm_time_scope_end))) \
+    struct rocm_time_scope _rocm_scope_ ## __LINE__ = { \
+        .name = (label), \
+        .t0 = rocm_time_on() ? rocm_now_sec() : 0.0 \
+    }
+
+static void rocm_time_dump(void) {
+    if (!rocm_time_on() || g_time_n_buckets == 0) return;
+    /* Sort by descending total_sec via simple insertion sort. */
+    for (int i = 1; i < g_time_n_buckets; i++) {
+        struct rocm_time_bucket b = g_time_buckets[i];
+        int j = i - 1;
+        while (j >= 0 && g_time_buckets[j].total_sec < b.total_sec) {
+            g_time_buckets[j + 1] = g_time_buckets[j];
+            j--;
+        }
+        g_time_buckets[j + 1] = b;
+    }
+    double total = 0.0;
+    for (int i = 0; i < g_time_n_buckets; i++) total += g_time_buckets[i].total_sec;
+    fprintf(stderr, "ds4: ROCm timing histogram (%.3f sec total):\n", total);
+    for (int i = 0; i < g_time_n_buckets; i++) {
+        const struct rocm_time_bucket *b = &g_time_buckets[i];
+        const double pct = total > 0.0 ? 100.0 * b->total_sec / total : 0.0;
+        fprintf(stderr,
+                "  %6.2f%%  %8.3f sec  %7llu calls  %8.3f ms/call  %s\n",
+                pct, b->total_sec, (unsigned long long)b->count,
+                1000.0 * b->total_sec / (double)b->count,
+                b->name);
+    }
 }
 
 static const uint8_t *tensor_u8_const(const ds4_metal_tensor *t) {
@@ -428,6 +524,69 @@ __global__ static void rocm_matmul_q8_0_kernel(float *out,
     if (tid == 0) out[tok * out_dim + row] = sh[0];
 }
 
+/* Strix Halo (RDNA 3.5) optimised Q8_0 matmul.
+ *
+ *   - blockDim.x = N_ROWS_PER_BLOCK * 32: one wavefront per output row.
+ *   - Each block computes N_ROWS_PER_BLOCK rows of one token.
+ *   - x[tok, :] is cooperatively loaded into LDS once per block, then
+ *     every wave reuses it from LDS instead of re-reading from global.
+ *   - In-wave reduction uses __shfl_down (no LDS, no syncthreads).
+ *
+ * Constraints: in_dim divisible by 32 (true for all DSv4 matmuls -- the
+ * scheduler aligns dims to DS4_QK_K=256), in_dim*sizeof(float) <= LDS
+ * budget (we pick a safe ceiling of 16 KiB = 4096 floats per token).
+ * The dispatcher falls back to the legacy kernel when those don't hold.
+ *
+ * Three concrete instantiations: 8 / 4 / 1 rows per block.  Plain
+ * functions (not C++ templates) because this TU is wrapped in extern "C". */
+
+static __device__ __forceinline__ float rocm_q8_0_block_dot(
+        const uint8_t *__restrict__ blk, const float *__restrict__ x_lds_block) {
+    const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    const int8_t *qs = (const int8_t *)(blk + 2);
+    float dot = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) dot += (float)qs[j] * x_lds_block[j];
+    return rocm_f16_to_f32(scale_bits) * dot;
+}
+
+static __device__ __forceinline__ float rocm_wave32_sum(float v) {
+    v += __shfl_down(v, 16);
+    v += __shfl_down(v,  8);
+    v += __shfl_down(v,  4);
+    v += __shfl_down(v,  2);
+    v += __shfl_down(v,  1);
+    return v;
+}
+
+#define ROCM_DEFINE_MATMUL_Q8_0_LDS(NROWS) \
+__global__ static void rocm_matmul_q8_0_lds_##NROWS##_kernel( \
+        float *out, const uint8_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes) { \
+    extern __shared__ float x_lds[]; \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t tok     = blockIdx.y; \
+    const float *xr = x + (uint64_t)tok * in_dim; \
+    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = xr[i]; \
+    __syncthreads(); \
+    if (row >= out_dim) return; \
+    const uint32_t blocks = in_dim >> 5; \
+    const uint8_t *wr = w + (uint64_t)row * row_bytes; \
+    float sum = 0.0f; \
+    for (uint32_t b = lane; b < blocks; b += 32u) { \
+        sum += rocm_q8_0_block_dot(wr + (uint64_t)b * 34u, x_lds + (b << 5)); \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_Q8_0_LDS(8)
+ROCM_DEFINE_MATMUL_Q8_0_LDS(4)
+ROCM_DEFINE_MATMUL_Q8_0_LDS(1)
+
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,
                                                               float *split,
@@ -627,6 +786,7 @@ int ds4_metal_init(void) {
 void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)hipDeviceSynchronize();
+    rocm_time_dump();
     for (int i = 0; i < g_registration_count; i++) {
         if (g_registrations[i].host_owned) {
             (void)hipHostUnregister(g_registrations[i].host_owned);
@@ -753,6 +913,12 @@ int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void 
     if (!tensor || (!data && bytes != 0)) return 0;
     if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (bytes == 0) return 1;
+    /* Reads need fresh data: drain any in-flight kernels we deferred in
+     * batched mode before sampling the tensor.  This is the only place
+     * outside the explicit batch boundaries where CPU consumes results. */
+    if (g_batch_open && !rocm_sync_each()) {
+        if (!rocm_ok(hipDeviceSynchronize(), "tensor read drain")) return 0;
+    }
     const void *src = tensor->host ?
                       (const void *)(tensor_host_u8_const(tensor) + offset) :
                       (const void *)(tensor_u8_const(tensor) + offset);
@@ -808,6 +974,32 @@ int ds4_metal_end_commands(void) {
 int ds4_metal_synchronize(void) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     return rocm_ok(hipDeviceSynchronize(), "synchronize");
+}
+
+/* Per-kernel launch validation.
+ *
+ * Historically every wrapper finished with `rocm_ok(hipGetLastError(), ...) &&
+ * rocm_ok(hipDeviceSynchronize(), ...)` -- a full device-wide barrier after
+ * every single kernel.  With ~30k kernel launches per inference, that's a
+ * massive amount of CPU/GPU drain time that scales with launch count, not
+ * useful work.  In batched mode we now only check the launch's
+ * hipGetLastError and rely on default-stream FIFO ordering to keep
+ * dependent kernels correct; the explicit sync is deferred to the
+ * begin/flush/end/synchronize boundaries that ds4.c already brackets graphs
+ * with.  Set DS4_ROCM_SYNC_EACH=1 to restore per-kernel sync (debug). */
+static int g_sync_each = -1;
+static int rocm_sync_each(void) {
+    if (g_sync_each < 0) {
+        const char *v = getenv("DS4_ROCM_SYNC_EACH");
+        g_sync_each = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return g_sync_each;
+}
+
+static int rocm_launch_done(const char *launch_label, const char *sync_label) {
+    if (!rocm_ok(hipGetLastError(), launch_label)) return 0;
+    if (g_batch_open && !rocm_sync_each()) return 1;
+    return rocm_ok(hipDeviceSynchronize(), sync_label);
 }
 
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
@@ -912,58 +1104,71 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
     const int fd = rocm_resolve_mmap_path(base, src_path, sizeof(src_path)) > 0
         ? open(src_path, O_RDONLY)
         : -1;
-    /* Pinned staging buffer.  Sized to amortize per-call overhead; smaller
-     * is fine, larger is fine until host memlock budget is exhausted. */
+    /* Pinned staging buffer.  Sized to amortize per-call overhead; on
+     * Strix Halo (UMA) the H2D "DMA" is just a memcpy from pinned host
+     * to GPU partition, so adding parallelism between disk reads and
+     * H2D doesn't add bandwidth -- they share the same memory bus.
+     * Sequential single-buffer with kernel-driven readahead measured
+     * fastest in A/B testing (~2.7 GiB/s vs ~2.2 GiB/s for a 3-buffer
+     * threaded pipeline that paid for extra pinned RAM with no win). */
     const uint64_t stage_bytes = 256ull * 1024ull * 1024ull;
     void *stage_host = NULL;
     if (fd >= 0 && hipHostMalloc(&stage_host, (size_t)stage_bytes,
                                  hipHostMallocDefault) != hipSuccess) {
         stage_host = NULL;
     }
+    int load_ok = 0;
     if (fd >= 0 && stage_host) {
-        /* Hint disk readahead while we DMA the previous chunk -- pipeline
-         * disk reads with device copies. */
         (void)posix_fadvise(fd, 0, (off_t)map_size, POSIX_FADV_SEQUENTIAL);
         (void)posix_fadvise(fd, 0, (off_t)map_size, POSIX_FADV_WILLNEED);
         const off_t base_off = (off_t)((const uint8_t *)base -
                                         (const uint8_t *)model_map);
+        struct timespec t_start;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+        load_ok = 1;
         for (uint64_t off = 0; off < map_size; off += stage_bytes) {
-            const uint64_t n = (map_size - off < stage_bytes) ? (map_size - off) : stage_bytes;
-            ssize_t got = pread(fd, stage_host, (size_t)n, base_off + (off_t)off);
+            const uint64_t n = (map_size - off < stage_bytes)
+                ? (map_size - off) : stage_bytes;
+            ssize_t got = pread(fd, stage_host, (size_t)n,
+                                base_off + (off_t)off);
             if (got != (ssize_t)n) {
                 fprintf(stderr,
                         "ds4: ROCm model read at offset %llu got %zd of %llu bytes\n",
-                        (unsigned long long)(base_off + off),
+                        (unsigned long long)(base_off + (off_t)off),
                         got, (unsigned long long)n);
-                (void)hipHostFree(stage_host);
-                (void)close(fd);
-                (void)hipFree(dev_alloc);
-                return 0;
+                load_ok = 0;
+                break;
             }
             if (!rocm_ok(hipMemcpy((uint8_t *)dev_alloc + off,
                                    stage_host, (size_t)n,
                                    hipMemcpyHostToDevice),
                          "model map staged copy")) {
-                (void)hipHostFree(stage_host);
-                (void)close(fd);
-                (void)hipFree(dev_alloc);
-                return 0;
+                load_ok = 0;
+                break;
             }
             if ((off + n) % (4ull * stage_bytes) == 0 || off + n == map_size) {
-                fprintf(stderr, "ds4: ROCm model copy %llu / %llu MiB\n",
+                struct timespec t_now;
+                clock_gettime(CLOCK_MONOTONIC, &t_now);
+                const double elapsed =
+                    (double)(t_now.tv_sec - t_start.tv_sec) +
+                    1.0e-9 * (double)(t_now.tv_nsec - t_start.tv_nsec);
+                const double gibps = elapsed > 0.0
+                    ? ((double)(off + n) / (1024.0 * 1024.0 * 1024.0)) / elapsed
+                    : 0.0;
+                fprintf(stderr,
+                        "ds4: ROCm model copy %llu / %llu MiB (%.2f GiB/s avg)\n",
                         (unsigned long long)((off + n) >> 20),
-                        (unsigned long long)(map_size >> 20));
+                        (unsigned long long)(map_size >> 20), gibps);
             }
         }
-        (void)hipHostFree(stage_host);
-        (void)close(fd);
-    } else {
-        /* Fallback: source mmap is the only thing we can read from.  Slower
-         * because each 4 KiB page faults synchronously before hipMemcpy DMAs
-         * it.  Used when /proc/self/maps lookup fails (e.g. test buffers
-         * that aren't backed by a file). */
-        if (fd >= 0) (void)close(fd);
-        if (stage_host) (void)hipHostFree(stage_host);
+    }
+    if (fd >= 0) (void)close(fd);
+    if (stage_host) (void)hipHostFree(stage_host);
+
+    if (!load_ok) {
+        /* Fallback: source mmap is the only thing we can read from.  Used
+         * when /proc/self/maps lookup fails (e.g. test buffers that
+         * aren't backed by a file). */
         (void)madvise(base, (size_t)map_size, MADV_SEQUENTIAL);
         (void)madvise(base, (size_t)map_size, MADV_WILLNEED);
         const uint64_t chunk = 1ull * 1024ull * 1024ull * 1024ull;
@@ -1022,6 +1227,7 @@ int ds4_metal_embed_token_hc_tensor(
         uint32_t          n_embd,
         uint32_t          n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_embed_token_hc_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_embed_token_hc_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !model_map || n_vocab == 0 || token >= n_vocab || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t out_bytes = (uint64_t)n_embd * n_hc * sizeof(float);
@@ -1044,8 +1250,7 @@ int ds4_metal_embed_token_hc_tensor(
                        (const uint16_t *)row_dev,
                        n_embd,
                        n_hc);
-    int ok = rocm_ok(hipGetLastError(), "embed token launch") &&
-             rocm_ok(hipDeviceSynchronize(), "embed token completion");
+    int ok = rocm_launch_done("embed token launch", "embed token completion");
     if (row_host) (void)hipHostFree(row_host);
     return ok;
 }
@@ -1061,6 +1266,7 @@ int ds4_metal_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_embed_tokens_hc_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_embed_tokens_hc_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !tokens || !model_map || n_vocab == 0 || n_tokens == 0 || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t out_bytes = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
@@ -1089,8 +1295,7 @@ int ds4_metal_embed_tokens_hc_tensor(
                        n_embd,
                        n_hc,
                        n_vocab);
-    int ok = rocm_ok(hipGetLastError(), "embed tokens launch") &&
-             rocm_ok(hipDeviceSynchronize(), "embed tokens completion");
+    int ok = rocm_launch_done("embed tokens launch", "embed tokens completion");
     if (table_host) (void)hipHostFree(table_host);
     return ok;
 }
@@ -1101,6 +1306,7 @@ int ds4_metal_repeat_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_repeat_hc_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_repeat_hc_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !row || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
@@ -1119,8 +1325,7 @@ int ds4_metal_repeat_hc_tensor(
                        (const float *)tensor_u8_const(row),
                        n_embd,
                        n_hc);
-    return rocm_ok(hipGetLastError(), "repeat launch") &&
-           rocm_ok(hipDeviceSynchronize(), "repeat completion");
+    return rocm_launch_done("repeat launch", "repeat completion");
 }
 
 int ds4_metal_rms_norm_plain_tensor(
@@ -1129,6 +1334,7 @@ int ds4_metal_rms_norm_plain_tensor(
         uint32_t                n,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_plain_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rms_norm_plain_tensor");
     return ds4_metal_rms_norm_plain_rows_tensor(out, x, n, 1, eps);
 }
 
@@ -1139,6 +1345,7 @@ int ds4_metal_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_plain_rows_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rms_norm_plain_rows_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !x || n == 0 || rows == 0 || (n & 3u) != 0) return 0;
     const uint64_t bytes = (uint64_t)n * rows * sizeof(float);
@@ -1157,8 +1364,7 @@ int ds4_metal_rms_norm_plain_rows_tensor(
                        (const float *)tensor_u8_const(x),
                        n,
                        eps);
-    return rocm_ok(hipGetLastError(), "plain RMS norm launch") &&
-           rocm_ok(hipDeviceSynchronize(), "plain RMS norm completion");
+    return rocm_launch_done("plain RMS norm launch", "plain RMS norm completion");
 }
 
 int ds4_metal_swiglu_tensor(
@@ -1169,6 +1375,7 @@ int ds4_metal_swiglu_tensor(
         float                   clamp,
         float                   weight) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_swiglu_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_swiglu_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !gate || !up || n == 0) return 0;
     if (fabsf(clamp) > 1.0e-12f || fabsf(weight - 1.0f) > 1.0e-12f) {
@@ -1189,8 +1396,7 @@ int ds4_metal_swiglu_tensor(
                        (const float *)tensor_u8_const(gate),
                        (const float *)tensor_u8_const(up),
                        n);
-    return rocm_ok(hipGetLastError(), "SwiGLU launch") &&
-           rocm_ok(hipDeviceSynchronize(), "SwiGLU completion");
+    return rocm_launch_done("SwiGLU launch", "SwiGLU completion");
 }
 
 int ds4_metal_add_tensor(
@@ -1199,6 +1405,7 @@ int ds4_metal_add_tensor(
         const ds4_metal_tensor *b,
         uint32_t                n) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_add_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_add_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !a || !b || n == 0) return 0;
     const uint64_t bytes = (uint64_t)n * sizeof(float);
@@ -1215,8 +1422,7 @@ int ds4_metal_add_tensor(
                        (const float *)tensor_u8_const(a),
                        (const float *)tensor_u8_const(b),
                        n);
-    return rocm_ok(hipGetLastError(), "add launch") &&
-           rocm_ok(hipDeviceSynchronize(), "add completion");
+    return rocm_launch_done("add launch", "add completion");
 }
 
 int ds4_metal_matmul_f16_tensor(
@@ -1229,6 +1435,7 @@ int ds4_metal_matmul_f16_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_f16_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1258,8 +1465,7 @@ int ds4_metal_matmul_f16_tensor(
                        (const float *)tensor_u8_const(x),
                        in_dim,
                        out_dim);
-    int ok = rocm_ok(hipGetLastError(), "F16 matmul launch") &&
-             rocm_ok(hipDeviceSynchronize(), "F16 matmul completion");
+    int ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
     if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
@@ -1276,6 +1482,7 @@ int ds4_metal_matmul_f16_pair_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_pair_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_f16_pair_tensor");
     return ds4_metal_matmul_f16_tensor(out_a, model_map, model_size,
                                        weight_a_offset, in_dim, out_dim, x, n_tok) &&
            ds4_metal_matmul_f16_tensor(out_b, model_map, model_size,
@@ -1292,6 +1499,7 @@ int ds4_metal_matmul_f32_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f32_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_f32_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1321,8 +1529,7 @@ int ds4_metal_matmul_f32_tensor(
                        (const float *)tensor_u8_const(x),
                        in_dim,
                        out_dim);
-    int ok = rocm_ok(hipGetLastError(), "F32 matmul launch") &&
-             rocm_ok(hipDeviceSynchronize(), "F32 matmul completion");
+    int ok = rocm_launch_done("F32 matmul launch", "F32 matmul completion");
     if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
@@ -1337,6 +1544,7 @@ int ds4_metal_matmul_q8_0_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_q8_0_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1353,21 +1561,23 @@ int ds4_metal_matmul_q8_0_tensor(
     const void *src = (const uint8_t *)model_map + weight_offset;
     if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "Q8_0 weight upload")) return 0;
 
-    const dim3 block(256);
+    /* Block-size tuning: each thread runs `for (b = tid; b < blocks; b +=
+     * blockDim.x)` so we want blockDim near `blocks` (= in_dim/32) to
+     * keep all wavefronts busy.  Capped at 256 for register pressure;
+     * floored at 32 so we always launch a full wavefront. */
+    const uint64_t qblocks = (in_dim + 31u) / 32u;
+    unsigned threads = 256u;
+    while (threads > 32u && (uint64_t)threads > qblocks) threads >>= 1;
+
+    const dim3 block(threads);
     const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
     hipLaunchKernelGGL(rocm_matmul_q8_0_kernel,
-                       grid,
-                       block,
-                       block.x * sizeof(float),
-                       0,
+                       grid, block, block.x * sizeof(float), 0,
                        (float *)tensor_u8(out),
                        (const uint8_t *)w_dev,
                        (const float *)tensor_u8_const(x),
-                       in_dim,
-                       out_dim,
-                       row_bytes);
-    int ok = rocm_ok(hipGetLastError(), "Q8_0 matmul launch") &&
-             rocm_ok(hipDeviceSynchronize(), "Q8_0 matmul completion");
+                       in_dim, out_dim, row_bytes);
+    int ok = rocm_launch_done("Q8_0 matmul launch", "Q8_0 matmul completion");
     if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
@@ -1381,6 +1591,7 @@ int ds4_metal_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_weight_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rms_norm_weight_tensor");
     return ds4_metal_rms_norm_weight_rows_tensor(out, x, model_map, model_size,
                                                  weight_offset, n, 1, eps);
 }
@@ -1395,6 +1606,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_weight_rows_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rms_norm_weight_rows_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !x || !model_map || n == 0 || rows == 0 || (n & 3u) != 0) return 0;
     const uint64_t bytes = (uint64_t)n * rows * sizeof(float);
@@ -1423,8 +1635,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
                        (const float *)w_dev,
                        n,
                        eps);
-    int ok = rocm_ok(hipGetLastError(), "weighted RMS norm launch") &&
-             rocm_ok(hipDeviceSynchronize(), "weighted RMS norm completion");
+    int ok = rocm_launch_done("weighted RMS norm launch", "weighted RMS norm completion");
     if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
@@ -1443,6 +1654,7 @@ int ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                rows,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_qkv_rms_norm_rows_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_dsv4_qkv_rms_norm_rows_tensor");
     return ds4_metal_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
                                                  q_weight_offset, q_n, rows, eps) &&
            ds4_metal_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
@@ -1456,6 +1668,7 @@ int ds4_metal_head_rms_norm_tensor(
         uint32_t          head_dim,
         float             eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_head_rms_norm_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_head_rms_norm_tensor");
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0) return 0;
     return ds4_metal_rms_norm_plain_rows_tensor(x, x, head_dim, n_tok * n_head, eps);
 }
@@ -1477,6 +1690,7 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_weighted_sum_norm_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_split_weighted_sum_norm_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
@@ -1550,8 +1764,7 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
                        sinkhorn_iters,
                        eps,
                        norm_eps);
-    ok = rocm_ok(hipGetLastError(), "HC split/sum/norm launch") &&
-         rocm_ok(hipDeviceSynchronize(), "HC split/sum/norm completion");
+    ok = rocm_launch_done("HC split/sum/norm launch", "HC split/sum/norm completion");
     if (scale_host) (void)hipHostFree(scale_host);
     if (base_host) (void)hipHostFree(base_host);
     if (norm_host) (void)hipHostFree(norm_host);
@@ -1574,6 +1787,7 @@ int ds4_metal_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rope_tail_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rope_tail_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) {
         return 0;
@@ -1604,8 +1818,7 @@ int ds4_metal_rope_tail_tensor(
                        attn_factor,
                        beta_fast,
                        beta_slow);
-    return rocm_ok(hipGetLastError(), "RoPE tail launch") &&
-           rocm_ok(hipDeviceSynchronize(), "RoPE tail completion");
+    return rocm_launch_done("RoPE tail launch", "RoPE tail completion");
 }
 
 int ds4_metal_dsv4_fp8_kv_quantize_tensor(
@@ -1614,6 +1827,7 @@ int ds4_metal_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_fp8_kv_quantize_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_dsv4_fp8_kv_quantize_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!x || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
     if (n_rot == head_dim) return 1;
@@ -1631,8 +1845,7 @@ int ds4_metal_dsv4_fp8_kv_quantize_tensor(
                        n_tok,
                        head_dim,
                        n_rot);
-    return rocm_ok(hipGetLastError(), "FP8 KV quantize launch") &&
-           rocm_ok(hipDeviceSynchronize(), "FP8 KV quantize completion");
+    return rocm_launch_done("FP8 KV quantize launch", "FP8 KV quantize completion");
 }
 
 /* =========================================================================
@@ -1686,8 +1899,7 @@ static int rocm_hc_weighted_sum_strided(ds4_metal_tensor       *out,
                        (const float *)(tensor_u8_const(weights) + weight_offset_bytes),
                        n_embd, n_hc, (uint32_t)n_tokens,
                        weight_row_stride / sizeof(float));
-    return rocm_ok(hipGetLastError(), label) &&
-           rocm_ok(hipDeviceSynchronize(), label);
+    return rocm_launch_done(label, label);
 }
 
 int ds4_metal_hc_weighted_sum_tensor(
@@ -1697,6 +1909,7 @@ int ds4_metal_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_weighted_sum_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_weighted_sum_tensor");
     return rocm_hc_weighted_sum_strided(out, residual_hc, weights, 0,
                                         (uint64_t)n_hc * sizeof(float),
                                         n_embd, n_hc, "HC weighted sum");
@@ -1709,6 +1922,7 @@ int ds4_metal_hc_weighted_sum_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_weighted_sum_split_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_weighted_sum_split_tensor");
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     return rocm_hc_weighted_sum_strided(out, residual_hc, split, 0,
                                         mix_hc * sizeof(float),
@@ -1793,6 +2007,7 @@ int ds4_metal_hc_split_sinkhorn_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_sinkhorn_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_split_sinkhorn_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !mix || !model_map || n_hc == 0 || n_hc > 16) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -1822,8 +2037,7 @@ int ds4_metal_hc_split_sinkhorn_tensor(
                        (const float *)sd,
                        (const float *)bd,
                        n_hc, sinkhorn_iters, eps, (uint32_t)rows, (uint32_t)mix_hc);
-    ok = rocm_ok(hipGetLastError(), "HC sinkhorn launch") &&
-         rocm_ok(hipDeviceSynchronize(), "HC sinkhorn completion");
+    ok = rocm_launch_done("HC sinkhorn launch", "HC sinkhorn completion");
     if (sh) (void)hipHostFree(sh);
     if (bh) (void)hipHostFree(bh);
     return ok;
@@ -1843,6 +2057,7 @@ int ds4_metal_hc_split_weighted_sum_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_weighted_sum_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_split_weighted_sum_tensor");
     /* Compose split (sinkhorn) + weighted_sum_split.  The fused norm variant
      * already lives in a dedicated kernel; this two-stage path matches the
      * Metal reference fallback used by the graph driver. */
@@ -1877,6 +2092,7 @@ int ds4_metal_output_hc_weights_tensor(
         uint32_t                n_hc,
         float                   eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_output_hc_weights_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_output_hc_weights_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !pre || !model_map || n_hc == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
@@ -1901,8 +2117,7 @@ int ds4_metal_output_hc_weights_tensor(
                        (const float *)tensor_u8_const(pre),
                        (const float *)sd, (const float *)bd,
                        n_hc, (uint32_t)rows, eps);
-    ok = rocm_ok(hipGetLastError(), "output_hc launch") &&
-         rocm_ok(hipDeviceSynchronize(), "output_hc completion");
+    ok = rocm_launch_done("output_hc launch", "output_hc completion");
     if (sh) (void)hipHostFree(sh);
     if (bh) (void)hipHostFree(bh);
     return ok;
@@ -1985,8 +2200,7 @@ static int rocm_hc_expand_dispatch(
                        (uint32_t)post_stride_floats,
                        (uint32_t)comb_stride_floats,
                        has_add);
-    return rocm_ok(hipGetLastError(), label) &&
-           rocm_ok(hipDeviceSynchronize(), label);
+    return rocm_launch_done(label, label);
 }
 
 int ds4_metal_hc_expand_tensor(
@@ -1998,6 +2212,7 @@ int ds4_metal_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_expand_tensor");
     /* post is [n_hc, n_tokens] dense, comb is [n_hc, n_hc, n_tokens] dense. */
     return rocm_hc_expand_dispatch(out_hc, block_out, NULL, residual_hc, post, comb,
                                    (uint64_t)n_hc, (uint64_t)n_hc * n_hc,
@@ -2012,6 +2227,7 @@ int ds4_metal_hc_expand_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_split_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_expand_split_tensor");
     /* split layout per row: [pre[n_hc] | post[n_hc] | comb[n_hc*n_hc]] */
     if (!split) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -2040,6 +2256,7 @@ int ds4_metal_hc_expand_add_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_add_split_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_hc_expand_add_split_tensor");
     if (!split) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     ds4_metal_tensor *post_view = ds4_metal_tensor_view(split, (uint64_t)n_hc * sizeof(float),
@@ -2077,6 +2294,7 @@ int ds4_metal_store_raw_kv_tensor(
         uint32_t                row,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_store_raw_kv_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_store_raw_kv_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap || head_dim == 0) return 0;
     const uint64_t needed = ((uint64_t)row + 1u) * head_dim * sizeof(float);
@@ -2086,8 +2304,7 @@ int ds4_metal_store_raw_kv_tensor(
     const dim3 grid((head_dim + block.x - 1u) / block.x);
     hipLaunchKernelGGL(rocm_store_raw_kv_kernel, grid, block, 0, 0,
                        raw, (const float *)tensor_u8_const(kv), head_dim);
-    return rocm_ok(hipGetLastError(), "store raw kv launch") &&
-           rocm_ok(hipDeviceSynchronize(), "store raw kv completion");
+    return rocm_launch_done("store raw kv launch", "store raw kv completion");
 }
 
 int ds4_metal_store_raw_kv_batch_tensor(
@@ -2098,6 +2315,7 @@ int ds4_metal_store_raw_kv_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_store_raw_kv_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_store_raw_kv_batch_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!raw_cache || !kv || head_dim == 0 || n_tokens == 0) return 0;
     if ((uint64_t)pos0 + n_tokens > raw_cap) return 0;
@@ -2156,6 +2374,7 @@ int ds4_metal_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_kv_fp8_store_raw_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_kv_fp8_store_raw_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv || !raw_cache || head_dim == 0 || n_rot > head_dim || row >= raw_cap) return 0;
     if (kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -2163,8 +2382,7 @@ int ds4_metal_kv_fp8_store_raw_tensor(
     float *raw = (float *)tensor_u8(raw_cache) + (uint64_t)row * head_dim;
     hipLaunchKernelGGL(rocm_kv_fp8_store_raw_kernel, dim3(1), dim3(64), 0, 0,
                        (float *)tensor_u8(kv), raw, head_dim, n_rot);
-    return rocm_ok(hipGetLastError(), "kv fp8 store launch") &&
-           rocm_ok(hipDeviceSynchronize(), "kv fp8 store completion");
+    return rocm_launch_done("kv fp8 store launch", "kv fp8 store completion");
 }
 
 /* =========================================================================
@@ -2183,6 +2401,7 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_shared_gate_up_swiglu_q8_0_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_shared_gate_up_swiglu_q8_0_tensor");
     if (!gate || !up || !mid) return 0;
     if (!ds4_metal_matmul_q8_0_tensor(gate, model_map, model_size, gate_offset, in_dim, out_dim, x, 1)) return 0;
     if (!ds4_metal_matmul_q8_0_tensor(up, model_map, model_size, up_offset, in_dim, out_dim, x, 1)) return 0;
@@ -2203,6 +2422,7 @@ int ds4_metal_attention_output_low_q8_tensor(
         uint32_t                n_groups,
         const ds4_metal_tensor *heads) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_low_q8_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_output_low_q8_tensor");
     /* heads is laid out as n_groups blocks of group_dim; produce one column of
      * size n_groups * rank by running n_groups independent Q8_0 matvecs.
      * Each matvec consumes group_dim inputs and produces `rank` outputs.
@@ -2246,6 +2466,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
         const ds4_metal_tensor *heads,
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_q8_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_output_q8_batch_tensor");
     /* For each token, compute low = Wa @ heads (per-group Q8 matvec), then
      * out = Wb @ low (single Q8 matvec of dim n_groups*rank -> out_dim). */
     (void)group_tmp;
@@ -2289,6 +2510,7 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_hc_expand_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_q8_0_hc_expand_tensor");
     /* Compose Q8 matmul (block_out = W . x) with HC expand (split layout). */
     if (!ds4_metal_matmul_q8_0_tensor(block_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, x, 1)) return 0;
@@ -2310,6 +2532,7 @@ int ds4_metal_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_shared_down_hc_expand_q8_0_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_shared_down_hc_expand_q8_0_tensor");
     /* shared_out = W . shared_mid (Q8); then HC expand uses (routed_out + shared_out) as block. */
     if (!ds4_metal_matmul_q8_0_tensor(shared_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, shared_mid, 1)) return 0;
@@ -2404,8 +2627,7 @@ static int rocm_indexer_scores_dispatch(
                        (const float *)tensor_u8_const(kcomp),
                        n_comp, n_tokens, n_head, head_dim,
                        pos0, ratio, scale);
-    return rocm_ok(hipGetLastError(), "indexer scores launch") &&
-           rocm_ok(hipDeviceSynchronize(), "indexer scores completion");
+    return rocm_launch_done("indexer scores launch", "indexer scores completion");
 }
 
 int ds4_metal_indexer_score_one_tensor(
@@ -2418,6 +2640,7 @@ int ds4_metal_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_score_one_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_indexer_score_one_tensor");
     /* one-token decode at any position; visibility handled by caller via n_comp.
      * We pass ratio=0 so all rows up to n_comp are visible. */
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
@@ -2437,6 +2660,7 @@ int ds4_metal_indexer_scores_prefill_tensor(
         uint32_t                ratio,
         float                   scale) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_scores_prefill_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_indexer_scores_prefill_tensor");
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
                                         n_comp, n_tokens, n_head, head_dim,
                                         0, ratio, scale);
@@ -2455,6 +2679,7 @@ int ds4_metal_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_scores_decode_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_indexer_scores_decode_batch_tensor");
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
                                         n_comp, n_tokens, n_head, head_dim,
                                         pos0, ratio, scale);
@@ -2506,6 +2731,7 @@ int ds4_metal_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_topk_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_indexer_topk_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0) return 0;
     if (selected->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) return 0;
@@ -2517,8 +2743,7 @@ int ds4_metal_indexer_topk_tensor(
                        (int32_t *)tensor_u8(selected),
                        (const float *)tensor_u8_const(scores),
                        n_comp, top_k);
-    return rocm_ok(hipGetLastError(), "indexer topk launch") &&
-           rocm_ok(hipDeviceSynchronize(), "indexer topk completion");
+    return rocm_launch_done("indexer topk launch", "indexer topk completion");
 }
 
 __global__ static void rocm_topk_mask_init_kernel(float *mask,
@@ -2553,6 +2778,7 @@ int ds4_metal_dsv4_topk_mask_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_topk_mask_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_dsv4_topk_mask_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0) return 0;
     if (mask->bytes < (uint64_t)n_comp * n_tokens * sizeof(float)) return 0;
@@ -2564,8 +2790,7 @@ int ds4_metal_dsv4_topk_mask_tensor(
         const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
         hipLaunchKernelGGL(rocm_topk_mask_init_kernel, grid, block, 0, 0,
                            (float *)tensor_u8(mask), n_comp, n_tokens);
-        if (!rocm_ok(hipGetLastError(), "topk mask init launch") ||
-            !rocm_ok(hipDeviceSynchronize(), "topk mask init completion")) return 0;
+        if (!rocm_launch_done("topk mask init launch", "topk mask init completion")) return 0;
     }
     {
         const uint64_t total = (uint64_t)top_k * n_tokens;
@@ -2574,14 +2799,27 @@ int ds4_metal_dsv4_topk_mask_tensor(
         hipLaunchKernelGGL(rocm_topk_mask_scatter_kernel, grid, block, 0, 0,
                            (float *)tensor_u8(mask), (const int32_t *)tensor_u8_const(topk),
                            n_comp, n_tokens, top_k);
-        return rocm_ok(hipGetLastError(), "topk mask scatter launch") &&
-               rocm_ok(hipDeviceSynchronize(), "topk mask scatter completion");
+        return rocm_launch_done("topk mask scatter launch", "topk mask scatter completion");
     }
 }
 
 /* =========================================================================
  * Router selection.
  * ========================================================================= */
+
+/* probs[i] := sqrt(softplus(logits[i])).  Replaces the CPU-side loop the
+ * router_select wrapper used to do; that loop forced a stream-drain in
+ * batched mode and dwarfed everything else when fired hundreds of times
+ * per token across 43 layers. */
+__global__ static void rocm_router_softplus_sqrt_kernel(float *probs,
+                                                        const float *logits,
+                                                        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float l = logits[i];
+    const float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+    probs[i] = sqrtf(sp > 0.0f ? sp : 0.0f);
+}
 
 __global__ static void rocm_router_select_one_kernel(int32_t *selected,
                                                      float *weights,
@@ -2638,6 +2876,7 @@ int ds4_metal_router_select_tensor(
         bool                    hash_mode,
         const ds4_metal_tensor *logits) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_router_select_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_router_select_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!selected || !weights || !probs || !logits) return 0;
     /* Call sites pass (0, 0) to mean "use DS4 defaults" -- the Metal driver
@@ -2648,20 +2887,20 @@ int ds4_metal_router_select_tensor(
     if (weights->bytes < (uint64_t)n_group_used * sizeof(float)) return 0;
     if (probs->bytes < (uint64_t)n_expert_groups * sizeof(float)) return 0;
 
-    /* probs := sqrt(softplus(logits)).  This matches the reference path so the
-     * caller doesn't need to pre-compute it.  The softmax-style probability
-     * shape is mandated by DS4. */
+    /* probs := sqrt(softplus(logits)) on the GPU.  Done as a launched
+     * kernel rather than a CPU loop so we don't force a stream drain in
+     * batched mode (router_select fires ~6 times per layer; a CPU drain
+     * each time was 99% of inference wall in DS4_ROCM_TIME profiles). */
     {
-        /* In-place transform on probs from logits (probs may equal logits). */
-        const float *src = (const float *)tensor_u8_const(logits);
-        float *dst = (float *)tensor_u8(probs);
-        for (uint32_t i = 0; i < n_expert_groups; i++) {
-            const float l = src[i];
-            const float sp = l > 20.0f ? l : logf(1.0f + expf(l));
-            dst[i] = sqrtf(sp > 0.0f ? sp : 0.0f);
-        }
-        /* Avoid a sync since these were host-mapped writes; downstream kernel
-         * reads through the same mapped pages. */
+        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
+        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
+        hipLaunchKernelGGL(rocm_router_softplus_sqrt_kernel,
+                           dim3(blocks), dim3(threads), 0, 0,
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           n_expert_groups);
+        if (!rocm_launch_done("router softplus_sqrt launch",
+                              "router softplus_sqrt completion")) return 0;
     }
 
     void *bh = NULL, *bd = NULL;
@@ -2691,8 +2930,7 @@ int ds4_metal_router_select_tensor(
                        (const int32_t *)hd,
                        n_expert_groups, n_group_used, hash_rows, token,
                        has_bias ? 1 : 0, hash_mode ? 1 : 0);
-    int ok = rocm_ok(hipGetLastError(), "router select launch") &&
-             rocm_ok(hipDeviceSynchronize(), "router select completion");
+    int ok = rocm_launch_done("router select launch", "router select completion");
     if (bh) (void)hipHostFree(bh);
     if (hh) (void)hipHostFree(hh);
     return ok;
@@ -2715,6 +2953,7 @@ int ds4_metal_router_select_batch_tensor(
         const ds4_metal_tensor *tokens,
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_router_select_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_router_select_batch_tensor");
     if (!selected || !weights || !probs || !logits || !tokens) return 0;
     if (n_expert_groups == 0) n_expert_groups = 256u;
     if (n_group_used == 0) n_group_used = 6u;
@@ -2810,6 +3049,7 @@ int ds4_metal_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_store_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_compressor_store_batch_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || n_tokens == 0 || ratio == 0u ||
@@ -2844,8 +3084,7 @@ int ds4_metal_compressor_store_batch_tensor(
                        ape_type == 0u ? (const float *)ape_d : (const float *)NULL,
                        ape_type == 1u ? (const __half *)ape_d : (const __half *)NULL,
                        width, ratio, coff, pos0, n_tokens);
-    int ok = rocm_ok(hipGetLastError(), "compressor store batch launch") &&
-             rocm_ok(hipDeviceSynchronize(), "compressor store batch completion");
+    int ok = rocm_launch_done("compressor store batch launch", "compressor store batch completion");
     if (ape_h) (void)hipHostFree(ape_h);
     return ok;
 }
@@ -2926,8 +3165,7 @@ static int rocm_compressor_pool_dispatch(ds4_metal_tensor *out,
                        (const float *)tensor_u8_const(state_kv),
                        (const float *)tensor_u8_const(state_score),
                        head_dim, ratio, coff);
-    return rocm_ok(hipGetLastError(), "compressor pool launch") &&
-           rocm_ok(hipDeviceSynchronize(), "compressor pool completion");
+    return rocm_launch_done("compressor pool launch", "compressor pool completion");
 }
 
 static int rocm_compressor_ratio4_shift_dispatch(ds4_metal_tensor *state_kv,
@@ -2940,8 +3178,7 @@ static int rocm_compressor_ratio4_shift_dispatch(ds4_metal_tensor *state_kv,
                        (float *)tensor_u8(state_kv),
                        (float *)tensor_u8(state_score),
                        width);
-    return rocm_ok(hipGetLastError(), "compressor shift launch") &&
-           rocm_ok(hipDeviceSynchronize(), "compressor shift completion");
+    return rocm_launch_done("compressor shift launch", "compressor shift completion");
 }
 
 int ds4_metal_compressor_update_tensor(
@@ -2970,6 +3207,7 @@ int ds4_metal_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_update_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_compressor_update_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache || !model_map ||
         head_dim == 0 || ratio == 0u ||
@@ -3024,8 +3262,7 @@ static int rocm_fill_f32_dispatch(void *p, float v, uint64_t n) {
     const uint64_t blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(rocm_fill_f32_kernel, dim3((uint32_t)blocks), dim3((uint32_t)threads), 0, 0,
                        (float *)p, v, n);
-    return rocm_ok(hipGetLastError(), "fill f32 launch") &&
-           rocm_ok(hipDeviceSynchronize(), "fill f32 completion");
+    return rocm_launch_done("fill f32 launch", "fill f32 completion");
 }
 
 /* Multi-token prefill compressor pass.  Resets state, then iterates tokens
@@ -3059,6 +3296,7 @@ int ds4_metal_compressor_prefill_tensor(
         float                   rms_eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_tensor head_dim=%u ratio=%u pos0=%u n_tokens=%u n_rot=%u ape_type=%u norm_type=%u\n",
                               head_dim, ratio, pos0, n_tokens, n_rot, ape_type, norm_type);
+    ROCM_TIME_SCOPE("ds4_metal_compressor_prefill_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0u || n_tokens == 0 ||
@@ -3153,6 +3391,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_state_ratio4_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_compressor_prefill_state_ratio4_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
         head_dim == 0 || (ape_type != 0u && ape_type != 1u)) return 0;
@@ -3187,8 +3426,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
                        ape_type == 0u ? (const float *)ape_d : (const float *)NULL,
                        ape_type == 1u ? (const __half *)ape_d : (const __half *)NULL,
                        width, pos0);
-    int ok = rocm_ok(hipGetLastError(), "compressor ratio4 state launch") &&
-             rocm_ok(hipDeviceSynchronize(), "compressor ratio4 state completion");
+    int ok = rocm_launch_done("compressor ratio4 state launch", "compressor ratio4 state completion");
     if (ape_h) (void)hipHostFree(ape_h);
     return ok;
 }
@@ -3219,6 +3457,7 @@ int ds4_metal_compressor_prefill_ratio4_replay_tensor(
         float                   beta_slow,
         float                   rms_eps) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_ratio4_replay_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_compressor_prefill_ratio4_replay_tensor");
     /* Replay is a ratio-4 prefill that requires aligned pos0 and full-period
      * n_tokens.  Semantically identical to compressor_prefill with ratio==4. */
     if (n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0) return 0;
@@ -3349,6 +3588,7 @@ int ds4_metal_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_decode_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3381,8 +3621,7 @@ int ds4_metal_attention_decode_heads_tensor(
                        use_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
                        (const float *)sink_d,
                        n_head, head_dim, n_raw, raw_cap, raw_start, n_comp, use_mask);
-    int ok = rocm_ok(hipGetLastError(), "attn decode heads launch") &&
-             rocm_ok(hipDeviceSynchronize(), "attn decode heads completion");
+    int ok = rocm_launch_done("attn decode heads launch", "attn decode heads completion");
     if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
@@ -3466,6 +3705,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_raw_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_prefill_raw_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || window == 0 || n_head == 0 || head_dim == 0) return 0;
@@ -3491,8 +3731,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
                        (const float *)tensor_u8_const(raw_kv),
                        (const float *)sink_d,
                        n_tokens, window, n_head, head_dim);
-    int ok = rocm_ok(hipGetLastError(), "attn prefill raw launch") &&
-             rocm_ok(hipDeviceSynchronize(), "attn prefill raw completion");
+    int ok = rocm_launch_done("attn prefill raw launch", "attn prefill raw completion");
     if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
@@ -3691,7 +3930,7 @@ static int rocm_attn_batch_dispatch(
     snprintf(launch_msg, sizeof(launch_msg), "attn batch %s launch", what);
     char done_msg[64];
     snprintf(done_msg, sizeof(done_msg), "attn batch %s completion", what);
-    int ok = rocm_ok(hipGetLastError(), launch_msg) && rocm_ok(hipDeviceSynchronize(), done_msg);
+    int ok = rocm_launch_done(launch_msg, done_msg);
     if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
@@ -3712,6 +3951,7 @@ int ds4_metal_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_raw_batch_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_decode_raw_batch_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3745,6 +3985,7 @@ int ds4_metal_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_mixed_batch_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_decode_mixed_batch_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3780,6 +4021,7 @@ int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_indexed_mixed_batch_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_indexed_mixed_batch_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3808,6 +4050,7 @@ int ds4_metal_attention_prefill_static_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_static_mixed_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_prefill_static_mixed_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
@@ -3838,6 +4081,7 @@ int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_masked_mixed_heads_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_attention_prefill_masked_mixed_heads_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_mask ||
         n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
@@ -4336,8 +4580,7 @@ static int rocm_moe_run(
                            expert_in_dim, expert_mid_dim, n_used, n_tokens,
                            (uint32_t)total_experts, clamp);
     }
-    ok = rocm_ok(hipGetLastError(), "moe gate_up launch") &&
-         rocm_ok(hipDeviceSynchronize(), "moe gate_up completion");
+    ok = rocm_launch_done("moe gate_up launch", "moe gate_up completion");
 
     if (ok) {
         const uint32_t threads = 64;
@@ -4353,8 +4596,7 @@ static int rocm_moe_run(
                            (const int32_t *)tensor_u8_const(selected),
                            expert_mid_dim, out_dim, n_used, n_tokens,
                            (uint32_t)total_experts);
-        ok = rocm_ok(hipGetLastError(), "moe down launch") &&
-             rocm_ok(hipDeviceSynchronize(), "moe down completion");
+        ok = rocm_launch_done("moe down launch", "moe down completion");
     }
 
     if (gate_h) (void)hipHostFree(gate_h);
@@ -4389,6 +4631,7 @@ int ds4_metal_routed_moe_one_tensor(
         float                   clamp,
         const ds4_metal_tensor *x) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_routed_moe_one_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_routed_moe_one_tensor");
     (void)gate; (void)up; (void)experts;
     return rocm_moe_run(out, mid, model_map, model_size,
                         gate_offset, up_offset, down_offset,
@@ -4426,6 +4669,7 @@ int ds4_metal_routed_moe_batch_tensor(
         const ds4_metal_tensor *x,
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_routed_moe_batch_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_routed_moe_batch_tensor");
     (void)gate; (void)up; (void)experts;
     return rocm_moe_run(out, mid, model_map, model_size,
                         gate_offset, up_offset, down_offset,

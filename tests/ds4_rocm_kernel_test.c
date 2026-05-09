@@ -168,6 +168,13 @@ typedef struct {
     uint16_t qs[MOE_QK_K / 8];
 } moe_block_iq2_xxs;
 
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[MOE_QK_K / 2];
+} moe_block_q4_K;
+
 static const uint64_t moe_iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
@@ -326,6 +333,51 @@ static float moe_q2_K_dot_block_cpu(const moe_block_q2_K *xb, const float *y) {
         q += 32;
     }
     return d * sum_d - dmin * sum_m;
+}
+
+static void moe_q4_K_get_scale_min(int j, const uint8_t *q, uint8_t *scale, uint8_t *minv) {
+    if (j < 4) {
+        *scale = q[j] & 0x3F;
+        *minv  = q[j + 4] & 0x3F;
+    } else {
+        *scale = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *minv  = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static float moe_q4_K_dot_block_cpu(const moe_block_q4_K *xb, const float *y) {
+    const float d = f16_to_f32(xb->d);
+    const float dmin = f16_to_f32(xb->dmin);
+    const uint8_t *q = xb->qs;
+    float sum_d = 0.0f, sum_m = 0.0f;
+    for (int j = 0; j < 8; j++) {
+        uint8_t scale, mn;
+        moe_q4_K_get_scale_min(j, xb->scales, &scale, &mn);
+        const int qoff = (j / 2) * 32;
+        const int shift = (j & 1) * 4;
+        const float *yj = y + j * 32;
+        float dot = 0.0f, sy = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            const float yv = yj[i];
+            dot += yv * (float)((q[qoff + i] >> shift) & 0x0F);
+            sy += yv;
+        }
+        sum_d += (float)scale * dot;
+        sum_m += (float)mn * sy;
+    }
+    return d * sum_d - dmin * sum_m;
+}
+
+static void moe_build_q4_K_block(moe_block_q4_K *b, uint32_t seed) {
+    b->d    = f32_to_f16(0.04f + 0.001f * (float)(seed & 0x7));
+    b->dmin = f32_to_f16(0.012f + 0.0006f * (float)(seed & 0xF));
+    /* 12-byte scales: 8 sub-groups, each 6-bit scale + 6-bit min. */
+    for (int i = 0; i < 12; i++) {
+        b->scales[i] = (uint8_t)((seed * 19u + (uint32_t)i * 7u) & 0xFFu);
+    }
+    for (int i = 0; i < 128; i++) {
+        b->qs[i] = (uint8_t)((seed * 23u + (uint32_t)i * 11u) & 0xFFu);
+    }
 }
 
 /* Build a synthetic IQ2_XXS block with deterministic content from a seed. */
@@ -1616,6 +1668,266 @@ int main(void) {
         read_tensor(tout_moe, got_out, n_tokens * out_dim);
         for (uint32_t i = 0; i < n_tokens * out_dim; i++) {
             require(nearf(got_out[i], ref_out[i], 1e-3f), "routed_moe_batch out value");
+        }
+
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        free(model);
+    }
+
+    STEP("routed_moe_one with Q4_K gate/up format");
+    {
+        /* Mirrors the IQ2_XXS test but uses Q4_K for gate/up to exercise that
+         * dequant path (the routed-MoE production checkpoints typically use
+         * IQ2_XXS, but the kernel supports Q4_K and we want to be sure the
+         * scale/min unpacking math is right). */
+        const uint32_t in_dim = 256;
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 2;
+        const uint32_t n_total = 256;
+        const float clamp = 4.0f;
+
+        const uint64_t gate_row_bytes = sizeof(moe_block_q4_K);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        uint8_t *model = (uint8_t *)calloc(1, (size_t)model_size);
+        require(model != NULL, "q4 moe model alloc");
+
+        moe_block_q4_K *gate_pool_p = (moe_block_q4_K *)(model + 0);
+        moe_block_q4_K *up_pool_p   = (moe_block_q4_K *)(model + gate_pool);
+        moe_block_q2_K *down_pool_p = (moe_block_q2_K *)(model + gate_pool + gate_pool);
+
+        const int32_t selected_vals[2] = { 5, 99 };
+        const float weights_vals[2] = { 0.7f, 0.3f };
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                moe_build_q4_K_block(&gate_pool_p[(uint64_t)e * mid_dim + r],
+                                     (uint32_t)e * 1031u + r * 5u);
+                moe_build_q4_K_block(&up_pool_p[(uint64_t)e * mid_dim + r],
+                                     (uint32_t)e * 1033u + r * 7u);
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                moe_build_q2_K_block(&down_pool_p[(uint64_t)e * out_dim + r],
+                                     (uint32_t)e * 1039u + r * 9u);
+            }
+        }
+
+        float xv[256];
+        for (uint32_t i = 0; i < 256; i++) xv[i] = 0.005f * (float)((int)(i % 11) - 5);
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc(sizeof(selected_vals));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc(sizeof(weights_vals));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "q4 moe tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, sizeof(xv)), "");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, sizeof(selected_vals)), "");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, sizeof(weights_vals)), "");
+
+        require(ds4_metal_routed_moe_one_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                 model, model_size,
+                                                 0, gate_pool, gate_pool + gate_pool,
+                                                 12u /* Q4_K */, 10u /* Q2_K */,
+                                                 gate_expert_bytes, gate_row_bytes,
+                                                 down_expert_bytes, down_row_bytes,
+                                                 in_dim, mid_dim, out_dim,
+                                                 tsel, twts, n_used, clamp, tx),
+                "routed_moe_one Q4_K");
+
+        float ref_mid[2 * 256];
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                float gate_v = moe_q4_K_dot_block_cpu(&gate_pool_p[(uint64_t)e * mid_dim + r], xv);
+                float up_v   = moe_q4_K_dot_block_cpu(&up_pool_p[(uint64_t)e * mid_dim + r], xv);
+                if (gate_v > clamp) gate_v = clamp;
+                if (up_v > clamp) up_v = clamp;
+                if (up_v < -clamp) up_v = -clamp;
+                const float silu = gate_v / (1.0f + expf(-gate_v));
+                ref_mid[s * mid_dim + r] = silu * up_v * weights_vals[s];
+            }
+        }
+        float got_mid[2 * 256];
+        read_tensor(tmid, got_mid, n_used * mid_dim);
+        for (uint32_t i = 0; i < n_used * mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 5e-3f), "Q4_K moe mid value");
+        }
+
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        free(model);
+    }
+
+    STEP("dequant edge cases (hand-crafted blocks)");
+    {
+        /* These check the kernel against the per-block CPU oracle on blocks
+         * that the seeded random builders are unlikely to hit:
+         *   - IQ2_XXS with d=0  -> all-zero contribution
+         *   - IQ2_XXS with sign_idx=127 (full kmask) -> every lane flips
+         *   - IQ2_XXS with grid index 0 (all 0x08 bytes) -> dequant = dl*8
+         *   - Q2_K with dmin=0, all scales packed at max nibble (0xF in low,
+         *     0xF in high) -> stresses the (sc & 0xF) and (sc >> 4) splits
+         *   - Q2_K with d=0 -> only -dmin*sum_y contribution survives
+         */
+        const uint32_t in_dim = 256;
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 1;
+        const uint32_t n_total = 256;
+        const float clamp = 100.0f;  /* effectively no clamp */
+
+        const uint64_t gate_row_bytes = sizeof(moe_block_iq2_xxs);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        uint8_t *model = (uint8_t *)calloc(1, (size_t)model_size);
+        require(model != NULL, "edge-case model alloc");
+
+        moe_block_iq2_xxs *gate_pool_p = (moe_block_iq2_xxs *)(model + 0);
+        moe_block_iq2_xxs *up_pool_p   = (moe_block_iq2_xxs *)(model + gate_pool);
+        moe_block_q2_K    *down_pool_p = (moe_block_q2_K    *)(model + gate_pool + gate_pool);
+
+        const int32_t selected_vals[1] = { 7 };
+        const float weights_vals[1] = { 1.0f };
+
+        /* Gate row 0..mid_dim-1 cycles through edge-case patterns. */
+        for (uint32_t r = 0; r < mid_dim; r++) {
+            moe_block_iq2_xxs *g = &gate_pool_p[(uint64_t)selected_vals[0] * mid_dim + r];
+            moe_block_iq2_xxs *u = &up_pool_p[(uint64_t)selected_vals[0] * mid_dim + r];
+            const uint32_t mode = r % 4u;
+            if (mode == 0) {
+                /* d=0 -> dot must be exactly 0 regardless of qs/scales. */
+                g->d = 0; u->d = 0;
+                for (int i = 0; i < 32; i++) { g->qs[i] = (uint16_t)i; u->qs[i] = (uint16_t)(i + 1); }
+            } else if (mode == 1) {
+                /* sign_idx=127 across the whole block -> every lane is negated. */
+                g->d = f32_to_f16(0.04f);
+                u->d = f32_to_f16(0.04f);
+                for (int ib32 = 0; ib32 < 8; ib32++) {
+                    uint32_t aux_g = 0u;  /* grid idx 0 = all-8 grid */
+                    uint32_t aux_s = (127u << 0) | (127u << 7) | (127u << 14) | (127u << 21);
+                    aux_s |= (15u << 28);  /* max scale offset 15 -> dl = d * 15.5 * 0.25 */
+                    g->qs[ib32 * 4 + 0] = (uint16_t)(aux_g & 0xFFFFu);
+                    g->qs[ib32 * 4 + 1] = (uint16_t)((aux_g >> 16) & 0xFFFFu);
+                    g->qs[ib32 * 4 + 2] = (uint16_t)(aux_s & 0xFFFFu);
+                    g->qs[ib32 * 4 + 3] = (uint16_t)((aux_s >> 16) & 0xFFFFu);
+                    u->qs[ib32 * 4 + 0] = (uint16_t)(aux_g & 0xFFFFu);
+                    u->qs[ib32 * 4 + 1] = (uint16_t)((aux_g >> 16) & 0xFFFFu);
+                    u->qs[ib32 * 4 + 2] = (uint16_t)(aux_s & 0xFFFFu);
+                    u->qs[ib32 * 4 + 3] = (uint16_t)((aux_s >> 16) & 0xFFFFu);
+                }
+            } else if (mode == 2) {
+                /* grid idx 0 (all-8) with sign_idx=0 -> all positive 8s. */
+                g->d = f32_to_f16(0.025f);
+                u->d = f32_to_f16(0.025f);
+                for (int ib32 = 0; ib32 < 8; ib32++) {
+                    uint32_t aux_g = 0u, aux_s = 0u;
+                    g->qs[ib32 * 4 + 0] = (uint16_t)(aux_g & 0xFFFFu);
+                    g->qs[ib32 * 4 + 1] = (uint16_t)((aux_g >> 16) & 0xFFFFu);
+                    g->qs[ib32 * 4 + 2] = (uint16_t)(aux_s & 0xFFFFu);
+                    g->qs[ib32 * 4 + 3] = (uint16_t)((aux_s >> 16) & 0xFFFFu);
+                    u->qs[ib32 * 4 + 0] = (uint16_t)(aux_g & 0xFFFFu);
+                    u->qs[ib32 * 4 + 1] = (uint16_t)((aux_g >> 16) & 0xFFFFu);
+                    u->qs[ib32 * 4 + 2] = (uint16_t)(aux_s & 0xFFFFu);
+                    u->qs[ib32 * 4 + 3] = (uint16_t)((aux_s >> 16) & 0xFFFFu);
+                }
+            } else {
+                /* Standard seeded block as a control. */
+                moe_build_iq2xxs_block(g, 5000u + r);
+                moe_build_iq2xxs_block(u, 6000u + r);
+            }
+        }
+
+        /* Down row 0..out_dim-1 cycles through Q2_K edge cases. */
+        for (uint32_t r = 0; r < out_dim; r++) {
+            moe_block_q2_K *d = &down_pool_p[(uint64_t)selected_vals[0] * out_dim + r];
+            const uint32_t mode = r % 4u;
+            if (mode == 0) {
+                /* dmin=0, all scales = max-low (0xF), all mins = 0. */
+                d->d    = f32_to_f16(0.02f);
+                d->dmin = 0;
+                for (int i = 0; i < 16; i++) d->scales[i] = 0x0F;
+                for (int i = 0; i < 64; i++) d->qs[i] = (uint8_t)((i * 7u) & 0xFFu);
+            } else if (mode == 1) {
+                /* d=0 -> only -dmin*sum_y contribution survives. */
+                d->d    = 0;
+                d->dmin = f32_to_f16(0.01f);
+                for (int i = 0; i < 16; i++) d->scales[i] = (uint8_t)((0xFu << 4) | 0xFu);
+                for (int i = 0; i < 64; i++) d->qs[i] = 0xFFu;
+            } else if (mode == 2) {
+                /* All scales/mins zero -> dot must be exactly 0. */
+                d->d    = f32_to_f16(0.03f);
+                d->dmin = f32_to_f16(0.01f);
+                memset(d->scales, 0, 16);
+                for (int i = 0; i < 64; i++) d->qs[i] = (uint8_t)i;
+            } else {
+                moe_build_q2_K_block(d, 7000u + r);
+            }
+        }
+
+        float xv[256];
+        for (uint32_t i = 0; i < 256; i++) xv[i] = 0.012f * (float)((int)(i % 13) - 6);
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc(sizeof(selected_vals));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc(sizeof(weights_vals));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "edge-case tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, sizeof(xv)), "");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, sizeof(selected_vals)), "");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, sizeof(weights_vals)), "");
+
+        require(ds4_metal_routed_moe_one_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                 model, model_size,
+                                                 0, gate_pool, gate_pool + gate_pool,
+                                                 16u, 10u,
+                                                 gate_expert_bytes, gate_row_bytes,
+                                                 down_expert_bytes, down_row_bytes,
+                                                 in_dim, mid_dim, out_dim,
+                                                 tsel, twts, n_used, clamp, tx),
+                "routed_moe_one edge cases");
+
+        float ref_mid[256];
+        for (uint32_t r = 0; r < mid_dim; r++) {
+            float gate_v = moe_iq2xxs_dot_block_cpu(&gate_pool_p[(uint64_t)selected_vals[0] * mid_dim + r], xv);
+            float up_v   = moe_iq2xxs_dot_block_cpu(&up_pool_p[(uint64_t)selected_vals[0] * mid_dim + r], xv);
+            const float silu = gate_v / (1.0f + expf(-gate_v));
+            ref_mid[r] = silu * up_v * weights_vals[0];
+            /* For mode 0 (d=0): expected exactly 0. */
+            if (r % 4u == 0) require(nearf(ref_mid[r], 0.0f, 1e-12f), "edge case d=0 oracle");
+        }
+        float got_mid[256];
+        read_tensor(tmid, got_mid, mid_dim);
+        for (uint32_t i = 0; i < mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 1e-4f), "edge case mid value");
+        }
+
+        float ref_out[256];
+        for (uint32_t r = 0; r < out_dim; r++) {
+            ref_out[r] = moe_q2_K_dot_block_cpu(&down_pool_p[(uint64_t)selected_vals[0] * out_dim + r], ref_mid);
+            if (r % 4u == 2) require(nearf(ref_out[r], 0.0f, 1e-12f), "edge case all-zero scales");
+        }
+        float got_out[256];
+        read_tensor(tout_moe, got_out, out_dim);
+        for (uint32_t i = 0; i < out_dim; i++) {
+            require(nearf(got_out[i], ref_out[i], 1e-3f), "edge case out value");
         }
 
         ds4_metal_tensor_free(tout_moe);

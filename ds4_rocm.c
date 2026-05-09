@@ -3892,7 +3892,13 @@ __device__ __forceinline__ static float rocm_silu(float x) {
 /* The kernel reads experts directly from the full model-map pool, indexed by
  * selected[t*n_used + s].  When the model map is registered (production path)
  * the pool pointer comes for free; for tests we upload the whole pool once
- * via rocm_upload_mapped. */
+ * via rocm_upload_mapped.
+ *
+ * Activations are LDS-staged one 256-element block at a time.  Every thread
+ * in a workgroup shares the same (slot, token) and so reads the same x
+ * slice; with LDS staging the per-block load is cooperative (threads in the
+ * block split the 256 elements) instead of each thread re-reading from
+ * global. */
 
 __global__ static void rocm_moe_gate_up_matvec_kernel(
         float *mid,                    /* [n_tokens * n_used * mid_dim]   */
@@ -3913,32 +3919,48 @@ __global__ static void rocm_moe_gate_up_matvec_kernel(
         uint32_t n_tokens,
         uint32_t n_total_experts,
         float clamp) {
+    __shared__ float x_lds[DS4_QK_K];
+
     const uint32_t slot   = blockIdx.x;
     const uint32_t row    = blockIdx.y * blockDim.x + threadIdx.x;
     const uint32_t token  = blockIdx.z;
-    if (slot >= n_used || row >= mid_dim || token >= n_tokens) return;
+    if (slot >= n_used || token >= n_tokens) return;
 
     const int32_t e = selected[(uint64_t)token * n_used + slot];
-    if (e < 0 || (uint32_t)e >= n_total_experts) {
-        mid[((uint64_t)token * n_used + slot) * mid_dim + row] = 0.0f;
+    const bool valid_expert = (e >= 0 && (uint32_t)e < n_total_experts);
+    const bool active_row = (row < mid_dim);
+
+    if (!valid_expert) {
+        if (active_row) mid[((uint64_t)token * n_used + slot) * mid_dim + row] = 0.0f;
         return;
     }
 
     const uint32_t nb = in_dim / DS4_QK_K;
     const uint32_t gate_bb = rocm_quant_block_bytes(gate_type);
     const uint32_t up_bb   = rocm_quant_block_bytes(up_type);
-    const uint8_t *gate_row_p = gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-    const uint8_t *up_row_p   = up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)row * up_row_bytes;
-    const float *xp = x + (uint64_t)token * in_dim;
+    const uint8_t *gate_row_p = active_row
+        ? gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes
+        : NULL;
+    const uint8_t *up_row_p = active_row
+        ? up_pool + (uint64_t)e * up_expert_bytes + (uint64_t)row * up_row_bytes
+        : NULL;
+    const float *x_token_base = x + (uint64_t)token * in_dim;
 
     float gate_v = 0.0f, up_v = 0.0f;
-    const float *yp = xp;
     for (uint32_t b = 0; b < nb; b++) {
-        gate_v += rocm_quant_dot_block(gate_type, gate_row_p + (uint64_t)b * gate_bb, yp);
-        up_v   += rocm_quant_dot_block(up_type,   up_row_p   + (uint64_t)b * up_bb,   yp);
-        yp += DS4_QK_K;
+        const float *x_src = x_token_base + (uint64_t)b * DS4_QK_K;
+        for (uint32_t i = threadIdx.x; i < DS4_QK_K; i += blockDim.x) {
+            x_lds[i] = x_src[i];
+        }
+        __syncthreads();
+        if (active_row) {
+            gate_v += rocm_quant_dot_block(gate_type, gate_row_p + (uint64_t)b * gate_bb, x_lds);
+            up_v   += rocm_quant_dot_block(up_type,   up_row_p   + (uint64_t)b * up_bb,   x_lds);
+        }
+        __syncthreads();
     }
 
+    if (!active_row) return;
     if (clamp > 1.0e-6f) {
         if (gate_v > clamp) gate_v = clamp;
         if (up_v > clamp) up_v = clamp;
@@ -3961,9 +3983,12 @@ __global__ static void rocm_moe_down_matvec_kernel(
         uint32_t n_used,
         uint32_t n_tokens,
         uint32_t n_total_experts) {
+    __shared__ float mid_lds[DS4_QK_K];
+
     const uint32_t row   = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t token = blockIdx.y;
-    if (row >= out_dim || token >= n_tokens) return;
+    if (token >= n_tokens) return;
+    const bool active_row = (row < out_dim);
 
     const uint32_t nb = mid_dim / DS4_QK_K;
     const uint32_t down_bb = rocm_quant_block_bytes(down_type);
@@ -3971,17 +3996,25 @@ __global__ static void rocm_moe_down_matvec_kernel(
     float acc = 0.0f;
     for (uint32_t s = 0; s < n_used; s++) {
         const int32_t e = selected[(uint64_t)token * n_used + s];
-        if (e < 0 || (uint32_t)e >= n_total_experts) continue;
-        const uint8_t *down_row_p = down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const float *mid_p = mid + ((uint64_t)token * n_used + s) * mid_dim;
-        float dot = 0.0f;
+        const bool valid = (e >= 0 && (uint32_t)e < n_total_experts);
+        const uint8_t *down_row_p = (valid && active_row)
+            ? down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)row * down_row_bytes
+            : NULL;
+        const float *mid_slot = mid + ((uint64_t)token * n_used + s) * mid_dim;
         for (uint32_t b = 0; b < nb; b++) {
-            dot += rocm_quant_dot_block(down_type, down_row_p + (uint64_t)b * down_bb, mid_p);
-            mid_p += DS4_QK_K;
+            const float *mid_src = mid_slot + (uint64_t)b * DS4_QK_K;
+            for (uint32_t i = threadIdx.x; i < DS4_QK_K; i += blockDim.x) {
+                mid_lds[i] = mid_src[i];
+            }
+            __syncthreads();
+            if (valid && active_row) {
+                acc += rocm_quant_dot_block(down_type, down_row_p + (uint64_t)b * down_bb, mid_lds);
+            }
+            __syncthreads();
         }
-        acc += dot;
     }
-    out[(uint64_t)token * out_dim + row] = acc;
+
+    if (active_row) out[(uint64_t)token * out_dim + row] = acc;
 }
 
 static int rocm_moe_run(

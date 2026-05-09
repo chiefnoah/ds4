@@ -1,0 +1,36 @@
+ROCm decode: tsk-32 results — router fusion landed (+1.6 t/s); HC fusion neutral
+
+Status: tsk-32 items 1 and 2 implemented and validated. Decode wall 14 -> 15.6 t/s (+11.6%) at /home/noah/repos/ds4 on gfx1151.
+
+Item 1 — router_select fusion: BIG WIN.
+- Implemented rocm_router_softplus_select_one_kernel (256 threads, fused softplus+wave32-argmax top-k) and the batch variant. Wrappers ds4_metal_router_select_tensor + ds4_metal_router_select_batch_tensor branch into the fused path when n_expert<=256 && n_used<=8 (the only case in production); legacy two-kernel path retained as fallback.
+- Per-call (DS4_ROCM_SYNC_EACH=1 DS4_ROCM_TIME=1): router_select_tensor 244 us -> 16 us. 15x speedup. Recovered ~9 ms/tok of GPU compute.
+- End-to-end: decode 14.0 -> ~15.6 t/s. Prefill unchanged at 39 t/s. Output identical / coherent.
+
+Item 2 — Q8_0 + HC4 expand fusion: NEUTRAL in production batched mode.
+- Implemented ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(NROWS, HAS_ADD) macro and rocm_matmul_q8_0_hc4_expand_dispatch helper. Lane 0 of each output-row wave writes block_out and immediately applies post[4]+comb[4*4] expand against residual_hc[*, d]. Wrappers ds4_metal_matmul_q8_0_hc_expand_tensor and ds4_metal_shared_down_hc_expand_q8_0_tensor try the fused path first, fall back to legacy when n_hc != 4 / in_dim % 32 != 0.
+- Per-call: matmul_q8_0_hc_expand 212 -> 202 us (-5%). shared_down_hc_expand ~75 -> 59 us (-21%). Total ~1.1 ms/tok per-kernel saving in sync_each.
+- End-to-end: NO measurable improvement in batched mode (15.78 -> 15.62, within noise across 3 runs). Reason: in stream-batched production mode, kernel launches are essentially free, and the fused kernel has the same total GPU compute as the two unfused kernels. The fusion only saves wall time when sync overhead dominates (sync_each mode).
+- Kept anyway: cleaner code path, fewer launches help future HIP graph capture.
+
+Item 3 — attention_output_low_q8: NOT TOUCHED (already at 195/220 GB/s; codex deprioritized).
+
+Validation:
+- ./ds4_rocm_kernel_test: OK (40 tests, all green including router_select default/with-bias and matmul_q8_0_hc_expand and shared_down_hc_expand_q8_0).
+- Coherence on 200-token prompt: multi-paragraph thinking-mode reply, identical output across runs.
+- Fresh sync_each top-of-list ranking attached below.
+
+New decode hotspot ranking (sync_each, ms/tok):
+- matmul_q8_0_tensor: 21.0 (already audited; ~5.5 ms recoverable per prior audit)
+- matmul_f16_tensor: 15.0 (NOT YET AUDITED — strongest candidate for next per-call-site audit)
+- routed_moe_one: 11.9 (already at 188 GiB/s)
+- matmul_q8_0_hc_expand: 8.4 (now fused; minimal additional headroom)
+- attention_output_low_q8: 7.5 (already near ceiling)
+- matmul_f16_pair_tensor: 6.6 (NOT YET AUDITED)
+
+Next obvious lever: per-call-site audit for matmul_f16_tensor and matmul_f16_pair_tensor (combined 21.6 ms/tok). Apply same DS4_ROCM_AUDIT_F16 instrumentation pattern as the Q8_0 audit (rocm_q8_audit_enabled in ds4_rocm.c near matmul_q8_0_tensor).
+
+Diff summary:
+- ds4_rocm.c: +rocm_wave32_argmax helper, +rocm_router_softplus_select_one_kernel (~70 LOC), +rocm_router_softplus_select_batch_kernel (~80 LOC), wrapper branching in both router_select wrappers, +ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND macro + 4 instantiations, +rocm_matmul_q8_0_hc4_expand_dispatch helper, two composed wrappers now try fused path first.
+
+Related: tsk-32 (parent plan), feedback_real_gpu_time.md (sync_each interpretation), project_strix_halo_bw_ceiling.md (220 GB/s target).

@@ -1,0 +1,36 @@
+ROCm feasibility: evaluate rocBLAS/hipBLASLt for dense projections
+
+# Status
+Open. Feasibility/research task first; do not modify Makefile or source until the result is clear.
+
+# Goal
+Decide whether dense F16/F32 projection paths in the ROCm backend should use rocBLAS/hipBLASLt on this host instead of custom row-reduction kernels. This supports tsk-6 but can be done independently without touching Claude's current ds4_rocm.c work.
+
+# Why
+The current F16/F32 matmul wrappers are scalar row-per-output reductions. Prefill is really GEMM-shaped (`n_tokens x in_dim` by `out_dim x in_dim`), and decode is GEMV/skinny GEMM-shaped. A tuned BLAS path may outperform custom kernels for HC mix, Q/KV projections, output head pre-proj, and other dense projections, while quantized Q8/MoE probably still need custom code.
+
+# Questions to answer
+1. Are rocBLAS or hipBLASLt available in the host Nix/ROCm environment without adding nontrivial dependencies? Check headers, libraries, and link flags.
+2. Does hipBLASLt support gfx1151 cleanly on ROCm 7.0.3 for f16 input / f32 accumulate / f32 output, or does rocBLAS GEMM/GEMV work better?
+3. What row/column-major transforms are needed? Current weights are stored row-major as `[out_dim, in_dim]`, activations as `[n_tok, in_dim]`, outputs as `[n_tok, out_dim]`. Avoid physical transposes if BLAS op flags can express the layout.
+4. Numeric behavior: compare against existing `ds4_metal_matmul_f16_tensor` and `ds4_metal_matmul_f32_tensor` tests. Determine tolerances and whether f32 accumulate is required.
+5. Stream integration: can BLAS use the same HIP stream planned by tsk-4? Record handle lifetime and thread-safety expectations.
+6. Startup/link impact: document exact Makefile additions, library names, and any Nix-specific paths. Do not apply them in this task.
+
+# Suggested experiment
+Create a throwaway local scratch outside tracked source or use a one-off command to compile a minimal BLAS GEMM against ROCm. Measure a few DS4-like shapes: `n_tok=1`, `16`, `512`, `2048`; `in_dim=4096` or HC dim where applicable; representative `out_dim` for Q/KV/router/output-pre. Record compile/link commands and timings in this task.
+
+# Decision output
+End this task with one of:
+- Use rocBLAS/hipBLASLt for dense F16/F32 projections.
+- Keep custom kernels because library support/perf/packaging is poor.
+- Hybrid: BLAS for prefill GEMM only, custom kernels for decode GEMV.
+
+# Files to inspect, not edit initially
+- Makefile ROCm variables and link rules.
+- ds4_rocm.c F16/F32 wrappers.
+- tests/ds4_rocm_kernel_test.c matmul tests.
+
+# Related tasks
+- tsk-6 matmul/projection kernel replacement.
+- tsk-4 stream-backed command batching.

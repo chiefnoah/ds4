@@ -2968,13 +2968,619 @@ int ds4_metal_compressor_prefill_ratio4_replay_tensor(
                                                 rms_eps);
 }
 
-DS4_ROCM_STUB(ds4_metal_attention_decode_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_prefill_raw_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_decode_raw_batch_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_decode_mixed_batch_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_indexed_mixed_batch_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_prefill_static_mixed_heads_tensor)
-DS4_ROCM_STUB(ds4_metal_attention_prefill_masked_mixed_heads_tensor)
+/* =========================================================================
+ * Sink-aware attention kernels.
+ * =========================================================================
+ *
+ * decode_heads computes one query token's per-head attention over a ring
+ * buffer of raw KV plus a list of compressed KV rows.  Each head shares the
+ * sink logit (read from the model map) and contributes one term to the
+ * softmax denominator without injecting a value vector.
+ */
+
+__global__ static void rocm_attn_decode_heads_kernel(
+        float *out,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        const float *sinks,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t use_mask) {
+    extern __shared__ float smem[];
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bs = blockDim.x;
+    const uint32_t n_kv = n_raw + n_comp;
+    float *scores = smem;                /* n_kv */
+    float *part   = smem + n_kv;         /* bs */
+
+    const float *qh = q + (uint64_t)h * head_dim;
+    const float kq_scale = rsqrtf((float)head_dim);
+
+    /* Step 1: compute scores. */
+    for (uint32_t r = tid; r < n_raw; r += bs) {
+        const uint32_t actual = (raw_start + r) % raw_cap;
+        const float *kv = raw_kv + (uint64_t)actual * head_dim;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+        scores[r] = s * kq_scale;
+    }
+    for (uint32_t r = tid; r < n_comp; r += bs) {
+        const float *kv = comp_kv + (uint64_t)r * head_dim;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+        s = s * kq_scale + (use_mask ? comp_mask[r] : 0.0f);
+        scores[n_raw + r] = s;
+    }
+    __syncthreads();
+
+    /* Step 2: max reduction including sink. */
+    float local_max = -1.0e30f;
+    for (uint32_t r = tid; r < n_kv; r += bs) {
+        if (scores[r] > local_max) local_max = scores[r];
+    }
+    if (tid == 0 && sinks[h] > local_max) local_max = sinks[h];
+    part[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] = fmaxf(part[tid], part[tid + s]);
+        __syncthreads();
+    }
+    const float maxs = part[0];
+
+    /* Step 3: exp weights into scores in place. */
+    for (uint32_t r = tid; r < n_kv; r += bs) {
+        scores[r] = expf(scores[r] - maxs);
+    }
+    __syncthreads();
+
+    /* Step 4: denom (sink + sum weights). */
+    float local_sum = (tid == 0) ? expf(sinks[h] - maxs) : 0.0f;
+    for (uint32_t r = tid; r < n_kv; r += bs) {
+        local_sum += scores[r];
+    }
+    part[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] += part[tid + s];
+        __syncthreads();
+    }
+    const float denom = part[0];
+
+    /* Step 5: weighted sum per dim. */
+    float *out_h = out + (uint64_t)h * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += bs) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t actual = (raw_start + r) % raw_cap;
+            acc += scores[r] * raw_kv[(uint64_t)actual * head_dim + d];
+        }
+        for (uint32_t r = 0; r < n_comp; r++) {
+            acc += scores[n_raw + r] * comp_kv[(uint64_t)r * head_dim + d];
+        }
+        out_h[d] = acc / denom;
+    }
+}
+
+int ds4_metal_attention_decode_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        const ds4_metal_tensor *comp_kv,
+        uint32_t                n_comp,
+        const ds4_metal_tensor *comp_mask,
+        uint32_t                use_mask,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv ||
+        n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap ||
+        n_raw > UINT32_MAX - n_comp || n_raw + n_comp > 8192u ||
+        (n_comp != 0 && !comp_kv) || (use_mask != 0 && !comp_mask)) return 0;
+
+    const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        q->bytes < q_bytes || raw_kv->bytes < raw_bytes || heads->bytes < q_bytes ||
+        (n_comp != 0 && comp_kv->bytes < comp_bytes) ||
+        (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) return 0;
+
+    void *sink_h = NULL, *sink_d = NULL;
+    if (!rocm_upload_mapped((const uint8_t *)model_map + sinks_offset, sink_bytes,
+                            &sink_h, &sink_d, "attention sinks upload")) return 0;
+
+    const uint32_t threads = 128;
+    const uint32_t n_kv = n_raw + n_comp;
+    const uint64_t smem_bytes = ((uint64_t)n_kv + threads) * sizeof(float);
+    hipLaunchKernelGGL(rocm_attn_decode_heads_kernel, dim3(n_head), dim3(threads),
+                       (uint32_t)smem_bytes, 0,
+                       (float *)tensor_u8(heads),
+                       (const float *)tensor_u8_const(q),
+                       (const float *)tensor_u8_const(raw_kv),
+                       n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                       use_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                       (const float *)sink_d,
+                       n_head, head_dim, n_raw, raw_cap, raw_start, n_comp, use_mask);
+    int ok = rocm_ok(hipGetLastError(), "attn decode heads launch") &&
+             rocm_ok(hipDeviceSynchronize(), "attn decode heads completion");
+    (void)hipHostFree(sink_h);
+    return ok;
+}
+
+/* prefill_raw_heads: n_tokens parallel decode steps where token t attends
+ * to a sliding window of the linearly-stored raw KV (no ring).  Each grid
+ * tile is one (token, head) pair. */
+__global__ static void rocm_attn_prefill_raw_heads_kernel(
+        float *out,
+        const float *q,
+        const float *raw_kv,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t window,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    extern __shared__ float smem[];
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bs = blockDim.x;
+
+    const uint32_t r0 = (t + 1u > window) ? t + 1u - window : 0u;
+    const uint32_t n_kv = t + 1u - r0;
+    float *scores = smem;
+    float *part = smem + n_kv;
+
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float kq_scale = rsqrtf((float)head_dim);
+
+    for (uint32_t i = tid; i < n_kv; i += bs) {
+        const float *kv = raw_kv + (uint64_t)(r0 + i) * head_dim;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+        scores[i] = s * kq_scale;
+    }
+    __syncthreads();
+
+    float lmax = -1.0e30f;
+    for (uint32_t i = tid; i < n_kv; i += bs) if (scores[i] > lmax) lmax = scores[i];
+    if (tid == 0 && sinks[h] > lmax) lmax = sinks[h];
+    part[tid] = lmax;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] = fmaxf(part[tid], part[tid + s]);
+        __syncthreads();
+    }
+    const float maxs = part[0];
+
+    for (uint32_t i = tid; i < n_kv; i += bs) scores[i] = expf(scores[i] - maxs);
+    __syncthreads();
+
+    float lsum = (tid == 0) ? expf(sinks[h] - maxs) : 0.0f;
+    for (uint32_t i = tid; i < n_kv; i += bs) lsum += scores[i];
+    part[tid] = lsum;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] += part[tid + s];
+        __syncthreads();
+    }
+    const float denom = part[0];
+
+    float *out_th = out + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += bs) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_kv; i++) acc += scores[i] * raw_kv[(uint64_t)(r0 + i) * head_dim + d];
+        out_th[d] = acc / denom;
+    }
+}
+
+int ds4_metal_attention_prefill_raw_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                window,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv ||
+        n_tokens == 0 || window == 0 || n_head == 0 || head_dim == 0) return 0;
+
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        q->bytes < q_bytes || raw_kv->bytes < kv_bytes || heads->bytes < q_bytes) return 0;
+
+    void *sink_h = NULL, *sink_d = NULL;
+    if (!rocm_upload_mapped((const uint8_t *)model_map + sinks_offset, sink_bytes,
+                            &sink_h, &sink_d, "prefill raw sinks upload")) return 0;
+
+    const uint32_t threads = 128;
+    const uint64_t smem_bytes = ((uint64_t)window + threads) * sizeof(float);
+    dim3 grid(n_tokens, n_head, 1);
+    dim3 block(threads, 1, 1);
+    hipLaunchKernelGGL(rocm_attn_prefill_raw_heads_kernel, grid, block,
+                       (uint32_t)smem_bytes, 0,
+                       (float *)tensor_u8(heads),
+                       (const float *)tensor_u8_const(q),
+                       (const float *)tensor_u8_const(raw_kv),
+                       (const float *)sink_d,
+                       n_tokens, window, n_head, head_dim);
+    int ok = rocm_ok(hipGetLastError(), "attn prefill raw launch") &&
+             rocm_ok(hipDeviceSynchronize(), "attn prefill raw completion");
+    (void)hipHostFree(sink_h);
+    return ok;
+}
+
+/* Batch attention kernel.  Handles all five remaining attention variants by
+ * parameter selection:
+ *   - mode_static: raw_kv is laid out (n_tokens × head_dim) with key k at
+ *     position k.  Otherwise raw_kv is a ring buffer (raw_cap × head_dim)
+ *     whose n_raw valid rows occupy logical positions
+ *     [pos0 + n_tokens - n_raw, pos0 + n_tokens) and start at index raw_start.
+ *   - use_topk: only the per-token indices in topk[t, 0..top_k) participate
+ *     from comp_kv; all other comp rows mask out for that query.
+ *   - use_comp_mask: comp_mask is added to each comp score (used to mask
+ *     dropped indexer top-k slots in non-indexed prefill).
+ */
+__global__ static void rocm_attn_batch_kernel(
+        float *out,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        const int32_t *topk,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t top_k,
+        int use_topk,
+        int use_comp_mask,
+        int mode_static) {
+    extern __shared__ float smem[];
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bs = blockDim.x;
+    const uint32_t n_keys = n_raw + n_comp;
+    float *scores = smem;
+    float *part = smem + n_keys;
+
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float kq_scale = rsqrtf((float)head_dim);
+    const uint32_t qpos = pos0 + t;
+    const uint32_t first_raw_pos = mode_static ? 0u : pos0 + n_tokens - n_raw;
+    const uint32_t n_visible_comp = ratio == 0u ? 0u : (qpos + 1u) / ratio;
+
+    /* Raw scores. */
+    for (uint32_t r = tid; r < n_raw; r += bs) {
+        const uint32_t kpos = first_raw_pos + r;
+        if (kpos > qpos || (window != 0u && qpos - kpos >= window)) {
+            scores[r] = -1.0e30f;
+            continue;
+        }
+        const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap;
+        const float *kv = raw_kv + (uint64_t)actual * head_dim;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+        scores[r] = s * kq_scale;
+    }
+
+    /* Comp scores. */
+    if (use_topk) {
+        for (uint32_t c = tid; c < n_comp; c += bs) scores[n_raw + c] = -1.0e30f;
+        __syncthreads();
+        for (uint32_t k = tid; k < top_k; k += bs) {
+            const int32_t c = topk[(uint64_t)t * top_k + k];
+            if (c < 0 || (uint32_t)c >= n_comp) continue;
+            if ((uint32_t)c >= n_visible_comp) continue;
+            const float *kv = comp_kv + (uint64_t)c * head_dim;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+            scores[n_raw + c] = s * kq_scale;
+        }
+    } else {
+        for (uint32_t c = tid; c < n_comp; c += bs) {
+            if (c >= n_visible_comp) {
+                scores[n_raw + c] = -1.0e30f;
+                continue;
+            }
+            const float *kv = comp_kv + (uint64_t)c * head_dim;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
+            scores[n_raw + c] = s * kq_scale + (use_comp_mask ? comp_mask[c] : 0.0f);
+        }
+    }
+    __syncthreads();
+
+    /* Max with sink. */
+    float lmax = -1.0e30f;
+    for (uint32_t r = tid; r < n_keys; r += bs) {
+        if (scores[r] > lmax) lmax = scores[r];
+    }
+    if (tid == 0 && sinks[h] > lmax) lmax = sinks[h];
+    part[tid] = lmax;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] = fmaxf(part[tid], part[tid + s]);
+        __syncthreads();
+    }
+    const float maxs = part[0];
+
+    /* Weights into scores in place; mask-out turns into 0. */
+    for (uint32_t r = tid; r < n_keys; r += bs) {
+        scores[r] = (scores[r] <= -5.0e29f) ? 0.0f : expf(scores[r] - maxs);
+    }
+    __syncthreads();
+
+    /* Denom: sink + sum(weights). */
+    float lsum = (tid == 0) ? expf(sinks[h] - maxs) : 0.0f;
+    for (uint32_t r = tid; r < n_keys; r += bs) lsum += scores[r];
+    part[tid] = lsum;
+    __syncthreads();
+    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) part[tid] += part[tid + s];
+        __syncthreads();
+    }
+    const float denom = part[0];
+
+    /* Weighted sum per output dim. */
+    float *out_th = out + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += bs) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap;
+            acc += scores[r] * raw_kv[(uint64_t)actual * head_dim + d];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            acc += scores[n_raw + c] * comp_kv[(uint64_t)c * head_dim + d];
+        }
+        out_th[d] = acc / denom;
+    }
+}
+
+static int rocm_attn_batch_dispatch(
+        ds4_metal_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *comp_mask,
+        const ds4_metal_tensor *topk,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t top_k,
+        int use_topk,
+        int use_comp_mask,
+        int mode_static,
+        const char *what) {
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)(mode_static ? n_tokens : raw_cap) * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        q->bytes < q_bytes || raw_kv->bytes < raw_bytes || heads->bytes < q_bytes ||
+        (n_comp != 0 && comp_kv->bytes < comp_bytes) ||
+        (use_topk && topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) ||
+        (use_comp_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) return 0;
+
+    void *sink_h = NULL, *sink_d = NULL;
+    if (!rocm_upload_mapped((const uint8_t *)model_map + sinks_offset, sink_bytes,
+                            &sink_h, &sink_d, "attention sinks upload")) return 0;
+
+    const uint32_t threads = 128;
+    const uint32_t n_keys = n_raw + n_comp;
+    const uint64_t smem_bytes = ((uint64_t)n_keys + threads) * sizeof(float);
+    dim3 grid(n_tokens, n_head, 1);
+    dim3 block(threads, 1, 1);
+    hipLaunchKernelGGL(rocm_attn_batch_kernel, grid, block, (uint32_t)smem_bytes, 0,
+                       (float *)tensor_u8(heads),
+                       (const float *)tensor_u8_const(q),
+                       (const float *)tensor_u8_const(raw_kv),
+                       n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                       use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                       use_topk ? (const int32_t *)tensor_u8_const(topk) : (const int32_t *)NULL,
+                       (const float *)sink_d,
+                       n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                       n_comp, window, ratio, top_k, use_topk, use_comp_mask, mode_static);
+    char launch_msg[64];
+    snprintf(launch_msg, sizeof(launch_msg), "attn batch %s launch", what);
+    char done_msg[64];
+    snprintf(done_msg, sizeof(done_msg), "attn batch %s completion", what);
+    int ok = rocm_ok(hipGetLastError(), launch_msg) && rocm_ok(hipDeviceSynchronize(), done_msg);
+    (void)hipHostFree(sink_h);
+    return ok;
+}
+
+int ds4_metal_attention_decode_raw_batch_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                window,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv ||
+        n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap) return 0;
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, NULL, NULL, NULL,
+                                    n_tokens, n_head, head_dim, pos0,
+                                    n_raw, raw_cap, raw_start,
+                                    0u, window, 1u, 0u, 0, 0, 0,
+                                    "decode_raw");
+}
+
+int ds4_metal_attention_decode_mixed_batch_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *comp_mask,
+        uint32_t                use_comp_mask,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv ||
+        n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap || ratio == 0u ||
+        (n_comp != 0 && !comp_kv) || (use_comp_mask != 0 && !comp_mask)) return 0;
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, comp_kv, comp_mask, NULL,
+                                    n_tokens, n_head, head_dim, pos0,
+                                    n_raw, raw_cap, raw_start,
+                                    n_comp, window, ratio, 0u, 0,
+                                    use_comp_mask ? 1 : 0, 0,
+                                    "decode_mixed");
+}
+
+int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
+        n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap || ratio == 0u ||
+        n_comp == 0 || top_k == 0) return 0;
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, comp_kv, NULL, topk,
+                                    n_tokens, n_head, head_dim, pos0,
+                                    n_raw, raw_cap, raw_start,
+                                    n_comp, window, ratio, top_k, 1, 0, 0,
+                                    "indexed_mixed");
+}
+
+int ds4_metal_attention_prefill_static_mixed_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv ||
+        n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
+        (n_comp != 0 && !comp_kv)) return 0;
+    /* mode_static: raw_kv has n_tokens rows at logical positions [0, n_tokens). */
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, comp_kv, NULL, NULL,
+                                    n_tokens, n_head, head_dim,
+                                    /*pos0=*/0u, /*n_raw=*/n_tokens, /*raw_cap=*/n_tokens,
+                                    /*raw_start=*/0u, n_comp, window, ratio,
+                                    0u, 0, 0, 1,
+                                    "prefill_static");
+}
+
+int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
+        ds4_metal_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv,
+        const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *comp_mask,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!heads || !model_map || !q || !raw_kv || !comp_mask ||
+        n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
+        (n_comp != 0 && !comp_kv)) return 0;
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, comp_kv, comp_mask, NULL,
+                                    n_tokens, n_head, head_dim,
+                                    /*pos0=*/0u, /*n_raw=*/n_tokens, /*raw_cap=*/n_tokens,
+                                    /*raw_start=*/0u, n_comp, window, ratio,
+                                    0u, 0, 1, 1,
+                                    "prefill_masked");
+}
+
 DS4_ROCM_STUB(ds4_metal_routed_moe_one_tensor)
 DS4_ROCM_STUB(ds4_metal_routed_moe_batch_tensor)
 

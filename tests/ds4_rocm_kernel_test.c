@@ -78,6 +78,80 @@ static void read_tensor(ds4_metal_tensor *t, float *v, uint32_t n) {
     require(ds4_metal_tensor_read(t, 0, v, (uint64_t)n * sizeof(float)) != 0, "tensor read");
 }
 
+/* CPU oracle for the unified batch attention kernel.  Computes
+ * out[t,h,d] = softmax(scores)·V.  Mode-static layouts have raw_kv as
+ * (n_tokens × head_dim); ring layouts have raw_kv as (raw_cap × head_dim)
+ * with valid keys at indices (raw_start + r) mod raw_cap, key positions
+ * starting at first_raw_pos = pos0 + n_tokens - n_raw. */
+static void attn_batch_oracle(
+        float *out, const float *qv, const float *raw_kv, const float *comp_kv,
+        const float *comp_mask, const int32_t *topk, const float *sinks,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t top_k, int use_topk, int use_comp_mask, int mode_static) {
+    const float kq = 1.0f / sqrtf((float)head_dim);
+    const uint32_t first_raw_pos = mode_static ? 0u : pos0 + n_tokens - n_raw;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t qpos = pos0 + t;
+        const uint32_t n_visible_comp = ratio == 0u ? 0u : (qpos + 1u) / ratio;
+        for (uint32_t h = 0; h < n_head; h++) {
+            float maxs = sinks[h];
+            float scores[64];  /* test sizes are small */
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t kpos = first_raw_pos + r;
+                if (kpos > qpos || (window != 0u && qpos - kpos >= window)) {
+                    scores[r] = -1.0e30f; continue;
+                }
+                const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap;
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++)
+                    s += qv[(t * n_head + h) * head_dim + d] * raw_kv[actual * head_dim + d];
+                scores[r] = s * kq;
+                if (scores[r] > maxs) maxs = scores[r];
+            }
+            for (uint32_t c = 0; c < n_comp; c++) scores[n_raw + c] = -1.0e30f;
+            if (use_topk) {
+                for (uint32_t k = 0; k < top_k; k++) {
+                    int32_t c = topk[t * top_k + k];
+                    if (c < 0 || (uint32_t)c >= n_comp) continue;
+                    if ((uint32_t)c >= n_visible_comp) continue;
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        s += qv[(t * n_head + h) * head_dim + d] * comp_kv[(uint32_t)c * head_dim + d];
+                    scores[n_raw + c] = s * kq;
+                    if (scores[n_raw + c] > maxs) maxs = scores[n_raw + c];
+                }
+            } else {
+                for (uint32_t c = 0; c < n_comp; c++) {
+                    if (c >= n_visible_comp) continue;
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        s += qv[(t * n_head + h) * head_dim + d] * comp_kv[c * head_dim + d];
+                    scores[n_raw + c] = s * kq + (use_comp_mask ? comp_mask[c] : 0.0f);
+                    if (scores[n_raw + c] > maxs) maxs = scores[n_raw + c];
+                }
+            }
+            float denom = expf(sinks[h] - maxs);
+            float oacc[64] = {0};
+            for (uint32_t r = 0; r < n_raw; r++) {
+                if (scores[r] <= -5.0e29f) continue;
+                float w = expf(scores[r] - maxs);
+                denom += w;
+                const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap;
+                for (uint32_t d = 0; d < head_dim; d++) oacc[d] += w * raw_kv[actual * head_dim + d];
+            }
+            for (uint32_t c = 0; c < n_comp; c++) {
+                if (scores[n_raw + c] <= -5.0e29f) continue;
+                float w = expf(scores[n_raw + c] - maxs);
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) oacc[d] += w * comp_kv[c * head_dim + d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) out[(t * n_head + h) * head_dim + d] = oacc[d] / denom;
+        }
+    }
+}
+
 int main(void) {
     STEP("init");
     if (!ds4_metal_init()) {
@@ -714,6 +788,402 @@ int main(void) {
         ds4_metal_tensor_free(tskv);
         ds4_metal_tensor_free(ts);
         ds4_metal_tensor_free(tk);
+    }
+
+    STEP("attention decode_heads (raw only, ring wrap)");
+    {
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t raw_cap = 4;
+        const uint32_t n_raw = 3;
+        const uint32_t raw_start = 2;          /* wraps: rows 2,3,0 */
+        float qv[2 * 4] = { 0.5f, -0.25f, 1.0f, 0.0f,  -0.1f, 0.3f, 0.0f, 0.5f };
+        float raw[4 * 4] = {
+            0.1f, 0.2f, -0.3f, 0.4f,           /* row 0 */
+            -0.5f, 0.6f, 0.7f, -0.8f,          /* row 1 (unused) */
+            0.25f, -0.5f, 0.125f, 0.0625f,     /* row 2 */
+            -0.0625f, 0.5f, -0.25f, 0.125f,    /* row 3 */
+        };
+        float sinks[2] = { 0.0f, 1.0f };
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tout, "attn decode raw alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "attn decode q write");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "attn decode raw write");
+        require(ds4_metal_attention_decode_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                        tq, traw, n_raw, raw_cap, raw_start,
+                                                        NULL, 0, NULL, 0, n_head, head_dim),
+                "attn decode raw");
+        float got[8];
+        read_tensor(tout, got, 8);
+        const float kq = 1.0f / sqrtf((float)head_dim);
+        for (uint32_t h = 0; h < n_head; h++) {
+            float scores[3];
+            float maxs = sinks[h];
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t actual = (raw_start + r) % raw_cap;
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) s += qv[h * head_dim + d] * raw[actual * head_dim + d];
+                scores[r] = s * kq;
+                if (scores[r] > maxs) maxs = scores[r];
+            }
+            float denom = expf(sinks[h] - maxs);
+            float out[4] = {0};
+            for (uint32_t r = 0; r < n_raw; r++) {
+                float w = expf(scores[r] - maxs);
+                denom += w;
+                const uint32_t actual = (raw_start + r) % raw_cap;
+                for (uint32_t d = 0; d < head_dim; d++) out[d] += w * raw[actual * head_dim + d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) {
+                require(nearf(got[h * head_dim + d], out[d] / denom, 1e-5f), "attn decode raw value");
+            }
+        }
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention decode_heads (mixed raw + comp, masked)");
+    {
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t raw_cap = 2;
+        const uint32_t n_raw = 2;
+        const uint32_t raw_start = 0;
+        const uint32_t n_comp = 3;
+        float qv[2 * 4] = { 0.4f, 0.0f, -0.2f, 0.7f,  0.1f, -0.3f, 0.5f, 0.2f };
+        float raw[2 * 4] = { 0.5f, -0.25f, 0.125f, 0.0f,  -0.5f, 0.25f, 0.0f, 0.125f };
+        float comp[3 * 4] = {
+            1.0f, 0.0f, 0.5f, -0.5f,
+            -1.0f, 0.5f, 0.0f, 0.25f,
+            0.25f, -0.5f, -0.25f, 1.0f,
+        };
+        float mask[3] = { 0.0f, -1.0e30f, 0.0f };  /* mask out comp row 1 */
+        float sinks[2] = { -0.5f, 0.5f };
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *tmask = ds4_metal_tensor_alloc(sizeof(mask));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && tmask && tout, "attn mix alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "attn mix q");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "attn mix raw");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "attn mix comp");
+        require(ds4_metal_tensor_write(tmask, 0, mask, sizeof(mask)), "attn mix mask");
+        require(ds4_metal_attention_decode_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                        tq, traw, n_raw, raw_cap, raw_start,
+                                                        tcomp, n_comp, tmask, 1, n_head, head_dim),
+                "attn decode mix");
+        float got[8];
+        read_tensor(tout, got, 8);
+        const float kq = 1.0f / sqrtf((float)head_dim);
+        for (uint32_t h = 0; h < n_head; h++) {
+            float scores_raw[2], scores_comp[3];
+            float maxs = sinks[h];
+            for (uint32_t r = 0; r < n_raw; r++) {
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) s += qv[h * head_dim + d] * raw[r * head_dim + d];
+                scores_raw[r] = s * kq;
+                if (scores_raw[r] > maxs) maxs = scores_raw[r];
+            }
+            for (uint32_t r = 0; r < n_comp; r++) {
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) s += qv[h * head_dim + d] * comp[r * head_dim + d];
+                scores_comp[r] = s * kq + mask[r];
+                if (scores_comp[r] > maxs) maxs = scores_comp[r];
+            }
+            float denom = expf(sinks[h] - maxs);
+            float out[4] = {0};
+            for (uint32_t r = 0; r < n_raw; r++) {
+                float w = expf(scores_raw[r] - maxs);
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) out[d] += w * raw[r * head_dim + d];
+            }
+            for (uint32_t r = 0; r < n_comp; r++) {
+                float w = expf(scores_comp[r] - maxs);
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) out[d] += w * comp[r * head_dim + d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) {
+                require(nearf(got[h * head_dim + d], out[d] / denom, 1e-5f), "attn decode mix value");
+            }
+        }
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(tmask);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention prefill_raw_heads sliding window");
+    {
+        const uint32_t n_tokens = 4;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 2;
+        float qv[4 * 2 * 4];
+        float raw[4 * 4];
+        float sinks[2] = { -0.25f, 0.5f };
+        for (uint32_t i = 0; i < 4 * 2 * 4; i++) qv[i] = sinf((float)(i + 1) * 0.5f);
+        for (uint32_t i = 0; i < 4 * 4; i++) raw[i] = cosf((float)(i + 1) * 0.4f);
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tout, "attn prefill alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "attn prefill q");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "attn prefill raw");
+        require(ds4_metal_attention_prefill_raw_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                              tq, traw, n_tokens, window,
+                                                              n_head, head_dim),
+                "attn prefill raw");
+        float got[4 * 2 * 4];
+        read_tensor(tout, got, 4 * 2 * 4);
+        const float kq = 1.0f / sqrtf((float)head_dim);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t r0 = (t + 1u > window) ? t + 1u - window : 0u;
+            const uint32_t n_kv = t + 1u - r0;
+            for (uint32_t h = 0; h < n_head; h++) {
+                float scores[4];
+                float maxs = sinks[h];
+                for (uint32_t i = 0; i < n_kv; i++) {
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        s += qv[(t * n_head + h) * head_dim + d] * raw[(r0 + i) * head_dim + d];
+                    scores[i] = s * kq;
+                    if (scores[i] > maxs) maxs = scores[i];
+                }
+                float denom = expf(sinks[h] - maxs);
+                float out[4] = {0};
+                for (uint32_t i = 0; i < n_kv; i++) {
+                    float w = expf(scores[i] - maxs);
+                    denom += w;
+                    for (uint32_t d = 0; d < head_dim; d++) out[d] += w * raw[(r0 + i) * head_dim + d];
+                }
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    float ref = out[d] / denom;
+                    require(nearf(got[(t * n_head + h) * head_dim + d], ref, 1e-5f),
+                            "attn prefill value");
+                }
+            }
+        }
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention decode_raw_batch (ring + window)");
+    {
+        const uint32_t n_tokens = 3;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 4;
+        const uint32_t pos0 = 5;
+        const uint32_t raw_cap = 4;
+        const uint32_t n_raw = 4;
+        const uint32_t raw_start = 1;
+        float qv[3 * 2 * 4];
+        float raw[4 * 4];
+        float sinks[2] = { 0.1f, -0.2f };
+        for (uint32_t i = 0; i < 24; i++) qv[i] = sinf((float)(i + 1) * 0.3f);
+        for (uint32_t i = 0; i < 16; i++) raw[i] = cosf((float)(i + 1) * 0.5f);
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tout, "decode_raw_batch alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "write q");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "write raw");
+        require(ds4_metal_attention_decode_raw_batch_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                                  tq, traw, n_tokens, pos0, n_raw,
+                                                                  raw_cap, raw_start, window,
+                                                                  n_head, head_dim),
+                "decode_raw_batch");
+        float got[24], ref[24];
+        read_tensor(tout, got, 24);
+        attn_batch_oracle(ref, qv, raw, NULL, NULL, NULL, sinks,
+                          n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                          0, window, 1, 0, 0, 0, 0);
+        for (uint32_t i = 0; i < 24; i++) require(nearf(got[i], ref[i], 1e-5f), "decode_raw_batch value");
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention decode_mixed_batch");
+    {
+        const uint32_t n_tokens = 2;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 4;
+        const uint32_t pos0 = 6;
+        const uint32_t raw_cap = 3;
+        const uint32_t n_raw = 3;
+        const uint32_t raw_start = 0;
+        const uint32_t n_comp = 3;
+        const uint32_t ratio = 2;
+        float qv[2 * 2 * 4];
+        float raw[3 * 4];
+        float comp[3 * 4];
+        float mask[3] = { 0, -1.0e30f, 0 };
+        float sinks[2] = { 0.0f, 0.5f };
+        for (uint32_t i = 0; i < 16; i++) qv[i] = 0.1f * (float)((i % 7) - 3);
+        for (uint32_t i = 0; i < 12; i++) raw[i] = 0.05f * (float)i + 0.1f;
+        for (uint32_t i = 0; i < 12; i++) comp[i] = -0.05f * (float)i + 0.2f;
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *tmask = ds4_metal_tensor_alloc(sizeof(mask));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && tmask && tout, "decode_mixed_batch alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "");
+        require(ds4_metal_tensor_write(tmask, 0, mask, sizeof(mask)), "");
+        require(ds4_metal_attention_decode_mixed_batch_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                                    tq, traw, tcomp, tmask, 1,
+                                                                    n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                                                    n_comp, window, ratio, n_head, head_dim),
+                "decode_mixed_batch");
+        float got[16], ref[16];
+        read_tensor(tout, got, 16);
+        attn_batch_oracle(ref, qv, raw, comp, mask, NULL, sinks,
+                          n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                          n_comp, window, ratio, 0, 0, 1, 0);
+        for (uint32_t i = 0; i < 16; i++) require(nearf(got[i], ref[i], 1e-5f), "decode_mixed_batch value");
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(tmask);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention indexed_mixed_batch");
+    {
+        const uint32_t n_tokens = 2;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 8;
+        const uint32_t pos0 = 7;
+        const uint32_t raw_cap = 3;
+        const uint32_t n_raw = 3;
+        const uint32_t raw_start = 0;
+        const uint32_t n_comp = 4;
+        const uint32_t top_k = 2;
+        const uint32_t ratio = 2;
+        float qv[2 * 2 * 4], raw[3 * 4], comp[4 * 4];
+        int32_t topk[2 * 2] = { 0, 2,  1, 3 };
+        float sinks[2] = { -0.1f, 0.2f };
+        for (uint32_t i = 0; i < 16; i++) qv[i] = 0.05f * (float)((i % 11) - 5);
+        for (uint32_t i = 0; i < 12; i++) raw[i] = 0.07f * (float)i;
+        for (uint32_t i = 0; i < 16; i++) comp[i] = -0.03f * (float)i;
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *ttk = ds4_metal_tensor_alloc(sizeof(topk));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && ttk && tout, "indexed alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "");
+        require(ds4_metal_tensor_write(ttk, 0, topk, sizeof(topk)), "");
+        require(ds4_metal_attention_indexed_mixed_batch_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                                     tq, traw, tcomp, ttk,
+                                                                     n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                                                     n_comp, top_k, window, ratio,
+                                                                     n_head, head_dim),
+                "indexed_mixed_batch");
+        float got[16], ref[16];
+        read_tensor(tout, got, 16);
+        attn_batch_oracle(ref, qv, raw, comp, NULL, topk, sinks,
+                          n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                          n_comp, window, ratio, top_k, 1, 0, 0);
+        for (uint32_t i = 0; i < 16; i++) require(nearf(got[i], ref[i], 1e-5f), "indexed value");
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(ttk);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention prefill_static_mixed");
+    {
+        const uint32_t n_tokens = 4;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 0;     /* full causal */
+        const uint32_t n_comp = 2;
+        const uint32_t ratio = 2;
+        float qv[4 * 2 * 4], raw[4 * 4], comp[2 * 4];
+        float sinks[2] = { 0.0f, 0.0f };
+        for (uint32_t i = 0; i < 32; i++) qv[i] = sinf((float)(i + 1) * 0.2f);
+        for (uint32_t i = 0; i < 16; i++) raw[i] = cosf((float)(i + 1) * 0.3f);
+        for (uint32_t i = 0; i < 8; i++) comp[i] = sinf((float)(i + 7) * 0.1f);
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && tout, "static alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "");
+        require(ds4_metal_attention_prefill_static_mixed_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                                      tq, traw, tcomp, n_tokens,
+                                                                      n_comp, window, ratio,
+                                                                      n_head, head_dim),
+                "prefill_static");
+        float got[32], ref[32];
+        read_tensor(tout, got, 32);
+        attn_batch_oracle(ref, qv, raw, comp, NULL, NULL, sinks,
+                          n_tokens, n_head, head_dim, 0, n_tokens, n_tokens, 0,
+                          n_comp, window, ratio, 0, 0, 0, 1);
+        for (uint32_t i = 0; i < 32; i++) require(nearf(got[i], ref[i], 1e-5f), "prefill_static value");
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
+    STEP("attention prefill_masked_mixed");
+    {
+        const uint32_t n_tokens = 3;
+        const uint32_t n_head = 2;
+        const uint32_t head_dim = 4;
+        const uint32_t window = 2;
+        const uint32_t n_comp = 2;
+        const uint32_t ratio = 2;
+        float qv[3 * 2 * 4], raw[3 * 4], comp[2 * 4];
+        float mask[2] = { -1.0e30f, 0.0f };
+        float sinks[2] = { 0.3f, -0.3f };
+        for (uint32_t i = 0; i < 24; i++) qv[i] = 0.1f * (float)((i % 9) - 4);
+        for (uint32_t i = 0; i < 12; i++) raw[i] = 0.08f * (float)i;
+        for (uint32_t i = 0; i < 8; i++) comp[i] = -0.06f * (float)i;
+        ds4_metal_tensor *tq = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *tmask = ds4_metal_tensor_alloc(sizeof(mask));
+        ds4_metal_tensor *tout = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && tmask && tout, "masked alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)), "");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)), "");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "");
+        require(ds4_metal_tensor_write(tmask, 0, mask, sizeof(mask)), "");
+        require(ds4_metal_attention_prefill_masked_mixed_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                                      tq, traw, tcomp, tmask,
+                                                                      n_tokens, n_comp, window, ratio,
+                                                                      n_head, head_dim),
+                "prefill_masked");
+        float got[24], ref[24];
+        read_tensor(tout, got, 24);
+        attn_batch_oracle(ref, qv, raw, comp, mask, NULL, sinks,
+                          n_tokens, n_head, head_dim, 0, n_tokens, n_tokens, 0,
+                          n_comp, window, ratio, 0, 0, 1, 1);
+        for (uint32_t i = 0; i < 24; i++) require(nearf(got[i], ref[i], 1e-5f), "prefill_masked value");
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(tmask);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
     }
 
     STEP("cleanup");

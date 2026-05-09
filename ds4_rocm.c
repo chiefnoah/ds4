@@ -784,6 +784,151 @@ __global__ static void rocm_matmul_q8_0_wmma_kernel(
     }
 }
 
+/* Activation microquant: f32[n_tok][in_dim] -> Q8_0-shaped int8 + per-32-block
+ * fp16 scale.  Output layout matches the Q8_0 weight format (2-byte scale
+ * followed by 32 int8) so the WMMA_I8 matmul kernel can read activations
+ * with the same indexing as weights.  One block (32 lanes) handles one
+ * (token, K-block) pair; each lane covers one int8 element of the block,
+ * with lane 0 publishing the per-block scale.
+ *
+ * Quantization: scale = max|x| / 127, qs = round(x / scale).  Lossy in the
+ * 7th bit (vs fp16's 11-bit mantissa) but the WMMA_I8 path that consumes
+ * this is ~2x faster than WMMA_F16 in micro, so worth the trade for opt-
+ * in prefill. */
+__global__ static void rocm_activation_microquant_q8_kernel(
+        uint8_t *out_blocks,    /* [n_tok * (in_dim/32) * 34 bytes] */
+        const float *x,         /* [n_tok * in_dim] */
+        uint32_t in_dim,
+        uint32_t n_tok) {
+    const uint32_t blocks = in_dim >> 5;
+    const uint32_t bidx   = blockIdx.x;
+    const uint32_t tok    = blockIdx.y;
+    if (bidx >= blocks || tok >= n_tok) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const float v = x[(uint64_t)tok * in_dim + (uint64_t)bidx * 32u + lane];
+    /* Wave-reduce max(|v|) across the 32 lanes of the block. */
+    float a = fabsf(v);
+    a = fmaxf(a, __shfl_xor(a, 16));
+    a = fmaxf(a, __shfl_xor(a,  8));
+    a = fmaxf(a, __shfl_xor(a,  4));
+    a = fmaxf(a, __shfl_xor(a,  2));
+    a = fmaxf(a, __shfl_xor(a,  1));
+    const float scale_f = (a > 0.0f) ? (a / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale_f;
+    const int q = (int)__builtin_rintf(v * inv_scale);
+    const int qclamped = (q > 127) ? 127 : (q < -128 ? -128 : q);
+
+    uint8_t *blk = out_blocks + ((uint64_t)tok * blocks + bidx) * 34ull;
+    if (lane == 0) {
+        const uint16_t hf = (uint16_t)((__half_raw)((__half)scale_f)).x;
+        blk[0] = (uint8_t)(hf & 0xffu);
+        blk[1] = (uint8_t)((hf >> 8) & 0xffu);
+    }
+    blk[2u + lane] = (uint8_t)(int8_t)qclamped;
+}
+
+/* Persistent device-resident scratch for microquantized activations.  Lazy
+ * resize when a larger n_tok or in_dim arrives.  Owned and freed at
+ * ds4_metal_finalize. */
+static uint8_t *g_act_q8_scratch = NULL;
+static uint64_t g_act_q8_scratch_bytes = 0;
+
+static int rocm_act_q8_scratch_ensure(uint64_t needed) {
+    if (g_act_q8_scratch_bytes >= needed) return 1;
+    if (g_act_q8_scratch) {
+        hipFree(g_act_q8_scratch);
+        g_act_q8_scratch = NULL;
+        g_act_q8_scratch_bytes = 0;
+    }
+    const uint64_t alloc = (needed + (1ull << 20)) & ~((1ull << 20) - 1ull);
+    if (hipMalloc(&g_act_q8_scratch, alloc) != hipSuccess) return 0;
+    g_act_q8_scratch_bytes = alloc;
+    return 1;
+}
+
+/* WMMA_I8 Q8_0 prefill matmul.  Same 16x16 output tile / 32-lane block as
+ * the WMMA_F16 kernel above, but the WMMA op is v_wmma_i32_16x16x16_iu8
+ * (signed*signed): it consumes int8 inputs and accumulates int32, then we
+ * scale by (a_scale * w_scale) and add to a per-tile fp32 accumulator
+ * once per Q8_0 block.
+ *
+ * Both the weight (Q8_0 from disk) and the activation (microquantized
+ * from f32 in a pre-pass) are 32-element blocks of int8 + fp16 scale,
+ * so the inner loop is symmetric: lane L (col=L%16) loads its row
+ * activation block and the row-L%16 weight block, runs 2 WMMA_I8 ops
+ * per K=32 step, then folds the int32 accumulator back into fp32. */
+typedef int8_t rocm_v16i8 __attribute__((ext_vector_type(16)));
+typedef int    rocm_v8i32 __attribute__((ext_vector_type(8)));
+
+__global__ static void rocm_matmul_q8_0_wmma_i8_kernel(
+        float *out, const uint8_t *w, const uint8_t *x_q8,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t t0   = blockIdx.y * 16u;
+    if (r0 >= out_dim || t0 >= n_tok) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok     = t0 + col_in_tile;
+    const uint32_t blocks  = in_dim >> 5;
+    const uint64_t x_row_bytes = (uint64_t)blocks * 34ull;
+
+    const uint32_t safe_row = (out_row < out_dim) ? out_row : (out_dim - 1u);
+    const uint32_t safe_tok = (tok     < n_tok)  ? tok     : (n_tok   - 1u);
+    const uint8_t *wr = w     + (uint64_t)safe_row * row_bytes;
+    const uint8_t *xr = x_q8  + (uint64_t)safe_tok * x_row_bytes;
+
+    rocm_v8f32 c = {0,0,0,0,0,0,0,0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *wblk = wr + (uint64_t)b * 34u;
+        const uint8_t *xblk = xr + (uint64_t)b * 34u;
+        const uint16_t w_scale_bits = (uint16_t)wblk[0] | ((uint16_t)wblk[1] << 8);
+        const uint16_t x_scale_bits = (uint16_t)xblk[0] | ((uint16_t)xblk[1] << 8);
+        const float w_scale = rocm_f16_to_f32(w_scale_bits);
+        const float x_scale = rocm_f16_to_f32(x_scale_bits);
+        const float combined = w_scale * x_scale;
+        const int8_t *wqs = (const int8_t *)(wblk + 2);
+        const int8_t *xqs = (const int8_t *)(xblk + 2);
+
+        rocm_v16i8 a, bv;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a[kk]  = wqs[kk];
+            bv[kk] = xqs[kk];
+        }
+        rocm_v8i32 acc1 = {0,0,0,0,0,0,0,0};
+        acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bv, acc1, false);
+
+        rocm_v16i8 a2, bv2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk]  = wqs[16 + kk];
+            bv2[kk] = xqs[16 + kk];
+        }
+        rocm_v8i32 acc2 = {0,0,0,0,0,0,0,0};
+        acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2, acc2, false);
+
+        _Pragma("unroll")
+        for (int i = 0; i < 8; i++) {
+            c[i] += (float)(acc1[i] + acc2[i]) * combined;
+        }
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t t = t0 + col_in_tile;
+        if (r < out_dim && t < n_tok) {
+            out[(uint64_t)t * out_dim + r] = c[i];
+        }
+    }
+}
+
 /* Tiled F16 wave matmul for prefill (n_tok > 1).  Matches the Q8_0 tile
  * pattern: one wave per output row, each lane reads each weight element
  * once and accumulates NTOK partial sums against NTOK x slices.  Only
@@ -2000,7 +2145,44 @@ int ds4_metal_matmul_q8_0_tensor(
                                 && (in_dim  % 32u) == 0u
                                 && out_dim >= 16u
                                 && n_tok   >= 16u;
-            if (wmma_ok) {
+            /* WMMA_I8 path: opt-in via DS4_ROCM_WMMA_I8=1 (lossy: int8
+             * activations have ~7-bit mantissa vs fp16's 11-bit).  When
+             * enabled, microquantize activations f32 -> Q8 once, then
+             * run the matmul with v_wmma_i32_16x16x16_iu8. */
+            static int g_wmma_i8_enabled_cached = -1;
+            if (g_wmma_i8_enabled_cached < 0) {
+                const char *env = getenv("DS4_ROCM_WMMA_I8");
+                g_wmma_i8_enabled_cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            int dispatched_wmma_i8 = 0;
+            if (wmma_ok && g_wmma_i8_enabled_cached) {
+                const uint32_t blocks_per_row = (uint32_t)(in_dim / 32u);
+                const uint64_t scratch_bytes  = (uint64_t)n_tok * blocks_per_row * 34ull;
+                if (rocm_act_q8_scratch_ensure(scratch_bytes)) {
+                    const dim3 mq_block(32u);
+                    const dim3 mq_grid(blocks_per_row, (unsigned)n_tok);
+                    hipLaunchKernelGGL(rocm_activation_microquant_q8_kernel,
+                                       mq_grid, mq_block, 0, 0,
+                                       g_act_q8_scratch,
+                                       (const float *)tensor_u8_const(x),
+                                       (uint32_t)in_dim, (uint32_t)n_tok);
+                    const dim3 wblock(32u);
+                    const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
+                                     (unsigned)((n_tok   + 15u) / 16u));
+                    hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_i8_kernel,
+                                       wgrid, wblock, 0, 0,
+                                       (float *)tensor_u8(out),
+                                       (const uint8_t *)w_dev,
+                                       g_act_q8_scratch,
+                                       (uint32_t)in_dim, (uint32_t)out_dim,
+                                       (uint32_t)n_tok, row_bytes);
+                    ok = rocm_launch_done("Q8_0 matmul wmma_i8 launch",
+                                          "Q8_0 matmul wmma_i8 completion");
+                    dispatched_wmma_i8 = 1;
+                }
+                /* fall through to WMMA_F16 if scratch alloc failed */
+            }
+            if (!dispatched_wmma_i8 && wmma_ok) {
                 const dim3 wblock(32u);
                 const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
                                  (unsigned)((n_tok   + 15u) / 16u));
@@ -2012,7 +2194,7 @@ int ds4_metal_matmul_q8_0_tensor(
                                    (uint32_t)in_dim, (uint32_t)out_dim,
                                    (uint32_t)n_tok, row_bytes);
                 ok = rocm_launch_done("Q8_0 matmul wmma launch", "Q8_0 matmul wmma completion");
-            } else {
+            } else if (!dispatched_wmma_i8) {
             const uint32_t ntok = 8u;
             const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),
                             (unsigned)((n_tok + ntok - 1u) / ntok));

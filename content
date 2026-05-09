@@ -1,0 +1,48 @@
+ROCm perf: benchmark session reuse and chunked-prefix scenarios
+
+# Status
+Open. Measurement task; no source edits required.
+
+# Goal
+Measure ROCm throughput in the paths users actually hit after the first prompt: cold prefill, resumed suffix prefill, short suffix decode replay, and chunked long-context prefill. This complements tsk-8, which captures core CLI prefill/decode baselines.
+
+# Why
+`ds4_session_sync` has several paths with different performance characteristics:
+- cold full prompt prefill,
+- long suffix extension via `metal_graph_prefill_chunked_range`,
+- short suffix extension via repeated one-token decode,
+- checkpoint/cache reuse where only a suffix is evaluated.
+Optimizing only the one-shot CLI path can miss throughput regressions in server/interactive workflows.
+
+# Scenarios to capture
+1. Cold prompt, length below prefill cap.
+2. Cold prompt, length above default 2048 chunk threshold.
+3. Reuse same session with a small suffix below `metal_graph_resume_prefill_min_tokens`; confirm it uses decode-style extension and record t/s or per-token ms.
+4. Reuse same session with a long suffix above resume threshold; confirm it uses chunked range prefill and record chunk/profile output.
+5. Nonzero `start` alignment cases: suffix begins not aligned to `DS4_METAL_PREFILL_CHUNK`, because `metal_graph_prefill_chunked_range` adjusts first chunk to boundary.
+
+# How to run
+- Prefer existing CLI/server/session hooks if available. If no simple harness exists, record the missing harness as a follow-up task rather than editing code here.
+- Use `DS4_METAL_GRAPH_PREFILL_PROFILE=1`, `DS4_METAL_GRAPH_TOKEN_PROFILE=1`, and `DS4_ROCM_TIME=1` for one representative run of each path.
+- Sweep `DS4_METAL_PREFILL_CHUNK=512,1024,2048` for long suffixes.
+- Keep model, seed, temperature, prompt files, and generated-token count fixed across runs.
+
+# Metrics
+- Cold prefill t/s and generation t/s.
+- Resume/suffix elapsed time and effective suffix tokens/s.
+- Number of chunks and first-chunk size for nonzero starts.
+- Per-layer/profile totals if enabled.
+- Any correctness/coherence drift versus tsk-3.
+
+# Expected output
+A small table in this task showing scenario, prompt/suffix length, chunk env, elapsed time, effective t/s, and the top ROCm timing buckets. Then link any bottleneck to tsk-4/5/6/7 or open a narrower follow-up task.
+
+# Files to inspect if a harness is needed
+- ds4.c `ds4_session_sync`, `metal_graph_prefill_chunked_range`, `metal_graph_resume_prefill_min_tokens`.
+- ds4_cli.c interactive/session behavior.
+- ds4_server.c disk KV/session cache behavior.
+
+# Related tasks
+- tsk-8 baseline capture.
+- tsk-10 call-site attribution map.
+- tsk-3 regression gate.

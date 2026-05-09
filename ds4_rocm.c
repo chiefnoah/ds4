@@ -53,10 +53,6 @@ static int rocm_trace(void) {
     return v && v[0] && v[0] != '0';
 }
 
-static void rocm_unimplemented(const char *name) {
-    fprintf(stderr, "ds4: ROCm kernel not implemented yet: %s\n", name);
-}
-
 static const uint8_t *tensor_u8_const(const ds4_metal_tensor *t) {
     return (const uint8_t *)t->dev_ptr + t->offset;
 }
@@ -2929,8 +2925,6 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
     return ok;
 }
 
-#define DS4_ROCM_STUB(name) int name() { rocm_unimplemented(#name); return 0; }
-
 int ds4_metal_compressor_prefill_ratio4_replay_tensor(
         ds4_metal_tensor       *comp_cache,
         ds4_metal_tensor       *state_kv,
@@ -3581,8 +3575,588 @@ int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
                                     "prefill_masked");
 }
 
-DS4_ROCM_STUB(ds4_metal_routed_moe_one_tensor)
-DS4_ROCM_STUB(ds4_metal_routed_moe_batch_tensor)
+/* =========================================================================
+ * Routed MoE kernels (IQ2_XXS / Q2_K / Q4_K weights, FP32 activations).
+ * =========================================================================
+ *
+ * Mirrors layer_routed_moe_one() / layer_routed_moe_batch() in ds4.c.  Two
+ * stages per token:
+ *   1. gate_up: for each (slot, mid_row), dot the per-slot expert's gate and
+ *      up rows against the activation, clamp, then write
+ *          mid[slot, mid_row] = silu(gate_clamped) * up_clamped * weight[slot]
+ *   2. down: for each out_row, accumulate over slots:
+ *          out[out_row] = sum_s dot(down_expert[selected[s], out_row], mid[s])
+ *
+ * For bring-up the host wrappers pre-pack just the n_used selected experts per
+ * token (CPU-side gather) and upload that compact slab via the existing
+ * mapped-host-memory path.  This keeps the per-call upload bounded by
+ * n_used*per-expert-bytes instead of the full 256-expert pool.  Activations
+ * stay in FP32 — we skip the Q8_K staging the CPU path uses, which is more
+ * accurate and removes a kernel.
+ */
+
+#define DS4_QK_K 256
+
+typedef struct {
+    uint8_t  scales[DS4_QK_K / 16];
+    uint8_t  qs[DS4_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} rocm_block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[DS4_QK_K / 2];
+} rocm_block_q4_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[DS4_QK_K / 8];
+} rocm_block_iq2_xxs;
+
+#define DS4_TENSOR_TYPE_Q2_K     10u
+#define DS4_TENSOR_TYPE_Q4_K     12u
+#define DS4_TENSOR_TYPE_IQ2_XXS  16u
+
+__device__ static const uint64_t rocm_iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+__device__ static const uint8_t rocm_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+/* Per-block dot helpers.  Each computes sum_i (dequant_w_i * y_i) for one
+ * 256-element block, accumulating in float against an FP32 activation slice. */
+
+__device__ __forceinline__ static float rocm_iq2xxs_dot_block(
+        const rocm_block_iq2_xxs *xb, const float *y) {
+    const float d = rocm_f16_to_f32(xb->d);
+    float sum = 0.0f;
+    const uint16_t *q = xb->qs;
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+        const uint32_t aux32_g = (uint32_t)q[0] | ((uint32_t)q[1] << 16);
+        const uint32_t aux32_s = (uint32_t)q[2] | ((uint32_t)q[3] << 16);
+        q += 4;
+        const float dl = d * (0.5f + (float)(aux32_s >> 28)) * 0.25f;
+        const uint8_t a0 = (uint8_t)(aux32_g >>  0);
+        const uint8_t a1 = (uint8_t)(aux32_g >>  8);
+        const uint8_t a2 = (uint8_t)(aux32_g >> 16);
+        const uint8_t a3 = (uint8_t)(aux32_g >> 24);
+        const uint8_t s0 = rocm_ksigns_iq2xs[(aux32_s >>  0) & 127u];
+        const uint8_t s1 = rocm_ksigns_iq2xs[(aux32_s >>  7) & 127u];
+        const uint8_t s2 = rocm_ksigns_iq2xs[(aux32_s >> 14) & 127u];
+        const uint8_t s3 = rocm_ksigns_iq2xs[(aux32_s >> 21) & 127u];
+        const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + a0);
+        const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + a1);
+        const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + a2);
+        const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + a3);
+        float sub = 0.0f;
+        for (int j = 0; j < 8; j++) {
+            const float v0 = (float)g0[j] * (((s0 >> j) & 1u) ? -1.0f : 1.0f);
+            const float v1 = (float)g1[j] * (((s1 >> j) & 1u) ? -1.0f : 1.0f);
+            const float v2 = (float)g2[j] * (((s2 >> j) & 1u) ? -1.0f : 1.0f);
+            const float v3 = (float)g3[j] * (((s3 >> j) & 1u) ? -1.0f : 1.0f);
+            sub += y[j +  0] * v0 + y[j +  8] * v1 + y[j + 16] * v2 + y[j + 24] * v3;
+        }
+        sum += dl * sub;
+        y += 32;
+    }
+    return sum;
+}
+
+__device__ __forceinline__ static float rocm_q2_K_dot_block(
+        const rocm_block_q2_K *xb, const float *y) {
+    const float d = rocm_f16_to_f32(xb->d);
+    const float dmin = rocm_f16_to_f32(xb->dmin);
+    const uint8_t *q = xb->qs;
+    const uint8_t *sc = xb->scales;
+    float sum_d = 0.0f, sum_m = 0.0f;
+    int is = 0;
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            const float scale_a = (float)(sc[is] & 0x0F);
+            const float min_a   = (float)(sc[is] >> 4);
+            float dot_a = 0.0f, sumy_a = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                const float yv = y[i];
+                dot_a += yv * (float)((q[i] >> shift) & 0x3);
+                sumy_a += yv;
+            }
+            sum_d += scale_a * dot_a;
+            sum_m += min_a * sumy_a;
+            is++;
+
+            const float scale_b = (float)(sc[is] & 0x0F);
+            const float min_b   = (float)(sc[is] >> 4);
+            float dot_b = 0.0f, sumy_b = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                const float yv = y[i + 16];
+                dot_b += yv * (float)((q[i + 16] >> shift) & 0x3);
+                sumy_b += yv;
+            }
+            sum_d += scale_b * dot_b;
+            sum_m += min_b * sumy_b;
+            is++;
+
+            shift += 2;
+            y += 32;
+        }
+        q += 32;
+    }
+    return d * sum_d - dmin * sum_m;
+}
+
+__device__ __forceinline__ static void rocm_q4_K_get_scale_min(
+        int j, const uint8_t *q, uint8_t *scale, uint8_t *minv) {
+    if (j < 4) {
+        *scale = q[j] & 0x3F;
+        *minv  = q[j + 4] & 0x3F;
+    } else {
+        *scale = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *minv  = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+__device__ __forceinline__ static float rocm_q4_K_dot_block(
+        const rocm_block_q4_K *xb, const float *y) {
+    const float d = rocm_f16_to_f32(xb->d);
+    const float dmin = rocm_f16_to_f32(xb->dmin);
+    const uint8_t *q = xb->qs;
+    float sum_d = 0.0f, sum_m = 0.0f;
+    for (int j = 0; j < 8; j++) {
+        uint8_t scale, mn;
+        rocm_q4_K_get_scale_min(j, xb->scales, &scale, &mn);
+        const int qoff = (j / 2) * 32;
+        const int shift = (j & 1) * 4;
+        const float *yj = y + j * 32;
+        float dot = 0.0f, sy = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            const float yv = yj[i];
+            dot += yv * (float)((q[qoff + i] >> shift) & 0x0F);
+            sy += yv;
+        }
+        sum_d += (float)scale * dot;
+        sum_m += (float)mn * sy;
+    }
+    return d * sum_d - dmin * sum_m;
+}
+
+__device__ __forceinline__ static float rocm_quant_dot_block(
+        uint32_t type, const uint8_t *block, const float *y) {
+    if (type == DS4_TENSOR_TYPE_IQ2_XXS) {
+        return rocm_iq2xxs_dot_block((const rocm_block_iq2_xxs *)block, y);
+    }
+    if (type == DS4_TENSOR_TYPE_Q2_K) {
+        return rocm_q2_K_dot_block((const rocm_block_q2_K *)block, y);
+    }
+    return rocm_q4_K_dot_block((const rocm_block_q4_K *)block, y);
+}
+
+__device__ __forceinline__ static uint32_t rocm_quant_block_bytes(uint32_t type) {
+    if (type == DS4_TENSOR_TYPE_IQ2_XXS) return (uint32_t)sizeof(rocm_block_iq2_xxs);
+    if (type == DS4_TENSOR_TYPE_Q2_K)    return (uint32_t)sizeof(rocm_block_q2_K);
+    return (uint32_t)sizeof(rocm_block_q4_K);
+}
+
+static uint64_t rocm_quant_block_bytes_host(uint32_t type) {
+    if (type == DS4_TENSOR_TYPE_IQ2_XXS) return sizeof(rocm_block_iq2_xxs);
+    if (type == DS4_TENSOR_TYPE_Q2_K)    return sizeof(rocm_block_q2_K);
+    if (type == DS4_TENSOR_TYPE_Q4_K)    return sizeof(rocm_block_q4_K);
+    return 0;
+}
+
+__device__ __forceinline__ static float rocm_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+/* Pre-packed: experts uploaded as n_used contiguous slabs in slot order.  The
+ * kernel reads slot s from gate_pack + s*expert_bytes (ignoring selected[]
+ * for the pointer math) but still uses weights[t*n_used + s]. */
+
+__global__ static void rocm_moe_gate_up_matvec_kernel(
+        float *mid,                    /* [n_tokens * n_used * mid_dim]   */
+        const uint8_t *gate_pack,      /* [n_tokens * n_used * gate_expert_bytes] */
+        const uint8_t *up_pack,        /* [n_tokens * n_used * up_expert_bytes]   */
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        const float *x,                /* [n_tokens * in_dim]             */
+        const float *weights,          /* [n_tokens * n_used]             */
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint32_t n_tokens,
+        float clamp) {
+    const uint32_t slot   = blockIdx.x;
+    const uint32_t row    = blockIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t token  = blockIdx.z;
+    if (slot >= n_used || row >= mid_dim || token >= n_tokens) return;
+
+    const uint32_t nb = in_dim / DS4_QK_K;
+    const uint32_t gate_bb = rocm_quant_block_bytes(gate_type);
+    const uint32_t up_bb   = rocm_quant_block_bytes(up_type);
+    const uint64_t pack_idx = (uint64_t)token * n_used + slot;
+    const uint8_t *gate_row_p = gate_pack + pack_idx * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const uint8_t *up_row_p   = up_pack   + pack_idx * up_expert_bytes   + (uint64_t)row * up_row_bytes;
+    const float *xp = x + (uint64_t)token * in_dim;
+
+    float gate_v = 0.0f, up_v = 0.0f;
+    const float *yp = xp;
+    for (uint32_t b = 0; b < nb; b++) {
+        gate_v += rocm_quant_dot_block(gate_type, gate_row_p + (uint64_t)b * gate_bb, yp);
+        up_v   += rocm_quant_dot_block(up_type,   up_row_p   + (uint64_t)b * up_bb,   yp);
+        yp += DS4_QK_K;
+    }
+
+    if (clamp > 1.0e-6f) {
+        if (gate_v > clamp) gate_v = clamp;
+        if (up_v > clamp) up_v = clamp;
+        if (up_v < -clamp) up_v = -clamp;
+    }
+    const float w = weights[(uint64_t)token * n_used + slot];
+    mid[((uint64_t)token * n_used + slot) * mid_dim + row] = rocm_silu(gate_v) * up_v * w;
+}
+
+__global__ static void rocm_moe_down_matvec_kernel(
+        float *out,                    /* [n_tokens * out_dim]            */
+        const uint8_t *down_pack,      /* [n_tokens * n_used * down_expert_bytes] */
+        uint32_t down_type,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        const float *mid,              /* [n_tokens * n_used * mid_dim]   */
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        uint32_t n_used,
+        uint32_t n_tokens) {
+    const uint32_t row   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+
+    const uint32_t nb = mid_dim / DS4_QK_K;
+    const uint32_t down_bb = rocm_quant_block_bytes(down_type);
+
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < n_used; s++) {
+        const uint64_t pack_idx = (uint64_t)token * n_used + s;
+        const uint8_t *down_row_p = down_pack + pack_idx * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const float *mid_p = mid + pack_idx * mid_dim;
+        float dot = 0.0f;
+        for (uint32_t b = 0; b < nb; b++) {
+            dot += rocm_quant_dot_block(down_type, down_row_p + (uint64_t)b * down_bb, mid_p);
+            mid_p += DS4_QK_K;
+        }
+        acc += dot;
+    }
+    out[(uint64_t)token * out_dim + row] = acc;
+}
+
+/* Host helper: pack n_used per-token expert weight slabs from the model map
+ * into a contiguous device-mappable buffer.  selected_host points at host-
+ * readable int32_t indices; result is malloc'd and must be freed by caller. */
+static int rocm_moe_pack_experts(
+        const void *model_map,
+        uint64_t model_offset,
+        uint64_t expert_bytes,
+        uint64_t total_experts,
+        const int32_t *selected_host,
+        uint32_t n_used,
+        uint32_t n_tokens,
+        void **out_buf) {
+    const uint64_t pack_bytes = (uint64_t)n_tokens * n_used * expert_bytes;
+    uint8_t *buf = (uint8_t *)malloc((size_t)pack_bytes);
+    if (!buf) return 0;
+    const uint8_t *src_base = (const uint8_t *)model_map + model_offset;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_host[(uint64_t)t * n_used + s];
+            if (e < 0 || (uint64_t)e >= total_experts) {
+                free(buf);
+                return 0;
+            }
+            memcpy(buf + ((uint64_t)t * n_used + s) * expert_bytes,
+                   src_base + (uint64_t)e * expert_bytes,
+                   (size_t)expert_bytes);
+        }
+    }
+    *out_buf = buf;
+    return 1;
+}
+
+static int rocm_moe_run(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_metal_tensor *selected,
+        const ds4_metal_tensor *weights,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   clamp,
+        const ds4_metal_tensor *x) {
+    if (!out || !mid || !x || !selected || !weights || !model_map) return 0;
+    if (n_used == 0 || n_tokens == 0 || expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0) return 0;
+    if ((expert_in_dim % DS4_QK_K) != 0 || (expert_mid_dim % DS4_QK_K) != 0) return 0;
+    const uint64_t gate_bb = rocm_quant_block_bytes_host(gate_type);
+    const uint64_t down_bb = rocm_quant_block_bytes_host(down_type);
+    if (gate_bb == 0 || down_bb == 0) {
+        fprintf(stderr, "ds4: ROCm routed MoE unsupported quant types gate=%u down=%u\n",
+                gate_type, down_type);
+        return 0;
+    }
+    /* Up shares gate's row layout and quant type. */
+    const uint32_t up_type = gate_type;
+    const uint64_t up_expert_bytes = gate_expert_bytes;
+    const uint64_t up_row_bytes = gate_row_bytes;
+
+    /* Pool size: total experts in the layer (all routed-MoE layers use 256). */
+    const uint64_t total_experts = 256ull;
+    const uint64_t gate_pool = total_experts * gate_expert_bytes;
+    const uint64_t up_pool   = total_experts * up_expert_bytes;
+    const uint64_t down_pool = total_experts * down_expert_bytes;
+    if (gate_offset > model_size || gate_pool > model_size - gate_offset) return 0;
+    if (up_offset   > model_size || up_pool   > model_size - up_offset)   return 0;
+    if (down_offset > model_size || down_pool > model_size - down_offset) return 0;
+
+    if (mid->bytes < (uint64_t)n_tokens * n_used * expert_mid_dim * sizeof(float)) return 0;
+    if (out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) return 0;
+    if (x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float)) return 0;
+    if (selected->bytes < (uint64_t)n_tokens * n_used * sizeof(int32_t)) return 0;
+    if (weights->bytes < (uint64_t)n_tokens * n_used * sizeof(float)) return 0;
+
+    const int32_t *sel_host = (const int32_t *)tensor_host_u8_const(selected);
+
+    void *gate_pack = NULL, *up_pack = NULL, *down_pack = NULL;
+    if (!rocm_moe_pack_experts(model_map, gate_offset, gate_expert_bytes, total_experts,
+                               sel_host, n_used, n_tokens, &gate_pack)) return 0;
+    if (!rocm_moe_pack_experts(model_map, up_offset, up_expert_bytes, total_experts,
+                               sel_host, n_used, n_tokens, &up_pack)) {
+        free(gate_pack); return 0;
+    }
+    if (!rocm_moe_pack_experts(model_map, down_offset, down_expert_bytes, total_experts,
+                               sel_host, n_used, n_tokens, &down_pack)) {
+        free(gate_pack); free(up_pack); return 0;
+    }
+
+    void *gate_h = NULL, *gate_d = NULL;
+    void *up_h = NULL, *up_d = NULL;
+    void *down_h = NULL, *down_d = NULL;
+    const uint64_t gate_bytes = (uint64_t)n_tokens * n_used * gate_expert_bytes;
+    const uint64_t up_bytes   = (uint64_t)n_tokens * n_used * up_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_tokens * n_used * down_expert_bytes;
+    int ok = rocm_upload_mapped(gate_pack, gate_bytes, &gate_h, &gate_d, "moe gate pack upload") &&
+             rocm_upload_mapped(up_pack,   up_bytes,   &up_h,   &up_d,   "moe up pack upload")   &&
+             rocm_upload_mapped(down_pack, down_bytes, &down_h, &down_d, "moe down pack upload");
+
+    free(gate_pack);
+    free(up_pack);
+    free(down_pack);
+    if (!ok) {
+        if (gate_h) (void)hipHostFree(gate_h);
+        if (up_h)   (void)hipHostFree(up_h);
+        if (down_h) (void)hipHostFree(down_h);
+        return 0;
+    }
+
+    {
+        const uint32_t threads = 64;
+        const uint32_t row_blocks = (expert_mid_dim + threads - 1) / threads;
+        dim3 grid(n_used, row_blocks, n_tokens);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_moe_gate_up_matvec_kernel, grid, block, 0, 0,
+                           (float *)tensor_u8(mid),
+                           (const uint8_t *)gate_d,
+                           (const uint8_t *)up_d,
+                           gate_type, up_type,
+                           gate_expert_bytes, gate_row_bytes,
+                           up_expert_bytes, up_row_bytes,
+                           (const float *)tensor_u8_const(x),
+                           (const float *)tensor_u8_const(weights),
+                           expert_in_dim, expert_mid_dim, n_used, n_tokens, clamp);
+    }
+    ok = rocm_ok(hipGetLastError(), "moe gate_up launch") &&
+         rocm_ok(hipDeviceSynchronize(), "moe gate_up completion");
+
+    if (ok) {
+        const uint32_t threads = 64;
+        const uint32_t row_blocks = (out_dim + threads - 1) / threads;
+        dim3 grid(row_blocks, n_tokens, 1);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_moe_down_matvec_kernel, grid, block, 0, 0,
+                           (float *)tensor_u8(out),
+                           (const uint8_t *)down_d,
+                           down_type,
+                           down_expert_bytes, down_row_bytes,
+                           (const float *)tensor_u8_const(mid),
+                           expert_mid_dim, out_dim, n_used, n_tokens);
+        ok = rocm_ok(hipGetLastError(), "moe down launch") &&
+             rocm_ok(hipDeviceSynchronize(), "moe down completion");
+    }
+
+    (void)hipHostFree(gate_h);
+    (void)hipHostFree(up_h);
+    (void)hipHostFree(down_h);
+    return ok;
+}
+
+int ds4_metal_routed_moe_one_tensor(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        ds4_metal_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_metal_tensor *selected,
+        const ds4_metal_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_metal_tensor *x) {
+    (void)gate; (void)up; (void)experts;
+    return rocm_moe_run(out, mid, model_map, model_size,
+                        gate_offset, up_offset, down_offset,
+                        gate_type, down_type,
+                        gate_expert_bytes, gate_row_bytes,
+                        down_expert_bytes, down_row_bytes,
+                        expert_in_dim, expert_mid_dim, out_dim,
+                        selected, weights, n_expert, 1u, clamp, x);
+}
+
+int ds4_metal_routed_moe_batch_tensor(
+        ds4_metal_tensor       *out,
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        ds4_metal_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_metal_tensor *selected,
+        const ds4_metal_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_metal_tensor *x,
+        uint32_t                n_tokens) {
+    (void)gate; (void)up; (void)experts;
+    return rocm_moe_run(out, mid, model_map, model_size,
+                        gate_offset, up_offset, down_offset,
+                        gate_type, down_type,
+                        gate_expert_bytes, gate_row_bytes,
+                        down_expert_bytes, down_row_bytes,
+                        expert_in_dim, expert_mid_dim, out_dim,
+                        selected, weights, n_expert, n_tokens, clamp, x);
+}
 
 #ifdef __cplusplus
 }

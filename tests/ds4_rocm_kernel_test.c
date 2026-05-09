@@ -152,6 +152,221 @@ static void attn_batch_oracle(
     }
 }
 
+/* CPU mirrors of the GPU routed-MoE block dots, used to oracle the kernels. */
+
+#define MOE_QK_K 256
+
+typedef struct {
+    uint8_t  scales[MOE_QK_K / 16];
+    uint8_t  qs[MOE_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} moe_block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[MOE_QK_K / 8];
+} moe_block_iq2_xxs;
+
+static const uint64_t moe_iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+static const uint8_t moe_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static float f16_to_f32(uint16_t bits) {
+    uint32_t sign = (uint32_t)(bits >> 15) & 0x1u;
+    uint32_t exp  = (uint32_t)(bits >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)(bits & 0x3FFu);
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) f = sign << 31;
+        else {
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp = (uint32_t)((int32_t)exp - 1); }
+            mant &= 0x3FFu; exp += 1;
+            f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    }
+    union { uint32_t u; float f; } u; u.u = f; return u.f;
+}
+
+static float moe_iq2xxs_dot_block_cpu(const moe_block_iq2_xxs *xb, const float *y) {
+    const float d = f16_to_f32(xb->d);
+    float sum = 0.0f;
+    const uint16_t *q = xb->qs;
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+        const uint32_t aux32_g = (uint32_t)q[0] | ((uint32_t)q[1] << 16);
+        const uint32_t aux32_s = (uint32_t)q[2] | ((uint32_t)q[3] << 16);
+        q += 4;
+        const float dl = d * (0.5f + (float)(aux32_s >> 28)) * 0.25f;
+        const uint8_t a[4] = {
+            (uint8_t)(aux32_g >>  0), (uint8_t)(aux32_g >>  8),
+            (uint8_t)(aux32_g >> 16), (uint8_t)(aux32_g >> 24),
+        };
+        const uint8_t s[4] = {
+            moe_ksigns_iq2xs[(aux32_s >>  0) & 127u],
+            moe_ksigns_iq2xs[(aux32_s >>  7) & 127u],
+            moe_ksigns_iq2xs[(aux32_s >> 14) & 127u],
+            moe_ksigns_iq2xs[(aux32_s >> 21) & 127u],
+        };
+        for (int sub = 0; sub < 4; sub++) {
+            const uint8_t *g = (const uint8_t *)(moe_iq2xxs_grid + a[sub]);
+            for (int j = 0; j < 8; j++) {
+                const float v = (float)g[j] * (((s[sub] >> j) & 1u) ? -1.0f : 1.0f);
+                sum += dl * v * y[sub * 8 + j];
+            }
+        }
+        y += 32;
+    }
+    return sum;
+}
+
+static float moe_q2_K_dot_block_cpu(const moe_block_q2_K *xb, const float *y) {
+    const float d = f16_to_f32(xb->d);
+    const float dmin = f16_to_f32(xb->dmin);
+    const uint8_t *q = xb->qs;
+    const uint8_t *sc = xb->scales;
+    float sum_d = 0.0f, sum_m = 0.0f;
+    int is = 0;
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            for (int half = 0; half < 2; half++) {
+                const float scale = (float)(sc[is] & 0x0F);
+                const float minv  = (float)(sc[is] >> 4);
+                float dot = 0.0f, sy = 0.0f;
+                for (int i = 0; i < 16; i++) {
+                    const float yv = y[half * 16 + i];
+                    dot += yv * (float)((q[half * 16 + i] >> shift) & 0x3);
+                    sy  += yv;
+                }
+                sum_d += scale * dot;
+                sum_m += minv * sy;
+                is++;
+            }
+            shift += 2;
+            y += 32;
+        }
+        q += 32;
+    }
+    return d * sum_d - dmin * sum_m;
+}
+
+/* Build a synthetic IQ2_XXS block with deterministic content from a seed. */
+static void moe_build_iq2xxs_block(moe_block_iq2_xxs *b, uint32_t seed) {
+    b->d = f32_to_f16(0.05f + 0.001f * (float)(seed & 0x7));
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+        /* aux32_g: 4 grid indices in [0,256) */
+        uint32_t g = 0;
+        for (int k = 0; k < 4; k++) {
+            uint8_t idx = (uint8_t)((seed * 31u + (uint32_t)ib32 * 17u + (uint32_t)k * 7u) & 0xFFu);
+            g |= ((uint32_t)idx) << (k * 8);
+        }
+        /* aux32_s: 4 sign indices (each 7 bits) + 4-bit scale offset on top. */
+        uint32_t s = 0;
+        for (int k = 0; k < 4; k++) {
+            uint32_t sg = (seed * 13u + (uint32_t)ib32 * 5u + (uint32_t)k * 3u) & 127u;
+            s |= sg << (k * 7);
+        }
+        const uint32_t scale_off = (seed + (uint32_t)ib32) & 0xFu;
+        s |= (scale_off << 28);
+        b->qs[ib32 * 4 + 0] = (uint16_t)(g & 0xFFFFu);
+        b->qs[ib32 * 4 + 1] = (uint16_t)((g >> 16) & 0xFFFFu);
+        b->qs[ib32 * 4 + 2] = (uint16_t)(s & 0xFFFFu);
+        b->qs[ib32 * 4 + 3] = (uint16_t)((s >> 16) & 0xFFFFu);
+    }
+}
+
+/* Build a synthetic Q2_K block. */
+static void moe_build_q2_K_block(moe_block_q2_K *b, uint32_t seed) {
+    b->d    = f32_to_f16(0.03f + 0.001f * (float)(seed & 0x7));
+    b->dmin = f32_to_f16(0.01f + 0.0005f * (float)(seed & 0xF));
+    for (int i = 0; i < 16; i++) {
+        const uint32_t scale = (seed * 11u + (uint32_t)i * 3u) & 0xFu;
+        const uint32_t minv  = (seed * 7u  + (uint32_t)i * 5u) & 0xFu;
+        b->scales[i] = (uint8_t)((minv << 4) | scale);
+    }
+    for (int i = 0; i < 64; i++) {
+        b->qs[i] = (uint8_t)((seed * 17u + (uint32_t)i * 13u) & 0xFFu);
+    }
+}
+
 int main(void) {
     STEP("init");
     if (!ds4_metal_init()) {
@@ -1184,6 +1399,231 @@ int main(void) {
         ds4_metal_tensor_free(tcomp);
         ds4_metal_tensor_free(traw);
         ds4_metal_tensor_free(tq);
+    }
+
+    STEP("routed_moe_one (iq2xxs gate/up + q2_K down)");
+    {
+        const uint32_t in_dim = 256;        /* one block per row */
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 2;
+        const uint32_t n_total = 256;       /* host wrapper assumes 256 experts */
+        const float clamp = 2.5f;
+
+        const uint64_t gate_row_bytes = sizeof(moe_block_iq2_xxs);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+
+        /* Synthetic mmap: gate_pool || up_pool || down_pool. */
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        uint8_t *model = (uint8_t *)calloc(1, (size_t)model_size);
+        require(model != NULL, "moe model alloc");
+
+        moe_block_iq2_xxs *gate_pool_p = (moe_block_iq2_xxs *)(model + 0);
+        moe_block_iq2_xxs *up_pool_p   = (moe_block_iq2_xxs *)(model + gate_pool);
+        moe_block_q2_K    *down_pool_p = (moe_block_q2_K    *)(model + gate_pool + gate_pool);
+
+        /* Only the experts we'll select need to be initialized; the rest stay zero. */
+        const int32_t selected_vals[2] = { 17, 142 };
+        const float weights_vals[2] = { 0.6f, 0.4f };
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                moe_build_iq2xxs_block(&gate_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1009u + r * 7u);
+                moe_build_iq2xxs_block(&up_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1013u + r * 11u);
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                moe_build_q2_K_block(&down_pool_p[(uint64_t)e * out_dim + r],
+                                     (uint32_t)e * 1019u + r * 13u);
+            }
+        }
+
+        float xv[256];
+        for (uint32_t i = 0; i < 256; i++) xv[i] = 0.02f * (float)((int)(i % 19) - 9);
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc(sizeof(selected_vals));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc(sizeof(weights_vals));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "moe tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, sizeof(xv)), "moe x write");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, sizeof(selected_vals)), "moe sel write");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, sizeof(weights_vals)), "moe wts write");
+
+        require(ds4_metal_routed_moe_one_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                 model, model_size,
+                                                 0, gate_pool, gate_pool + gate_pool,
+                                                 16u /* IQ2_XXS */, 10u /* Q2_K */,
+                                                 gate_expert_bytes, gate_row_bytes,
+                                                 down_expert_bytes, down_row_bytes,
+                                                 in_dim, mid_dim, out_dim,
+                                                 tsel, twts, n_used, clamp, tx),
+                "routed_moe_one");
+
+        /* CPU oracle. */
+        float ref_mid[2 * 256];
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                float gate_v = moe_iq2xxs_dot_block_cpu(&gate_pool_p[(uint64_t)e * mid_dim + r], xv);
+                float up_v   = moe_iq2xxs_dot_block_cpu(&up_pool_p[(uint64_t)e * mid_dim + r],   xv);
+                if (gate_v > clamp) gate_v = clamp;
+                if (up_v > clamp) up_v = clamp;
+                if (up_v < -clamp) up_v = -clamp;
+                const float silu = gate_v / (1.0f + expf(-gate_v));
+                ref_mid[s * mid_dim + r] = silu * up_v * weights_vals[s];
+            }
+        }
+        float got_mid[2 * 256];
+        read_tensor(tmid, got_mid, n_used * mid_dim);
+        for (uint32_t i = 0; i < n_used * mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 1e-4f), "routed_moe_one mid value");
+        }
+
+        float ref_out[256] = {0};
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t s = 0; s < n_used; s++) {
+                const int32_t e = selected_vals[s];
+                acc += moe_q2_K_dot_block_cpu(&down_pool_p[(uint64_t)e * out_dim + r],
+                                              ref_mid + (uint64_t)s * mid_dim);
+            }
+            ref_out[r] = acc;
+        }
+        float got_out[256];
+        read_tensor(tout_moe, got_out, out_dim);
+        for (uint32_t i = 0; i < out_dim; i++) {
+            require(nearf(got_out[i], ref_out[i], 1e-3f), "routed_moe_one out value");
+        }
+
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        free(model);
+    }
+
+    STEP("routed_moe_batch (n_tokens=2)");
+    {
+        const uint32_t in_dim = 256;
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 2;
+        const uint32_t n_total = 256;
+        const uint32_t n_tokens = 2;
+        const float clamp = 2.5f;
+
+        const uint64_t gate_row_bytes = sizeof(moe_block_iq2_xxs);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        uint8_t *model = (uint8_t *)calloc(1, (size_t)model_size);
+        require(model != NULL, "moe batch model alloc");
+
+        moe_block_iq2_xxs *gate_pool_p = (moe_block_iq2_xxs *)(model + 0);
+        moe_block_iq2_xxs *up_pool_p   = (moe_block_iq2_xxs *)(model + gate_pool);
+        moe_block_q2_K    *down_pool_p = (moe_block_q2_K    *)(model + gate_pool + gate_pool);
+
+        const int32_t selected_vals[4] = { 4, 91, 200, 33 };  /* 2 tokens × 2 used */
+        const float weights_vals[4] = { 0.5f, 0.5f, 0.7f, 0.3f };
+        for (uint32_t s = 0; s < 4; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                moe_build_iq2xxs_block(&gate_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1009u + r * 7u);
+                moe_build_iq2xxs_block(&up_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1013u + r * 11u);
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                moe_build_q2_K_block(&down_pool_p[(uint64_t)e * out_dim + r],
+                                     (uint32_t)e * 1019u + r * 13u);
+            }
+        }
+
+        float xv[2 * 256];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < 256; i++) {
+                xv[t * 256 + i] = 0.015f * (float)((int)((i + t * 5) % 23) - 11);
+            }
+        }
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc(sizeof(selected_vals));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc(sizeof(weights_vals));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_tokens * n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "moe batch tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, sizeof(xv)), "moe batch x write");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, sizeof(selected_vals)), "moe batch sel write");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, sizeof(weights_vals)), "moe batch wts write");
+
+        require(ds4_metal_routed_moe_batch_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                   model, model_size,
+                                                   0, gate_pool, gate_pool + gate_pool,
+                                                   16u, 10u,
+                                                   gate_expert_bytes, gate_row_bytes,
+                                                   down_expert_bytes, down_row_bytes,
+                                                   in_dim, mid_dim, out_dim,
+                                                   tsel, twts, n_used, clamp, tx, n_tokens),
+                "routed_moe_batch");
+
+        float ref_mid[2 * 2 * 256];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t s = 0; s < n_used; s++) {
+                const int32_t e = selected_vals[t * n_used + s];
+                const float w  = weights_vals[t * n_used + s];
+                for (uint32_t r = 0; r < mid_dim; r++) {
+                    float gate_v = moe_iq2xxs_dot_block_cpu(&gate_pool_p[(uint64_t)e * mid_dim + r], xv + t * in_dim);
+                    float up_v   = moe_iq2xxs_dot_block_cpu(&up_pool_p[(uint64_t)e * mid_dim + r],   xv + t * in_dim);
+                    if (gate_v > clamp) gate_v = clamp;
+                    if (up_v > clamp) up_v = clamp;
+                    if (up_v < -clamp) up_v = -clamp;
+                    const float silu = gate_v / (1.0f + expf(-gate_v));
+                    ref_mid[(t * n_used + s) * mid_dim + r] = silu * up_v * w;
+                }
+            }
+        }
+
+        float got_mid[2 * 2 * 256];
+        read_tensor(tmid, got_mid, n_tokens * n_used * mid_dim);
+        for (uint32_t i = 0; i < n_tokens * n_used * mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 1e-4f), "routed_moe_batch mid value");
+        }
+
+        float ref_out[2 * 256] = {0};
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float acc = 0.0f;
+                for (uint32_t s = 0; s < n_used; s++) {
+                    const int32_t e = selected_vals[t * n_used + s];
+                    acc += moe_q2_K_dot_block_cpu(&down_pool_p[(uint64_t)e * out_dim + r],
+                                                  ref_mid + (uint64_t)(t * n_used + s) * mid_dim);
+                }
+                ref_out[t * out_dim + r] = acc;
+            }
+        }
+        float got_out[2 * 256];
+        read_tensor(tout_moe, got_out, n_tokens * out_dim);
+        for (uint32_t i = 0; i < n_tokens * out_dim; i++) {
+            require(nearf(got_out[i], ref_out[i], 1e-3f), "routed_moe_batch out value");
+        }
+
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        free(model);
     }
 
     STEP("cleanup");

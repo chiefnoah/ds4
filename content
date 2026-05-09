@@ -1,0 +1,39 @@
+ROCm throughput: make command batching real
+
+# Status
+Open. Coordinate with Claude; do not touch the current model-load diff.
+
+# Host/platform context
+- Host has one AMD GPU at PCI bus 0000:C2:00.0.
+- ROCm SMI reports driver 7.0.3, GFX Version gfx1151, SKU STRXLGEN, model id 0x1586.
+- VRAM total 103079215104 bytes; current used was about 87056060416 bytes during inspection.
+- `rocminfo` was not usable in the sandbox because `/dev/kfd` was unavailable, but `rocm-smi` works.
+- This is the Strix Halo UMA path already documented in ds4_rocm.c; activation locality and host/device copy policy matter.
+
+# Bottleneck
+The ROCm backend exposes `ds4_metal_begin_commands` / `flush` / `end`, but nearly every kernel wrapper immediately calls `hipDeviceSynchronize()`. That serializes the whole graph and defeats the layer/decode command-buffer scheduling in ds4.c. Decode calls `ds4_metal_flush_commands()` after a few layers to overlap CPU graph encoding with GPU work, but the per-kernel syncs mean there is little or nothing left to overlap. Prefill has the same issue: layer-major batching still becomes one synchronous kernel after another.
+
+# Evidence in code
+- ds4_rocm.c:793-806 only tracks `g_batch_open` and synchronizes on flush/end.
+- ds4_rocm.c wrappers synchronize after launches throughout: matmul around 1265/1276, RMS around 1430/1441, attention around 3389/3399 and 3694/3708, MoE around 4353 and 4371, compressor around 2862/2944/2958/3100.
+- ds4.c:12158-12178 expects a full decode graph inside one begin/end pair.
+- ds4.c:10280-10324 intentionally flushes after a split layer; the ROCm backend currently cannot exploit this.
+
+# Instructions
+Implement a real HIP stream-backed command context:
+1. Create one default compute stream in `ds4_metal_init` and use it for all kernel launches and async copies in graph execution.
+2. Replace routine per-wrapper `hipDeviceSynchronize()` with launch error checks only; synchronize only in `ds4_metal_flush_commands`, `ds4_metal_end_commands`, `ds4_metal_synchronize`, tensor reads that need CPU visibility, and error recovery.
+3. For host-mapped tensors, audit CPU writes immediately followed by kernel reads. If tensors remain mapped, call the cheapest needed fence/stream wait for correctness; if tensors move to device memory, use `hipMemcpyAsync` on the graph stream.
+4. Add `DS4_ROCM_SYNC_EACH_KERNEL=1` or similar as a temporary debug fallback while validating.
+5. Measure before/after with existing env profilers: `DS4_METAL_GRAPH_TOKEN_PROFILE=1` for decode and `DS4_METAL_GRAPH_PREFILL_PROFILE=1` for prefill.
+
+# Expected impact
+This should improve both prefill and decode throughput by removing thousands of full-device barriers per request. It is also a prerequisite for later matmul/MoE/attention tuning because current synchronization overhead can mask kernel-level wins.
+
+# Regression gate
+Run task tsk-3 after each patch batch: `DS4_ROCM=1 make ds4_rocm_kernel_test && ./ds4_rocm_kernel_test`, then coherent inference and record prefill/decode t/s.
+
+# Files
+- ds4_rocm.c:620-811 initialization, tensor API, command API.
+- ds4_rocm.c:all kernel wrapper launch sites.
+- ds4.c:10255-10324 and 12158-12178 decode scheduling assumptions.

@@ -1,0 +1,28 @@
+Regression gate: 40 kernel tests + coherent inference
+
+# Status
+
+Pending after each optimization batch.
+
+# How to run
+
+- Kernel tests: `DS4_ROCM=1 make ds4_rocm_kernel_test && ./ds4_rocm_kernel_test`
+  - Must end with `ds4_rocm_kernel_test: OK`
+- End-to-end:
+  - `DS4_ROCM=1 make ds4`
+  - `time ./ds4 --backend rocm -p "Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip." -n 200 --temp 0 --seed 42`
+  - Output must be coherent thinking-mode text. With seed 42 and the chat-v2 GGUF the run reliably reaches a paragraph starting with "The AMD Strix Halo APU is well-suited for running large language models" so any drift from coherent flow is a regression.
+  - Capture prefill / decode t/s from the final line `ds4: prefill: X.XX t/s, generation: Y.YY t/s`
+
+# Baseline numbers (before any opt)
+
+- prefill 7.11 t/s
+- decode 6.85 t/s
+- load 30 sec / 2.7 GiB/s
+
+# After load-path threading change
+
+- prefill 6.68-7.32 t/s (noise)
+- decode 6.85-7.02 t/s (noise)
+- load slowed to 2.21 GiB/s — REVERT or supersede before shipping
+- 40 tests still pass

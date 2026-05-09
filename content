@@ -1,0 +1,62 @@
+ROCm MoE expert-major regrouping for prefill
+
+Status: PROPOSED (codex recommendation 2026-05-09)
+
+Goal:
+Implement expert-major routed MoE prefill so ds4_metal_routed_moe_batch_tensor()
+groups the n_tokens prompt's selected experts and reuses IQ2_XXS/Q2_K expert
+weight rows across tokens selecting the same expert.  Preserve the public
+wrapper signature; keep decode (n_tokens=1) on the existing wave-per-row path
+unless the grouped path is proven neutral.
+
+Why:
+Codex perf analysis (2026-05-09) ranked this as the #1 remaining prefill
+lever.  Canonical 21-token prompt has 126 (token, expert) pairs touching
+~80 unique experts -> ~1.58x avoidable expert-weight rereads in routed MoE
+prefill.  After FlashAttention (committed 7771ea3), MoE prefill traffic is
+the dominant remaining bandwidth cost.  Estimated 1.4-1.6x MoE-portion
+speedup, 1.15-1.35x end-to-end prefill.
+
+File pointers:
+- ds4_metal_routed_moe_batch_tensor() at ds4_rocm.c:5698
+- rocm_moe_run() at ds4_rocm.c:5513 (shared impl)
+- Token/slot-major gate/up launch at ds4_rocm.c:5587-5602
+- Token-major down launch at ds4_rocm.c:5623-5652
+- Existing wave-per-row gate kernel at ds4_rocm.c:5337
+- Call site passes ignored scratch tensors at ds4.c:12026-12030
+
+Next steps:
+1. Add grouped fast path in rocm_moe_run() gated on:
+   n_tokens > 1 && n_used == 6 && gate_type == IQ2_XXS && down_type == Q2_K
+2. rocm_moe_group_pairs_kernel: 256-thread block, zero counts, count
+   selected experts, prefix sum, scatter (token, slot, weight) tuples by
+   expert.  Produces expert_ids[<=256], expert_offsets[257],
+   pair_token[n_tokens*n_used], pair_slot[...], pair_weight[...].
+3. rocm_moe_gate_up_iq2xxs_expert_major_kernel:
+   grid (unique_expert, row_block, pair_tile), one wave per mid_dim row,
+   each expert row loaded once, dot against PAIR_TILE=2 or 4 token pairs.
+   Writes mid[(token*n_used+slot)*mid_dim+row].  Use macro variants.
+4. rocm_zero_out_kernel: zero out[n_tokens, out_dim].
+5. rocm_moe_down_q2k_expert_major_kernel:
+   grid (unique_expert, out_row_block, pair_tile), atomicAdd into
+   out[token*out_dim+row].  ~516k atomics for 21 tok x 4096 rows -- cheap.
+6. Keep the old path as fallback for unsupported quants / n_tokens=1 / debug.
+
+Validation:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test ds4_rocm_moe_bench
+- ./ds4_rocm_kernel_test  (must end with OK, 40+ tests)
+- Extend kernel test routed_moe_batch coverage: n_tokens=21, repeated experts,
+  all tokens same expert, -1 sentinels.
+- Extend ds4_rocm_moe_bench to use ~80 unique random experts; report ms/call
+  and effective unique-weight bw.
+- DS4_ROCM_TIME=1 time ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+  must stay coherent + improved prefill
+
+Complexity: 450-800 lines ds4_rocm.c + 80-150 lines tests/bench.
+Estimated 1-2 days.  Bugs likely in scatter indexing, pair grouping, atomics.
+
+Related:
+- tsk-22 FlashAttention (committed 7771ea3) -- attention share has shifted,
+  re-measure histogram before claiming MoE win
+- tsk-16, tsk-20 HIP graph capture -- separate decode-side lever
+- tsk-21 MoE 2-bit wave kernels (committed) -- foundation

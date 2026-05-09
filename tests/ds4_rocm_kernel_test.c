@@ -274,6 +274,448 @@ int main(void) {
         for (uint32_t i = 2; i < 4; i++) require(nearf(out[r * 4 + i], kv[r * 4 + i], 1e-6f), "fp8 rot value");
     }
 
+    STEP("compressor store batch ratio=4");
+    {
+        const uint32_t head_dim = 8;
+        const uint32_t ratio = 4;
+        const uint32_t coff = 2;
+        const uint32_t width = coff * head_dim;
+        const uint32_t state_rows = coff * ratio;
+        const uint32_t n_tokens = 6;
+        const uint32_t pos0 = 0;
+        float kv_in[6 * 16];
+        float sc_in[6 * 16];
+        float ape_in[4 * 16];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < width; i++) {
+                kv_in[t * width + i] = (float)(t + 1) * 0.125f + (float)i * 0.0625f;
+                sc_in[t * width + i] = (float)(t + 1) * 0.5f - (float)i * 0.0625f;
+            }
+        }
+        for (uint32_t r = 0; r < ratio; r++) {
+            for (uint32_t i = 0; i < width; i++) ape_in[r * width + i] = (float)r * 0.25f + (float)i * 0.001f;
+        }
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        require(tkv && tsc && tskv && tssc, "comp store alloc");
+        require(ds4_metal_tensor_write(tkv, 0, kv_in, sizeof(kv_in)), "comp kv write");
+        require(ds4_metal_tensor_write(tsc, 0, sc_in, sizeof(sc_in)), "comp sc write");
+        float zeros[8 * 16] = {0};
+        require(ds4_metal_tensor_write(tskv, 0, zeros, (uint64_t)state_rows * width * sizeof(float)), "comp state kv zero");
+        require(ds4_metal_tensor_write(tssc, 0, zeros, (uint64_t)state_rows * width * sizeof(float)), "comp state sc zero");
+        require(ds4_metal_compressor_store_batch_tensor(tkv, tsc, tskv, tssc,
+                                                        ape_in, sizeof(ape_in), 0, 0,
+                                                        head_dim, ratio, pos0, n_tokens),
+                "comp store batch f32 r4");
+        float got_kv[8 * 16], got_sc[8 * 16];
+        read_tensor(tskv, got_kv, state_rows * width);
+        read_tensor(tssc, got_sc, state_rows * width);
+        for (uint32_t r = 0; r < state_rows; r++) {
+            int pos_mod;
+            int valid = 1;
+            uint32_t src_t = 0;
+            if (r < ratio) { valid = 0; pos_mod = 0; }
+            else {
+                pos_mod = (int)(r - ratio);
+                int t0 = ((pos_mod - (int)(pos0 % ratio)) + (int)ratio) % (int)ratio;
+                if ((uint32_t)t0 >= n_tokens) { valid = 0; }
+                else {
+                    uint32_t k_max = (n_tokens - 1u - (uint32_t)t0) / ratio;
+                    src_t = (uint32_t)t0 + k_max * ratio;
+                }
+            }
+            for (uint32_t i = 0; i < width; i++) {
+                if (!valid) {
+                    require(nearf(got_kv[r * width + i], 0.0f, 1e-6f), "comp store r4 lower untouched kv");
+                    require(nearf(got_sc[r * width + i], 0.0f, 1e-6f), "comp store r4 lower untouched sc");
+                } else {
+                    require(nearf(got_kv[r * width + i], kv_in[src_t * width + i], 1e-6f), "comp store r4 kv");
+                    require(nearf(got_sc[r * width + i], sc_in[src_t * width + i] + ape_in[(uint32_t)pos_mod * width + i], 1e-6f), "comp store r4 sc");
+                }
+            }
+        }
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(tsc);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("compressor store batch ratio=2 with f16 APE");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t ratio = 2;
+        const uint32_t coff = 1;
+        const uint32_t width = coff * head_dim;
+        const uint32_t state_rows = coff * ratio;
+        const uint32_t n_tokens = 3;
+        const uint32_t pos0 = 1;
+        float kv_in[3 * 4] = { 1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12 };
+        float sc_in[3 * 4] = { -1, -2, -3, -4,  -5, -6, -7, -8,  -9, -10, -11, -12 };
+        uint16_t ape_in_f16[2 * 4];
+        float ape_ref[2 * 4] = { 0.5f, 0.25f, -0.25f, 1.0f,  -0.5f, 0.125f, 1.5f, -1.0f };
+        for (uint32_t i = 0; i < 8; i++) ape_in_f16[i] = f32_to_f16(ape_ref[i]);
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv_in));
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(sizeof(sc_in));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        require(tkv && tsc && tskv && tssc, "comp store r2 alloc");
+        require(ds4_metal_tensor_write(tkv, 0, kv_in, sizeof(kv_in)), "comp store r2 kv write");
+        require(ds4_metal_tensor_write(tsc, 0, sc_in, sizeof(sc_in)), "comp store r2 sc write");
+        require(ds4_metal_compressor_store_batch_tensor(tkv, tsc, tskv, tssc,
+                                                        ape_in_f16, sizeof(ape_in_f16), 0, 1,
+                                                        head_dim, ratio, pos0, n_tokens),
+                "comp store batch f16 r2");
+        float got_kv[2 * 4], got_sc[2 * 4];
+        read_tensor(tskv, got_kv, state_rows * width);
+        read_tensor(tssc, got_sc, state_rows * width);
+        for (uint32_t r = 0; r < state_rows; r++) {
+            int pos_mod = (int)r;
+            int t0 = ((pos_mod - (int)(pos0 % ratio)) + (int)ratio) % (int)ratio;
+            require((uint32_t)t0 < n_tokens, "comp store r2 row covered");
+            uint32_t k_max = (n_tokens - 1u - (uint32_t)t0) / ratio;
+            uint32_t src_t = (uint32_t)t0 + k_max * ratio;
+            for (uint32_t i = 0; i < width; i++) {
+                require(nearf(got_kv[r * width + i], kv_in[src_t * width + i], 1e-6f), "comp store r2 kv");
+                /* APE was round-tripped through f16; compare against the f16-decoded reference. */
+                float ape = ape_ref[(uint32_t)pos_mod * width + i];
+                require(nearf(got_sc[r * width + i], sc_in[src_t * width + i] + ape, 1e-3f), "comp store r2 sc");
+            }
+        }
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(tsc);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("compressor update ratio=2 emit");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t ratio = 2;
+        const uint32_t coff = 1;
+        const uint32_t width = coff * head_dim;
+        const uint32_t state_rows = coff * ratio;
+        const uint32_t n_rot = 4;
+        const uint32_t pos = 1;
+        float kv_cur[4] = { 0.7f, -1.5f, 2.25f, 0.4f };
+        float sc_cur[4] = { 1.0f, -0.5f, 0.25f, 0.5f };
+        float ape[2 * 4] = { 0, 0, 0, 0,  0.1f, 0.2f, 0.3f, 0.4f };
+        float norm_w[4] = { 1.0f, 2.0f, -1.0f, 0.5f };
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv_cur));
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(sizeof(sc_cur));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(2u * head_dim * sizeof(float));
+        require(tkv && tsc && tskv && tssc && tcomp, "comp update r2 alloc");
+        require(ds4_metal_tensor_write(tkv, 0, kv_cur, sizeof(kv_cur)), "comp update r2 kv write");
+        require(ds4_metal_tensor_write(tsc, 0, sc_cur, sizeof(sc_cur)), "comp update r2 sc write");
+        float mask_min[2 * 4];
+        for (uint32_t i = 0; i < 8; i++) mask_min[i] = -1.0e30f;
+        require(ds4_metal_tensor_write(tssc, 0, mask_min, sizeof(mask_min)), "comp update r2 score init");
+        float zeros[2 * 4] = {0};
+        require(ds4_metal_tensor_write(tskv, 0, zeros, sizeof(zeros)), "comp update r2 kv init");
+        float comp_init[2 * 4] = {0};
+        require(ds4_metal_tensor_write(tcomp, 0, comp_init, sizeof(comp_init)), "comp update r2 cache init");
+        uint8_t blob[sizeof(ape) + sizeof(norm_w)];
+        memcpy(blob, ape, sizeof(ape));
+        memcpy(blob + sizeof(ape), norm_w, sizeof(norm_w));
+        require(ds4_metal_compressor_update_tensor(tkv, tsc, tskv, tssc, tcomp,
+                                                   blob, sizeof(blob),
+                                                   0, 0, sizeof(ape), 0,
+                                                   head_dim, ratio, pos, 0, n_rot, 0,
+                                                   10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-6f),
+                "compressor update r2");
+        float got[8];
+        read_tensor(tcomp, got, 8);
+        float ref[4] = { kv_cur[0], kv_cur[1], kv_cur[2], kv_cur[3] };
+        float ss = 0.0f;
+        for (uint32_t i = 0; i < 4; i++) ss += ref[i] * ref[i];
+        float rms = 1.0f / sqrtf(ss / 4.0f + 1e-6f);
+        for (uint32_t i = 0; i < 4; i++) ref[i] = ref[i] * rms * norm_w[i];
+        /* RoPE at comp_pos=0: theta=0 → identity. */
+        for (uint32_t i = 0; i < 4; i++) require(nearf(got[i], ref[i], 1e-5f), "comp update r2 row 0");
+        for (uint32_t i = 4; i < 8; i++) require(nearf(got[i], 0.0f, 1e-6f), "comp update r2 row 1 untouched");
+        /* state_kv row 1 must equal kv_cur. */
+        float skv[8];
+        read_tensor(tskv, skv, 8);
+        for (uint32_t i = 0; i < 4; i++) require(nearf(skv[width + i], kv_cur[i], 1e-6f), "comp update r2 state kv");
+        /* state_score row 1 must equal sc_cur + ape[1, i]. */
+        float ssc[8];
+        read_tensor(tssc, ssc, 8);
+        for (uint32_t i = 0; i < 4; i++) {
+            require(nearf(ssc[width + i], sc_cur[i] + ape[width + i], 1e-6f), "comp update r2 state score");
+        }
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(tsc);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("compressor update ratio=4 emit + shift");
+    {
+        const uint32_t head_dim = 8;
+        const uint32_t ratio = 4;
+        const uint32_t coff = 2;
+        const uint32_t width = coff * head_dim;
+        const uint32_t state_rows = coff * ratio;
+        const uint32_t n_rot = 4;
+        const uint32_t pos = 3;
+        float kv_cur[16];
+        float sc_cur[16];
+        for (uint32_t i = 0; i < 16; i++) {
+            kv_cur[i] = 0.1f * (float)(i + 1);
+            sc_cur[i] = 0.05f * (float)i;
+        }
+        float ape[4 * 16];
+        for (uint32_t r = 0; r < 4; r++) {
+            for (uint32_t i = 0; i < 16; i++) ape[r * 16 + i] = 0.01f * (float)(r * 16 + i);
+        }
+        float norm_w[8] = { 1.0f, -1.0f, 0.5f, 2.0f, 0.25f, 1.5f, -0.5f, 1.0f };
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv_cur));
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(sizeof(sc_cur));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(2u * head_dim * sizeof(float));
+        require(tkv && tsc && tskv && tssc && tcomp, "comp update r4 alloc");
+        require(ds4_metal_tensor_write(tkv, 0, kv_cur, sizeof(kv_cur)), "comp update r4 kv write");
+        require(ds4_metal_tensor_write(tsc, 0, sc_cur, sizeof(sc_cur)), "comp update r4 sc write");
+        float kv_init[8 * 16];
+        float sc_init[8 * 16];
+        for (uint32_t i = 0; i < 8 * 16; i++) {
+            kv_init[i] = (float)(i + 100);          /* sentinel: must be overwritten by shift */
+            sc_init[i] = -1.0e30f;
+        }
+        require(ds4_metal_tensor_write(tskv, 0, kv_init, sizeof(kv_init)), "comp update r4 state kv init");
+        require(ds4_metal_tensor_write(tssc, 0, sc_init, sizeof(sc_init)), "comp update r4 state score init");
+        float comp_init[16] = {0};
+        require(ds4_metal_tensor_write(tcomp, 0, comp_init, sizeof(comp_init)), "comp update r4 cache init");
+        uint8_t blob[sizeof(ape) + sizeof(norm_w)];
+        memcpy(blob, ape, sizeof(ape));
+        memcpy(blob + sizeof(ape), norm_w, sizeof(norm_w));
+        require(ds4_metal_compressor_update_tensor(tkv, tsc, tskv, tssc, tcomp,
+                                                   blob, sizeof(blob),
+                                                   0, 0, sizeof(ape), 0,
+                                                   head_dim, ratio, pos, 0, n_rot, 0,
+                                                   10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-6f),
+                "compressor update r4");
+        float got[16];
+        read_tensor(tcomp, got, 16);
+        /* Pool: only row 7 has non-mask score (row 7, cols 8..15 since coff==2 reads upper half cols).
+         * So pooled[j] = state_kv[7, head_dim + j] = kv_cur[head_dim + j]. */
+        float pooled[8];
+        for (uint32_t j = 0; j < 8; j++) pooled[j] = kv_cur[head_dim + j];
+        float ss = 0.0f;
+        for (uint32_t j = 0; j < 8; j++) ss += pooled[j] * pooled[j];
+        float rms = 1.0f / sqrtf(ss / 8.0f + 1e-6f);
+        float ref[8];
+        for (uint32_t j = 0; j < 8; j++) ref[j] = pooled[j] * rms * norm_w[j];
+        /* RoPE at comp_pos = pos+1-ratio = 0: identity. */
+        for (uint32_t j = 0; j < 8; j++) require(nearf(got[j], ref[j], 1e-5f), "comp update r4 pool/norm/rope");
+        for (uint32_t j = 8; j < 16; j++) require(nearf(got[j], 0.0f, 1e-6f), "comp update r4 cache row 1 untouched");
+        /* After shift: lower half (rows 0..3) of state must equal upper half (rows 4..7) post-store.
+         * Upper rows 4,5,6 still hold their initial values (kv_init), row 7 holds kv_cur. */
+        float skv[8 * 16];
+        read_tensor(tskv, skv, 8 * 16);
+        for (uint32_t r = 0; r < 4; r++) {
+            for (uint32_t i = 0; i < width; i++) {
+                const float expected = (r < 3)
+                    ? kv_init[(ratio + r) * width + i]
+                    : kv_cur[i];
+                require(nearf(skv[r * width + i], expected, 1e-5f), "comp update r4 shift kv");
+            }
+        }
+        /* Upper half rows 4..6 must be unchanged from init; row 7 must be kv_cur. */
+        for (uint32_t r = 0; r < 3; r++) {
+            for (uint32_t i = 0; i < width; i++) {
+                require(nearf(skv[(ratio + r) * width + i], kv_init[(ratio + r) * width + i], 1e-6f),
+                        "comp update r4 upper preserved");
+            }
+        }
+        for (uint32_t i = 0; i < width; i++) {
+            require(nearf(skv[(ratio + 3) * width + i], kv_cur[i], 1e-6f),
+                    "comp update r4 upper row 7 kv_cur");
+        }
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(tsc);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("compressor prefill ratio=2 n_tokens=4");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t ratio = 2;
+        const uint32_t coff = 1;
+        const uint32_t width = coff * head_dim;
+        const uint32_t state_rows = coff * ratio;
+        const uint32_t n_tokens = 4;
+        const uint32_t pos0 = 0;
+        const uint32_t n_rot = 4;
+        float kv[4 * 4];
+        float sc[4 * 4];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < width; i++) {
+                kv[t * width + i] = 0.5f * (float)(t + 1) + 0.125f * (float)i;
+                sc[t * width + i] = 0.25f * (float)t - 0.0625f * (float)i;
+            }
+        }
+        float ape[2 * 4] = { 0, 0, 0, 0,  0.1f, -0.1f, 0.2f, -0.2f };
+        float norm_w[4] = { 1.0f, 0.5f, 2.0f, -1.0f };
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv));
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(sizeof(sc));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(2u * head_dim * sizeof(float));
+        require(tkv && tsc && tskv && tssc && tcomp, "comp prefill r2 alloc");
+        require(ds4_metal_tensor_write(tkv, 0, kv, sizeof(kv)), "comp prefill r2 kv write");
+        require(ds4_metal_tensor_write(tsc, 0, sc, sizeof(sc)), "comp prefill r2 sc write");
+        uint8_t blob[sizeof(ape) + sizeof(norm_w)];
+        memcpy(blob, ape, sizeof(ape));
+        memcpy(blob + sizeof(ape), norm_w, sizeof(norm_w));
+        require(ds4_metal_compressor_prefill_tensor(tcomp, tskv, tssc, tkv, tsc,
+                                                    blob, sizeof(blob),
+                                                    0, 0, sizeof(ape), 0,
+                                                    head_dim, ratio, pos0, n_tokens, n_rot, 0,
+                                                    false,
+                                                    10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-6f),
+                "compressor prefill r2");
+        float got[2 * 4];
+        read_tensor(tcomp, got, 2 * 4);
+        /* Reference: at first emit (t=1), state has rows {0,1} with (kv[t], sc[t]+ape[t%2]). */
+        for (uint32_t emit = 0; emit < 2; emit++) {
+            const uint32_t base_t = emit * ratio;
+            float pooled[4];
+            for (uint32_t j = 0; j < head_dim; j++) {
+                float s0 = sc[(base_t + 0) * width + j] + ape[0 * width + j];
+                float s1 = sc[(base_t + 1) * width + j] + ape[1 * width + j];
+                float maxs = s0 > s1 ? s0 : s1;
+                float e0 = expf(s0 - maxs);
+                float e1 = expf(s1 - maxs);
+                pooled[j] = (e0 * kv[(base_t + 0) * width + j] +
+                             e1 * kv[(base_t + 1) * width + j]) / (e0 + e1);
+            }
+            float ss = 0.0f;
+            for (uint32_t j = 0; j < head_dim; j++) ss += pooled[j] * pooled[j];
+            float rms = 1.0f / sqrtf(ss / (float)head_dim + 1e-6f);
+            for (uint32_t j = 0; j < head_dim; j++) {
+                float ref = pooled[j] * rms * norm_w[j];
+                /* RoPE: comp_pos = (base_t + ratio) - ratio = base_t. For emit 0: comp_pos=0 → identity.
+                 * For emit 1: comp_pos=2.  We compare against the post-RoPE result. */
+                if (emit == 0) {
+                    require(nearf(got[emit * head_dim + j], ref, 1e-5f), "comp prefill r2 emit0");
+                } else {
+                    /* For emit 1, n_rot=head_dim covers all dims. Apply YaRN RoPE manually. */
+                    /* Defer: test only emit 0 strictly; for emit 1 just check magnitude is reasonable. */
+                    (void)ref;
+                }
+            }
+        }
+        /* Spot-check the second emit by recomputing expected with full RoPE. */
+        {
+            const uint32_t base_t = ratio;
+            const uint32_t comp_pos = base_t;  /* ratio + base_t - ratio */
+            float pooled[4];
+            for (uint32_t j = 0; j < head_dim; j++) {
+                float s0 = sc[(base_t + 0) * width + j] + ape[0 * width + j];
+                float s1 = sc[(base_t + 1) * width + j] + ape[1 * width + j];
+                float maxs = s0 > s1 ? s0 : s1;
+                float e0 = expf(s0 - maxs);
+                float e1 = expf(s1 - maxs);
+                pooled[j] = (e0 * kv[(base_t + 0) * width + j] +
+                             e1 * kv[(base_t + 1) * width + j]) / (e0 + e1);
+            }
+            float ss = 0.0f;
+            for (uint32_t j = 0; j < head_dim; j++) ss += pooled[j] * pooled[j];
+            float rms = 1.0f / sqrtf(ss / (float)head_dim + 1e-6f);
+            float refn[4];
+            for (uint32_t j = 0; j < head_dim; j++) refn[j] = pooled[j] * rms * norm_w[j];
+            /* RoPE tail with adjacent-pair convention (j0=2*ic, j1=2*ic+1) and YaRN. */
+            float ref_rope[4];
+            memcpy(ref_rope, refn, sizeof(ref_rope));
+            for (uint32_t ic = 0; ic < n_rot / 2; ic++) {
+                uint32_t r = ic * 2u;
+                float theta = (float)comp_pos * powf(10000.0f, (-1.0f / (float)n_rot) * (float)r);
+                float c = cosf(theta);
+                float s = sinf(theta);
+                uint32_t j0 = r;        /* n_nope = 0 */
+                uint32_t j1 = j0 + 1u;
+                float x0 = refn[j0];
+                float x1 = refn[j1];
+                ref_rope[j0] = x0 * c - x1 * s;
+                ref_rope[j1] = x0 * s + x1 * c;
+            }
+            for (uint32_t j = 0; j < head_dim; j++) {
+                require(nearf(got[head_dim + j], ref_rope[j], 5e-5f), "comp prefill r2 emit1");
+            }
+        }
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(tsc);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("compressor prefill_state_ratio4");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t ratio = 4;
+        const uint32_t width = 2 * head_dim;
+        const uint32_t state_rows = 8;
+        const uint32_t pos0 = 1;
+        float kv_tail[4 * 8];
+        float sc_tail[4 * 8];
+        for (uint32_t r = 0; r < ratio; r++) {
+            for (uint32_t i = 0; i < width; i++) {
+                kv_tail[r * width + i] = 0.5f * (float)(r + 1) + 0.0625f * (float)i;
+                sc_tail[r * width + i] = 0.25f * (float)r - 0.125f * (float)i;
+            }
+        }
+        float ape[4 * 8];
+        for (uint32_t r = 0; r < ratio; r++) {
+            for (uint32_t i = 0; i < width; i++) ape[r * width + i] = 0.01f * (float)(r * 16 + i);
+        }
+        ds4_metal_tensor *tk = ds4_metal_tensor_alloc(sizeof(kv_tail));
+        ds4_metal_tensor *ts = ds4_metal_tensor_alloc(sizeof(sc_tail));
+        ds4_metal_tensor *tskv = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        ds4_metal_tensor *tssc = ds4_metal_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+        require(tk && ts && tskv && tssc, "comp r4 state alloc");
+        require(ds4_metal_tensor_write(tk, 0, kv_tail, sizeof(kv_tail)), "comp r4 state kv write");
+        require(ds4_metal_tensor_write(ts, 0, sc_tail, sizeof(sc_tail)), "comp r4 state sc write");
+        /* Pre-fill state with sentinel garbage to confirm the kernel resets it. */
+        float garbage[8 * 8];
+        for (uint32_t i = 0; i < 8 * 8; i++) garbage[i] = (float)(i + 999);
+        require(ds4_metal_tensor_write(tskv, 0, garbage, sizeof(garbage)), "comp r4 state init kv");
+        require(ds4_metal_tensor_write(tssc, 0, garbage, sizeof(garbage)), "comp r4 state init sc");
+        require(ds4_metal_compressor_prefill_state_ratio4_tensor(tskv, tssc, tk, ts,
+                                                                  ape, sizeof(ape), 0, 0,
+                                                                  head_dim, pos0),
+                "comp r4 state");
+        float skv[8 * 8], ssc[8 * 8];
+        read_tensor(tskv, skv, 8 * 8);
+        read_tensor(tssc, ssc, 8 * 8);
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t pm = (pos0 + r) % ratio;
+            for (uint32_t i = 0; i < width; i++) {
+                require(nearf(skv[r * width + i], kv_tail[r * width + i], 1e-6f), "comp r4 state lower kv");
+                require(nearf(ssc[r * width + i], sc_tail[r * width + i] + ape[pm * width + i], 1e-6f),
+                        "comp r4 state lower sc");
+            }
+        }
+        for (uint32_t r = ratio; r < state_rows; r++) {
+            for (uint32_t i = 0; i < width; i++) {
+                require(nearf(skv[r * width + i], 0.0f, 1e-6f), "comp r4 state upper kv reset");
+                require(ssc[r * width + i] < -1.0e29f, "comp r4 state upper sc -inf");
+            }
+        }
+        ds4_metal_tensor_free(tssc);
+        ds4_metal_tensor_free(tskv);
+        ds4_metal_tensor_free(ts);
+        ds4_metal_tensor_free(tk);
+    }
+
     STEP("cleanup");
     ds4_metal_tensor_free(tnorm);
     ds4_metal_tensor_free(thc_out);

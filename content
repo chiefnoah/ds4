@@ -1,0 +1,56 @@
+Hot kernels: MoE routed, attention decode, attention batch
+
+# Status
+
+Pending.
+
+# Baseline
+
+- prefill: 7.11 t/s (chunk=2048)
+- decode: 6.85 t/s
+- 43 layers × ~1.5 GB read per token (256 MoE experts × 6 used × ~6 MB each) → at 256 GB/s peak we'd want 6 ms/token = 167 t/s. Currently 22× off peak.
+
+# Likely hot kernels (decode path)
+
+1. `rocm_moe_gate_up_matvec_kernel` (ds4_rocm.c:4150)
+   - blockDim=64 (only 2 wavefronts on RDNA 3.5 wave32) → low occupancy
+   - Each thread does 1 row independently
+   - LDS load + sync per nb iteration (16x per row)
+   - Inner: rocm_quant_dot_block branches on quant type (IQ2_XXS/Q2_K)
+   - **Win candidates**: bigger blockDim (256?), float4 LDS loads, type-specialised kernels
+
+2. `rocm_moe_down_matvec_kernel` (ds4_rocm.c:4203)
+   - Same shape as gate_up but Q2_K dequant
+
+3. `rocm_attn_decode_heads_kernel` (ds4_rocm.c:3244)
+   - 1 block per head, 128 threads
+   - Reads full KV cache per token
+   - For ctx=32K the K/V dot products dominate
+
+4. `rocm_attn_batch_kernel` (ds4_rocm.c:3511)
+   - Used for batched prefill
+   - 1 block per (token, head)
+   - top-k masked or full pass
+
+# Optimization ideas (gfx1151-specific)
+
+- Wavefront size = 32. Use __shfl_xor for in-wave reductions (no LDS).
+- Use float4/float8 vector loads where activation alignment permits.
+- LDS prefetch double-buffer for the Q-block weight reads in MoE.
+- Wave-cooperative dequant: spread block-decode work across a wave instead of single-thread per row.
+- For attention: split-K parallelism across multiple blocks per head.
+- For prefill: WMMA via `__builtin_amdgcn_wmma_*` for big matmuls (Q8_0 lm_head, FP16 QKV proj). gfx1151 supports wmma.f16/bf16.
+
+# Plan
+
+1. Add per-kernel timing (DS4_ROCM_TIME env) so we know where time goes.
+2. Try MoE blockDim 64→128 first (single-line change, easy A/B).
+3. If wins are small: rewrite MoE matvec with wave32 reductions + multi-row per block.
+4. Then attention split-K.
+
+# Files
+
+- ds4_rocm.c:4133-4360 (MoE)
+- ds4_rocm.c:3244-3387 (attn decode)
+- ds4_rocm.c:3511-3697 (attn batch)
+- ds4_rocm.c:3977-4103 (Q-format dequant per-block helpers)

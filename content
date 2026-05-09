@@ -1,0 +1,28 @@
+ROCm decode: fuse router_select + HC expand hotspots
+
+Status: proposed optimization plan from 2026-05-09 decode profile (codex high-reasoning analysis at /tmp/codex_advice.log).
+
+Goal: recover the largest part of the 27 ms/tok currently spent in router_select, matmul_q8_0_hc_expand, and attention_output_low_q8 on gfx1151. Decode wall 71 ms/tok; target 220 GB/s ceiling = ~43 ms/tok = 23 t/s.
+
+Chosen highest-ROI approach (in order):
+
+1. router_select (saves ~7-9 ms/tok). Replace decode router softplus + serial select with one fused 256-thread block kernel rocm_router_softplus_select_one_kernel. Each thread computes probs[e] = sqrt(softplus(logits[e])), writes probs (debug/test path still reads it), then block-reduces top-6 using wave32 __shfl_down argmax + 8-entry shared wave summary. Tie-break: lower index wins (matches existing serial > comparison). Hash-mode and bias-mode preserved. Same fusion pattern for batch wrapper (one block per token, grid=n_tokens, block=256). Sketch in /tmp/codex_advice.log lines 1404-1500. Expected per-call: 244 us -> 25-60 us in SYNC_EACH.
+
+2. matmul_q8_0_hc_expand (saves ~6-8 ms/tok). Fuse HC expand into the Q8 producer kernel for the two composed wrappers ds4_metal_matmul_q8_0_hc_expand_tensor (3325) and ds4_metal_shared_down_hc_expand_q8_0_tensor (3346). Lane 0 of each Q8 output-row wave already stores block_out[d]; have it also load residual_hc[d, 0..3] and split (post[4]+comb[4*4]) and write the four HC rows immediately. Keep block_out store for ABI/debug. Safe because both wrappers already do matmul-then-expand sequentially with no intervening consumer. New macro ROCM_DEFINE_MATMUL_Q8_0_HC_EXPAND(NROWS, HAS_ADD); fall back to current path when n_hc != 4, n_tok != 1, in_dim % 32 != 0. Sketch in /tmp/codex_advice.log lines 1528-1591.
+
+3. attention_output_low_q8 (deprioritized, ~1 ms/tok possible). Already at ~195 GB/s vs 220 ceiling; current wave-per-row kernel is bandwidth-bound. Optional: production-shape specialization for group_dim=4096, rank=1024, n_groups=8, qblocks=128, row_bytes=4352 to let compiler unroll fixed loops. Defer until after items 1 and 2 land.
+
+Validation gates (per CLAUDE.md):
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test must end with OK (40 tests including router_select default/with-bias and matmul_q8_0_hc_expand / shared_down_hc_expand_q8_0).
+- Coherence: time ./ds4 --backend rocm -p "Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip." -n 200 --temp 0 --seed 42 -- multi-paragraph thinking-mode reply.
+- Per-kernel sanity: DS4_ROCM_SYNC_EACH=1 DS4_ROCM_TIME=1 ./ds4 ... and confirm router_select / hc_expand drop.
+
+Add a new tie-order test case for top-k argmax (two experts with equal score; lowest index must win).
+
+Expected total speedup from items 1+2: 13-17 ms/tok recovered. Decode 71 ms -> 54-58 ms = 14 -> 17.5-18.5 t/s. Headroom remains in matmul_f16 (17 ms/tok, unaudited) and routed_moe_one (12 ms/tok, near 188 GiB/s).
+
+Related:
+- tsk-20 HIP graph capture / weight repack (lower priority now).
+- tsk-22 FlashAttention prefill+decode (separate effort; biggest remaining structural gap).
+- feedback_real_gpu_time.md (SYNC_EACH=1 needed for real kernel time).

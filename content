@@ -1,0 +1,25 @@
+ROCm decode: evaluate HIP graph capture/replay to reduce launch CPU
+
+Status: Open
+
+Goal
+Reduce per-token CPU overhead from repeatedly encoding and launching the same decode graph. Stream batching removes sync barriers, but the CPU still walks metal_graph_encode_token_raw_swa() and launches many HIP kernels every token.
+
+Context
+Related: tsk-4, tsk-13, tsk-15. This is distinct from stream-backed command batching: after correctness is restored, capture a stable decode sequence and replay it when shapes/pointers are unchanged. Token id, position, raw-cache row, and small scalar params may need device-side parameter buffers or patched kernel arguments.
+
+Evidence
+- ds4.c metal_graph_eval_token_raw_swa() calls metal_graph_encode_token_raw_swa() once per generated token.
+- ds4_rocm.c has many hipLaunchKernelGGL sites; decode launch count is high enough to heat CPU cores even when kernels run on GPU.
+- HIP graph replay could collapse CPU launch overhead without changing kernel math.
+
+Next steps
+1. Measure launch/encode CPU cost with DS4_METAL_GRAPH_TOKEN_PROFILE=1 after tsk-13 is coherent.
+2. Prototype HIP graph capture for one-token decode with fixed ctx/raw-cap shape and no debug dumps.
+3. Identify dynamic arguments that block replay; move them into device parameter tensors or use HIP graph node parameter updates if stable enough.
+4. Compare graph replay vs normal stream batching for generation t/s and CPU utilization.
+
+Validation
+- tsk-3 gate passes.
+- Same prompt/seed/temp=0 produces identical tokens.
+- CPU utilization and per-token encode time decrease without hurting GPU occupancy.

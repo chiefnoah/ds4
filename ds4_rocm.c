@@ -2451,6 +2451,106 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
  * Attention output projections (Q8_0).
  * ========================================================================= */
 
+/* Fused per-group Q8_0 matvec for the attention output low projection.
+ *
+ *   grid = (rank, n_groups, n_tokens)
+ *   block = 256 threads = 8 wavefronts on RDNA 3.5
+ *
+ * Each block computes one output element low[t, g, r] by partial-summing
+ * across the group_dim axis with all 256 threads, finishing with a
+ * shared-memory reduction.  Replaces the n_groups CPU loop launching
+ * one matmul_q8_0_tensor per group, which paid the per-launch overhead
+ * 12-128x per call. */
+__global__ static void rocm_attn_out_low_q8_fused_kernel(
+        float *low,
+        const uint8_t *w,
+        const float *heads,
+        uint32_t group_dim,
+        uint32_t rank,
+        uint32_t n_groups,
+        uint64_t row_bytes,
+        uint64_t group_w_bytes) {
+    extern __shared__ float sh[];
+    const uint32_t r   = blockIdx.x;
+    const uint32_t g   = blockIdx.y;
+    const uint32_t tok = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bs  = blockDim.x;
+    if (r >= rank) return;
+
+    const float   *xr  = heads + ((uint64_t)tok * n_groups + g) * group_dim;
+    const uint8_t *wr  = w + (uint64_t)g * group_w_bytes + (uint64_t)r * row_bytes;
+    const uint32_t qblocks = (group_dim + 31u) >> 5;
+
+    float sum = 0.0f;
+    for (uint32_t b = tid; b < qblocks; b += bs) {
+        const uint8_t *blk = wr + (uint64_t)b * 34u;
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+        const uint32_t i0 = b << 5;
+        const uint32_t n  = (i0 + 32u <= group_dim) ? 32u : (group_dim - i0);
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            if ((uint32_t)j < n) dot += (float)qs[j] * xr[i0 + j];
+        }
+        sum += rocm_f16_to_f32(scale_bits) * dot;
+    }
+    sh[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = bs / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) low[((uint64_t)tok * n_groups + g) * rank + r] = sh[0];
+}
+
+static int rocm_attention_output_low_q8_dispatch(
+        ds4_metal_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint32_t                n_tokens,
+        const ds4_metal_tensor *heads) {
+    if (!low || !heads || group_dim == 0 || rank == 0 || n_groups == 0 || n_tokens == 0) return 0;
+    const uint64_t per_token_out = (uint64_t)n_groups * rank;
+    const uint64_t per_token_in  = (uint64_t)n_groups * group_dim;
+    if (low->bytes  < (uint64_t)n_tokens * per_token_out * sizeof(float)) return 0;
+    if (heads->bytes < (uint64_t)n_tokens * per_token_in  * sizeof(float)) return 0;
+    const uint64_t row_bytes = ((group_dim + 31u) / 32u) * 34u;
+    const uint64_t group_w_bytes = row_bytes * rank;
+    if (out_a_offset > model_size ||
+        (uint64_t)n_groups * group_w_bytes > model_size - out_a_offset) return 0;
+
+    void *w_host = NULL;
+    void *w_dev  = NULL;
+    if (!rocm_upload_mapped((const uint8_t *)model_map + out_a_offset,
+                             (uint64_t)n_groups * group_w_bytes,
+                             &w_host, &w_dev,
+                             "attn out low Q8 weight upload")) return 0;
+
+    /* Same blockDim=256 as the legacy matmul_q8_0_kernel; on this host the
+     * 8-wave block hides scalar-reduction latency well even if the inner
+     * loop has half the threads idle for tiny qblocks. */
+    const uint32_t threads = 256u;
+    dim3 grid((unsigned)rank, (unsigned)n_groups, (unsigned)n_tokens);
+    dim3 block(threads, 1, 1);
+    hipLaunchKernelGGL(rocm_attn_out_low_q8_fused_kernel,
+                       grid, block, threads * sizeof(float), 0,
+                       (float *)tensor_u8(low),
+                       (const uint8_t *)w_dev,
+                       (const float *)tensor_u8_const(heads),
+                       (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                       row_bytes, group_w_bytes);
+    int ok = rocm_launch_done("attn out low Q8 launch",
+                              "attn out low Q8 completion");
+    rocm_defer_free(w_host);
+    return ok;
+}
+
 int ds4_metal_attention_output_low_q8_tensor(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -2462,28 +2562,9 @@ int ds4_metal_attention_output_low_q8_tensor(
         const ds4_metal_tensor *heads) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_low_q8_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_attention_output_low_q8_tensor");
-    /* heads is laid out as n_groups blocks of group_dim; produce one column of
-     * size n_groups * rank by running n_groups independent Q8_0 matvecs.
-     * Each matvec consumes group_dim inputs and produces `rank` outputs. */
-    if (!low || !heads || group_dim == 0 || rank == 0 || n_groups == 0) return 0;
-    if (low->bytes < (uint64_t)n_groups * rank * sizeof(float)) return 0;
-    if (heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float)) return 0;
-    const uint64_t row_bytes = ((group_dim + 31u) / 32u) * 34u;
-    const uint64_t group_w_bytes = row_bytes * rank;
-    if (out_a_offset > model_size || (uint64_t)n_groups * group_w_bytes > model_size - out_a_offset) return 0;
-
-    for (uint32_t g = 0; g < n_groups; g++) {
-        ds4_metal_tensor x_view = *heads;
-        x_view.offset = heads->offset + (uint64_t)g * group_dim * sizeof(float);
-        x_view.bytes = group_dim * sizeof(float);
-        ds4_metal_tensor low_view = *low;
-        low_view.offset = low->offset + (uint64_t)g * rank * sizeof(float);
-        low_view.bytes = rank * sizeof(float);
-        if (!ds4_metal_matmul_q8_0_tensor(&low_view, model_map, model_size,
-                                          out_a_offset + (uint64_t)g * group_w_bytes,
-                                          group_dim, rank, &x_view, 1)) return 0;
-    }
-    return 1;
+    return rocm_attention_output_low_q8_dispatch(low, model_map, model_size,
+                                                 out_a_offset, group_dim, rank,
+                                                 n_groups, 1, heads);
 }
 
 int ds4_metal_attention_output_q8_batch_tensor(
@@ -2517,17 +2598,9 @@ int ds4_metal_attention_output_q8_batch_tensor(
     if (low->bytes < (uint64_t)n_tokens * low_per * sizeof(float)) return 0;
     if (heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float)) return 0;
 
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        ds4_metal_tensor heads_view = *heads;
-        heads_view.offset = heads->offset + (uint64_t)t * n_groups * group_dim * sizeof(float);
-        heads_view.bytes = (uint64_t)n_groups * group_dim * sizeof(float);
-        ds4_metal_tensor low_view = *low;
-        low_view.offset = low->offset + (uint64_t)t * low_per * sizeof(float);
-        low_view.bytes = low_per * sizeof(float);
-        if (!ds4_metal_attention_output_low_q8_tensor(&low_view, model_map, model_size,
-                                                      out_a_offset, group_dim, rank,
-                                                      n_groups, &heads_view)) return 0;
-    }
+    if (!rocm_attention_output_low_q8_dispatch(low, model_map, model_size,
+                                               out_a_offset, group_dim, rank,
+                                               n_groups, n_tokens, heads)) return 0;
     return ds4_metal_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset,
                                         low_per, out_dim, low, n_tokens);
 }

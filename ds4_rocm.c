@@ -1726,7 +1726,13 @@ int ds4_metal_matmul_q8_0_tensor(
          * ROWS_PER_BLOCK=8 when out_dim is a multiple of 8 and small
          * enough that the launched block count still saturates 40 CUs;
          * falls back to NROWS=4 for out_dim that isn't divisible by 8
-         * or is small (e.g. attn_kv at out_dim=576). */
+         * or is small (e.g. attn_kv at out_dim=576).
+         *
+         * The LDS-x cached variant (rocm_matmul_q8_0_lds_*_kernel) was
+         * benchmarked and is ~4x SLOWER (48 vs 185 GiB/s on 4096^2):
+         * x is already L1/L2-resident across waves on the same CU, so
+         * the LDS staging burns occupancy without saving DRAM traffic.
+         * Don't dispatch to it without first re-measuring occupancy. */
         const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
         const dim3 block(nrows * 32u);
         const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows), (unsigned)n_tok);

@@ -71,6 +71,8 @@ int ds4_metal_rms_norm_weight_rows_tensor(ds4_metal_tensor *out,
 
 static int rocm_sync_each(void);
 static int rocm_launch_done(const char *launch_label, const char *sync_label);
+static void rocm_drain_pending_frees(void);
+static void rocm_defer_free(void *host_ptr);
 
 static int rocm_ok(hipError_t rc, const char *what) {
     if (rc == hipSuccess) return 1;
@@ -786,6 +788,7 @@ int ds4_metal_init(void) {
 void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)hipDeviceSynchronize();
+    rocm_drain_pending_frees();
     rocm_time_dump();
     for (int i = 0; i < g_registration_count; i++) {
         if (g_registrations[i].host_owned) {
@@ -914,10 +917,13 @@ int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void 
     if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (bytes == 0) return 1;
     /* Reads need fresh data: drain any in-flight kernels we deferred in
-     * batched mode before sampling the tensor.  This is the only place
-     * outside the explicit batch boundaries where CPU consumes results. */
+     * batched mode before sampling the tensor, then release any pending
+     * temporary host allocations that those kernels were still using.
+     * This is the only place outside the explicit batch boundaries where
+     * CPU consumes results. */
     if (g_batch_open && !rocm_sync_each()) {
         if (!rocm_ok(hipDeviceSynchronize(), "tensor read drain")) return 0;
+        rocm_drain_pending_frees();
     }
     const void *src = tensor->host ?
                       (const void *)(tensor_host_u8_const(tensor) + offset) :
@@ -962,18 +968,59 @@ int ds4_metal_begin_commands(void) {
 
 int ds4_metal_flush_commands(void) {
     if (!g_batch_open) return 0;
-    return rocm_ok(hipDeviceSynchronize(), "command flush");
+    int ok = rocm_ok(hipDeviceSynchronize(), "command flush");
+    rocm_drain_pending_frees();
+    return ok;
 }
 
 int ds4_metal_end_commands(void) {
     if (!g_batch_open) return 0;
     g_batch_open = 0;
-    return rocm_ok(hipDeviceSynchronize(), "command completion");
+    int ok = rocm_ok(hipDeviceSynchronize(), "command completion");
+    rocm_drain_pending_frees();
+    return ok;
 }
 
 int ds4_metal_synchronize(void) {
     if (!g_initialized && !ds4_metal_init()) return 0;
-    return rocm_ok(hipDeviceSynchronize(), "synchronize");
+    int ok = rocm_ok(hipDeviceSynchronize(), "synchronize");
+    rocm_drain_pending_frees();
+    return ok;
+}
+
+/* Deferred-free queue: temporary hipHostMalloc'd staging buffers (router
+ * bias, attention sinks, MoE expert pools, weight-upload fallbacks) used
+ * to be hipHostFree'd immediately after their kernel was launched.  In
+ * batched mode the launch returns before the kernel runs, so an immediate
+ * free races the queued kernel.  Production paths almost never hit the
+ * temp-buffer path (rocm_upload_mapped finds the registered model map
+ * first), so this is mostly defense-in-depth, but we still need it
+ * correct for tests and any future caller that bypasses the registration
+ * cache. */
+#define ROCM_PENDING_FREE_CAP 4096
+static void *g_pending_frees[ROCM_PENDING_FREE_CAP];
+static int   g_pending_n;
+
+static void rocm_defer_free(void *host_ptr) {
+    if (!host_ptr) return;
+    if (!g_batch_open || rocm_sync_each()) {
+        (void)hipHostFree(host_ptr);
+        return;
+    }
+    if (g_pending_n >= ROCM_PENDING_FREE_CAP) {
+        /* Queue full: flush stream and drain so we can reuse the slot. */
+        (void)hipDeviceSynchronize();
+        for (int i = 0; i < g_pending_n; i++) (void)hipHostFree(g_pending_frees[i]);
+        g_pending_n = 0;
+    }
+    g_pending_frees[g_pending_n++] = host_ptr;
+}
+
+static void rocm_drain_pending_frees(void) {
+    if (g_pending_n == 0) return;
+    /* Caller is responsible for syncing the stream before calling us. */
+    for (int i = 0; i < g_pending_n; i++) (void)hipHostFree(g_pending_frees[i]);
+    g_pending_n = 0;
 }
 
 /* Per-kernel launch validation.
@@ -1251,7 +1298,7 @@ int ds4_metal_embed_token_hc_tensor(
                        n_embd,
                        n_hc);
     int ok = rocm_launch_done("embed token launch", "embed token completion");
-    if (row_host) (void)hipHostFree(row_host);
+    rocm_defer_free(row_host);
     return ok;
 }
 
@@ -1296,7 +1343,7 @@ int ds4_metal_embed_tokens_hc_tensor(
                        n_hc,
                        n_vocab);
     int ok = rocm_launch_done("embed tokens launch", "embed tokens completion");
-    if (table_host) (void)hipHostFree(table_host);
+    rocm_defer_free(table_host);
     return ok;
 }
 
@@ -1466,7 +1513,7 @@ int ds4_metal_matmul_f16_tensor(
                        in_dim,
                        out_dim);
     int ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
-    if (w_host) (void)hipHostFree(w_host);
+    rocm_defer_free(w_host);
     return ok;
 }
 
@@ -1530,7 +1577,7 @@ int ds4_metal_matmul_f32_tensor(
                        in_dim,
                        out_dim);
     int ok = rocm_launch_done("F32 matmul launch", "F32 matmul completion");
-    if (w_host) (void)hipHostFree(w_host);
+    rocm_defer_free(w_host);
     return ok;
 }
 
@@ -1561,15 +1608,7 @@ int ds4_metal_matmul_q8_0_tensor(
     const void *src = (const uint8_t *)model_map + weight_offset;
     if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "Q8_0 weight upload")) return 0;
 
-    /* Block-size tuning: each thread runs `for (b = tid; b < blocks; b +=
-     * blockDim.x)` so we want blockDim near `blocks` (= in_dim/32) to
-     * keep all wavefronts busy.  Capped at 256 for register pressure;
-     * floored at 32 so we always launch a full wavefront. */
-    const uint64_t qblocks = (in_dim + 31u) / 32u;
-    unsigned threads = 256u;
-    while (threads > 32u && (uint64_t)threads > qblocks) threads >>= 1;
-
-    const dim3 block(threads);
+    const dim3 block(256);
     const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
     hipLaunchKernelGGL(rocm_matmul_q8_0_kernel,
                        grid, block, block.x * sizeof(float), 0,
@@ -1578,7 +1617,7 @@ int ds4_metal_matmul_q8_0_tensor(
                        (const float *)tensor_u8_const(x),
                        in_dim, out_dim, row_bytes);
     int ok = rocm_launch_done("Q8_0 matmul launch", "Q8_0 matmul completion");
-    if (w_host) (void)hipHostFree(w_host);
+    rocm_defer_free(w_host);
     return ok;
 }
 
@@ -1636,7 +1675,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
                        n,
                        eps);
     int ok = rocm_launch_done("weighted RMS norm launch", "weighted RMS norm completion");
-    if (w_host) (void)hipHostFree(w_host);
+    rocm_defer_free(w_host);
     return ok;
 }
 
@@ -1736,9 +1775,9 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
                                 &norm_dev,
                                 "HC norm weight upload");
     if (!ok) {
-        if (scale_host) (void)hipHostFree(scale_host);
-        if (base_host) (void)hipHostFree(base_host);
-        if (norm_host) (void)hipHostFree(norm_host);
+        rocm_defer_free(scale_host);
+        rocm_defer_free(base_host);
+        rocm_defer_free(norm_host);
         return 0;
     }
 
@@ -1765,9 +1804,9 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
                        eps,
                        norm_eps);
     ok = rocm_launch_done("HC split/sum/norm launch", "HC split/sum/norm completion");
-    if (scale_host) (void)hipHostFree(scale_host);
-    if (base_host) (void)hipHostFree(base_host);
-    if (norm_host) (void)hipHostFree(norm_host);
+    rocm_defer_free(scale_host);
+    rocm_defer_free(base_host);
+    rocm_defer_free(norm_host);
     return ok;
 }
 
@@ -2024,8 +2063,8 @@ int ds4_metal_hc_split_sinkhorn_tensor(
              rocm_upload_mapped((const uint8_t *)model_map + base_offset, row_bytes,
                                 &bh, &bd, "sinkhorn base upload");
     if (!ok) {
-        if (sh) (void)hipHostFree(sh);
-        if (bh) (void)hipHostFree(bh);
+        rocm_defer_free(sh);
+        rocm_defer_free(bh);
         return 0;
     }
 
@@ -2038,8 +2077,8 @@ int ds4_metal_hc_split_sinkhorn_tensor(
                        (const float *)bd,
                        n_hc, sinkhorn_iters, eps, (uint32_t)rows, (uint32_t)mix_hc);
     ok = rocm_launch_done("HC sinkhorn launch", "HC sinkhorn completion");
-    if (sh) (void)hipHostFree(sh);
-    if (bh) (void)hipHostFree(bh);
+    rocm_defer_free(sh);
+    rocm_defer_free(bh);
     return ok;
 }
 
@@ -2118,8 +2157,8 @@ int ds4_metal_output_hc_weights_tensor(
                        (const float *)sd, (const float *)bd,
                        n_hc, (uint32_t)rows, eps);
     ok = rocm_launch_done("output_hc launch", "output_hc completion");
-    if (sh) (void)hipHostFree(sh);
-    if (bh) (void)hipHostFree(bh);
+    rocm_defer_free(sh);
+    rocm_defer_free(bh);
     return ok;
 }
 
@@ -2425,10 +2464,7 @@ int ds4_metal_attention_output_low_q8_tensor(
     ROCM_TIME_SCOPE("ds4_metal_attention_output_low_q8_tensor");
     /* heads is laid out as n_groups blocks of group_dim; produce one column of
      * size n_groups * rank by running n_groups independent Q8_0 matvecs.
-     * Each matvec consumes group_dim inputs and produces `rank` outputs.
-     * The Metal kernel 'kernel_dsv4_attn_out_low_q8_0_f32' walks groups in a
-     * single threadgroup, but for correctness we just dispatch per-group.
-     */
+     * Each matvec consumes group_dim inputs and produces `rank` outputs. */
     if (!low || !heads || group_dim == 0 || rank == 0 || n_groups == 0) return 0;
     if (low->bytes < (uint64_t)n_groups * rank * sizeof(float)) return 0;
     if (heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float)) return 0;
@@ -2467,8 +2503,12 @@ int ds4_metal_attention_output_q8_batch_tensor(
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_q8_batch_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_attention_output_q8_batch_tensor");
-    /* For each token, compute low = Wa @ heads (per-group Q8 matvec), then
-     * out = Wb @ low (single Q8 matvec of dim n_groups*rank -> out_dim). */
+    /* Two stages:
+     *   low = Wa @ heads  (per-group Q8 matvec, batched across tokens)
+     *   out = Wb @ low    (single Q8 matvec of dim n_groups*rank -> out_dim)
+     * Used to be a per-token CPU loop launching 2 kernels each iteration; for
+     * a 2048-token prefill chunk that was 4096 launches per layer.  Both
+     * stages now batch across n_tokens with a single launch each. */
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || n_tokens == 0) return 0;
@@ -2487,13 +2527,9 @@ int ds4_metal_attention_output_q8_batch_tensor(
         if (!ds4_metal_attention_output_low_q8_tensor(&low_view, model_map, model_size,
                                                       out_a_offset, group_dim, rank,
                                                       n_groups, &heads_view)) return 0;
-        ds4_metal_tensor out_view = *out;
-        out_view.offset = out->offset + (uint64_t)t * out_dim * sizeof(float);
-        out_view.bytes = out_dim * sizeof(float);
-        if (!ds4_metal_matmul_q8_0_tensor(&out_view, model_map, model_size, out_b_offset,
-                                          low_per, out_dim, &low_view, 1)) return 0;
     }
-    return 1;
+    return ds4_metal_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset,
+                                        low_per, out_dim, low, n_tokens);
 }
 
 int ds4_metal_matmul_q8_0_hc_expand_tensor(
@@ -2931,8 +2967,8 @@ int ds4_metal_router_select_tensor(
                        n_expert_groups, n_group_used, hash_rows, token,
                        has_bias ? 1 : 0, hash_mode ? 1 : 0);
     int ok = rocm_launch_done("router select launch", "router select completion");
-    if (bh) (void)hipHostFree(bh);
-    if (hh) (void)hipHostFree(hh);
+    rocm_defer_free(bh);
+    rocm_defer_free(hh);
     return ok;
 }
 
@@ -3085,7 +3121,7 @@ int ds4_metal_compressor_store_batch_tensor(
                        ape_type == 1u ? (const __half *)ape_d : (const __half *)NULL,
                        width, ratio, coff, pos0, n_tokens);
     int ok = rocm_launch_done("compressor store batch launch", "compressor store batch completion");
-    if (ape_h) (void)hipHostFree(ape_h);
+    rocm_defer_free(ape_h);
     return ok;
 }
 
@@ -3427,7 +3463,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
                        ape_type == 1u ? (const __half *)ape_d : (const __half *)NULL,
                        width, pos0);
     int ok = rocm_launch_done("compressor ratio4 state launch", "compressor ratio4 state completion");
-    if (ape_h) (void)hipHostFree(ape_h);
+    rocm_defer_free(ape_h);
     return ok;
 }
 
@@ -3622,7 +3658,7 @@ int ds4_metal_attention_decode_heads_tensor(
                        (const float *)sink_d,
                        n_head, head_dim, n_raw, raw_cap, raw_start, n_comp, use_mask);
     int ok = rocm_launch_done("attn decode heads launch", "attn decode heads completion");
-    if (sink_h) (void)hipHostFree(sink_h);
+    rocm_defer_free(sink_h);
     return ok;
 }
 
@@ -3732,7 +3768,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
                        (const float *)sink_d,
                        n_tokens, window, n_head, head_dim);
     int ok = rocm_launch_done("attn prefill raw launch", "attn prefill raw completion");
-    if (sink_h) (void)hipHostFree(sink_h);
+    rocm_defer_free(sink_h);
     return ok;
 }
 
@@ -3931,7 +3967,7 @@ static int rocm_attn_batch_dispatch(
     char done_msg[64];
     snprintf(done_msg, sizeof(done_msg), "attn batch %s completion", what);
     int ok = rocm_launch_done(launch_msg, done_msg);
-    if (sink_h) (void)hipHostFree(sink_h);
+    rocm_defer_free(sink_h);
     return ok;
 }
 
@@ -4556,9 +4592,9 @@ static int rocm_moe_run(
           && rocm_upload_mapped((const uint8_t *)model_map + down_offset, down_pool,
                                 &down_h, &down_d, "moe down pool");
     if (!ok) {
-        if (gate_h) (void)hipHostFree(gate_h);
-        if (up_h)   (void)hipHostFree(up_h);
-        if (down_h) (void)hipHostFree(down_h);
+        rocm_defer_free(gate_h);
+        rocm_defer_free(up_h);
+        rocm_defer_free(down_h);
         return 0;
     }
 
@@ -4599,9 +4635,9 @@ static int rocm_moe_run(
         ok = rocm_launch_done("moe down launch", "moe down completion");
     }
 
-    if (gate_h) (void)hipHostFree(gate_h);
+    rocm_defer_free(gate_h);
     if (up_h)   (void)hipHostFree(up_h);
-    if (down_h) (void)hipHostFree(down_h);
+    rocm_defer_free(down_h);
     return ok;
 }
 

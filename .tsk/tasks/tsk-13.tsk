@@ -1,6 +1,55 @@
 Stream-batch wins (TSK-4): kernels now 0.001 ms/call but corrupted output
 
 # Status
+Open. Treat as the top correctness blocker for TSK-4, not as a validated
+performance win.
+
+# Opinion / diagnosis
+The current stream-batching diff is directionally right but unsafe as written.
+It removes per-wrapper `hipDeviceSynchronize()` in batched mode, but many
+wrappers still pass temporary `hipHostMallocMapped` buffers to kernels and then
+free those buffers immediately after enqueue. Once `rocm_launch_done()` returns
+after only `hipGetLastError()`, those frees can race the queued kernels and
+explain corrupted output.
+
+Clear examples:
+- `ds4_metal_router_select_tensor`: `bh` / `hh` may be freed while
+  `rocm_router_select_one_kernel` still reads `bd` / `hd`.
+- Attention wrappers free `sink_h` while queued attention kernels still read
+  `sink_d`.
+- Compressor wrappers free `ape_h` while queued compressor kernels still read
+  `ape_d`.
+- MoE fallback/test path frees `gate_h` / `up_h` / `down_h` while queued MoE
+  kernels may still read those pools.
+- Similar one-shot `rocm_upload_mapped()` users around matmul, RMS, embed,
+  sinkhorn, and output_hc need the same lifetime audit.
+
+Also, the reported `0.001 ms/call` timing is not real kernel time after sync
+deferral; wall-clock wrapper scopes now mostly measure launch/enqueue time.
+Use HIP events or bracket synchronized graph regions when claiming GPU kernel
+latency.
+
+# Recommended next steps
+1. Do not stack further performance changes on this diff until coherent output
+   passes again.
+2. Prove the lifetime hypothesis by running with `DS4_ROCM_SYNC_EACH=1`; if
+   output becomes coherent, the deferred-free/audit path is the primary bug.
+3. Fix lifetime before optimizing: either make `rocm_upload_mapped()` return
+   registered model-map pointers on production paths and avoid per-call mapped
+   temporaries, or defer freeing temporary mapped uploads until flush/end.
+4. Audit CPU-side `memcpy` / `memmove` tensor writes and copies while a batch is
+   open; mapped host tensors can race queued kernels unless explicitly fenced
+   or moved to stream-ordered async copies.
+5. After output is coherent, replace per-wrapper wall timing with event timing
+   or graph-region timing, then rerun the tsk-3 regression gate.
+
+# Validation
+- `DS4_ROCM_SYNC_EACH=1 time ./ds4 --backend rocm ...` should distinguish a
+  launch-order/lifetime bug from a math bug.
+- Required final gate remains `tsk-3`: build, 40 kernel tests ending in `OK`,
+  coherent 200-token ROCm inference, and recorded prefill/decode t/s.
+
+# Status
 
 In progress. Per-launch sync removal works for kernels but introduces a CPU/GPU race in `ds4_metal_router_select_tensor` (and likely a few peers). Need to plug those before this can ship.
 

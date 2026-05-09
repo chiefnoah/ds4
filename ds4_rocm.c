@@ -5510,6 +5510,344 @@ __global__ static void rocm_moe_down_q2k_wave_n##NROWS##_kernel( \
 
 ROCM_DEFINE_MOE_DOWN_Q2K_WAVE(8)
 
+/* === Expert-major routed-MoE prefill path ===
+ *
+ * The legacy wave_n8 kernels above are gridded as (slot, row_block, token) and
+ * (row_block, token, 1) respectively.  For prefill with n_tokens > 1 each
+ * (token, slot) pair re-reads its expert's weight rows independently, so an
+ * expert touched by P pairs in the prompt has its rows fetched P times.
+ *
+ * The expert-major path groups (token, slot, weight) tuples by selected
+ * expert, then launches gate_up and down kernels that read each unique
+ * expert's row exactly once per row tile and dot it against PAIR_TILE
+ * matching activation rows.  For 21-token / n_used=6 prompts this brings
+ * the redundant read factor from ~1.6x down to roughly ceil(P/PAIR_TILE)
+ * blocks per expert.
+ */
+#define ROCM_MOE_EM_PAIR_TILE 4
+
+/* Schedule kernel: groups (token, slot, weight) by expert.
+ *
+ *   counts[e]     = number of pairs that selected expert e
+ *   dense_idx[e]  = position of expert e in expert_ids (only valid where
+ *                   counts[e] > 0)
+ *
+ * Outputs (max_dense = n_tokens * n_used = max possible unique experts;
+ * unused trailing slots are padded with offsets[max_dense] = total_pairs):
+ *   *out_n_unique               = number of unique experts present
+ *   out_expert_ids[max_dense]   = sparse expert IDs in dense order
+ *   out_expert_pair_offsets[..] = prefix offsets into pair_* arrays
+ *   out_pair_token[total]       = (token, slot, weight) tuples grouped by
+ *   out_pair_slot[total]          expert (length total = n_pairs minus any
+ *   out_pair_weight[total]        invalid sentinels) */
+__global__ static void rocm_moe_group_pairs_kernel(
+        uint32_t       *out_n_unique,    /* [2]: {n_unique, max_pairs_per_expert} */
+        uint32_t       *out_expert_ids,
+        uint32_t       *out_expert_pair_offsets,
+        uint32_t       *out_pair_token,
+        uint32_t       *out_pair_slot,
+        float          *out_pair_weight,
+        const int32_t  *selected,
+        const float    *weights,
+        uint32_t        n_tokens,
+        uint32_t        n_used,
+        uint32_t        n_total_experts,
+        uint32_t        max_dense) {
+    extern __shared__ uint32_t s_sched[];
+    uint32_t *counts    = s_sched;                          /* [n_total_experts] */
+    uint32_t *dense_idx = s_sched + n_total_experts;        /* [n_total_experts] */
+    uint32_t *fill      = s_sched + 2u * n_total_experts;   /* [max_dense]       */
+
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t bs      = blockDim.x;
+    const uint32_t n_pairs = n_tokens * n_used;
+
+    for (uint32_t e = tid; e < n_total_experts; e += bs) {
+        counts[e]    = 0u;
+        dense_idx[e] = 0u;
+    }
+    for (uint32_t i = tid; i < max_dense; i += bs) fill[i] = 0u;
+    __syncthreads();
+
+    for (uint32_t p = tid; p < n_pairs; p += bs) {
+        const int32_t e = selected[p];
+        if (e >= 0 && (uint32_t)e < n_total_experts) atomicAdd(&counts[e], 1u);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        uint32_t cum       = 0u;
+        uint32_t dense     = 0u;
+        uint32_t max_pairs = 0u;
+        for (uint32_t e = 0; e < n_total_experts; e++) {
+            const uint32_t c = counts[e];
+            if (c > 0u) {
+                out_expert_ids[dense]          = e;
+                out_expert_pair_offsets[dense] = cum;
+                dense_idx[e]                   = dense;
+                dense++;
+                cum += c;
+                if (c > max_pairs) max_pairs = c;
+            }
+        }
+        for (uint32_t i = dense; i <= max_dense; i++) {
+            out_expert_pair_offsets[i] = cum;
+        }
+        out_n_unique[0] = dense;
+        out_n_unique[1] = max_pairs;
+    }
+    __syncthreads();
+
+    for (uint32_t p = tid; p < n_pairs; p += bs) {
+        const int32_t e = selected[p];
+        if (e < 0 || (uint32_t)e >= n_total_experts) continue;
+        const uint32_t d     = dense_idx[e];
+        const uint32_t base  = out_expert_pair_offsets[d];
+        const uint32_t local = atomicAdd(&fill[d], 1u);
+        const uint32_t dst   = base + local;
+        out_pair_token[dst]  = p / n_used;
+        out_pair_slot[dst]   = p - (p / n_used) * n_used;
+        out_pair_weight[dst] = weights[p];
+    }
+}
+
+/* Expert-major IQ2_XXS gate/up kernel (pair-loop variant).
+ * Grid: (max_dense, ceil(mid_dim/NROWS), 1).
+ * Block: NROWS waves of 32 lanes (one wave per output row).
+ *
+ * Each block iterates ALL pairs that selected this expert in chunks of
+ * CHUNK pairs.  The chunk inner loop reuses each weight sub-block across
+ * the chunk, so per-block weight DRAM = total_subs reads (independent of
+ * pair count). */
+#define ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_EM(NROWS, CHUNK) \
+__global__ static void rocm_moe_gate_up_iq2xxs_em_n##NROWS##_c##CHUNK##_kernel( \
+        float *mid, \
+        const uint8_t *gate_pool, \
+        const uint8_t *up_pool, \
+        uint64_t gate_expert_bytes, \
+        uint64_t gate_row_bytes, \
+        uint64_t up_expert_bytes, \
+        uint64_t up_row_bytes, \
+        const float *x, \
+        const uint32_t *expert_ids, \
+        const uint32_t *expert_pair_offsets, \
+        const uint32_t *pair_token, \
+        const uint32_t *pair_slot, \
+        const float *pair_weight, \
+        uint32_t in_dim, \
+        uint32_t mid_dim, \
+        uint32_t n_used, \
+        float clamp) { \
+    const uint32_t e_dense    = blockIdx.x; \
+    const uint32_t row_base   = blockIdx.y * (uint32_t)(NROWS); \
+    const uint32_t pair_start = expert_pair_offsets[e_dense]; \
+    const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u]; \
+    if (pair_start >= pair_end) return; \
+    const uint32_t e    = expert_ids[e_dense]; \
+    const uint32_t lane = threadIdx.x & 31u; \
+    const uint32_t wave = threadIdx.x >> 5; \
+    const uint32_t row  = row_base + wave; \
+    if (row >= mid_dim) return; \
+    const uint32_t nb = in_dim / DS4_QK_K; \
+    const uint32_t total_subs = nb * 8u; \
+    const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *) \
+        (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes); \
+    const rocm_block_iq2_xxs *up_row_p = (const rocm_block_iq2_xxs *) \
+        (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)row * up_row_bytes); \
+    for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += (uint32_t)(CHUNK)) { \
+        const uint32_t pt = (pair_end - pair_base < (uint32_t)(CHUNK)) \
+                            ? (pair_end - pair_base) : (uint32_t)(CHUNK); \
+        float gate_v[CHUNK], up_v[CHUNK]; \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+            gate_v[p] = 0.0f; up_v[p] = 0.0f; \
+        } \
+        uint32_t tk[CHUNK]; \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+            tk[p] = ((uint32_t)p < pt) ? pair_token[pair_base + (uint32_t)p] : 0u; \
+        } \
+        for (uint32_t sub = lane; sub < total_subs; sub += 32u) { \
+            const uint32_t bi   = sub >> 3; \
+            const uint32_t ib32 = sub & 7u; \
+            const rocm_block_iq2_xxs *gb = gate_row_p + bi; \
+            const rocm_block_iq2_xxs *ub = up_row_p   + bi; \
+            const float gd = rocm_f16_to_f32(gb->d); \
+            const float ud = rocm_f16_to_f32(ub->d); \
+            const uint16_t *gq = gb->qs + ib32 * 4u; \
+            const uint16_t *uq = ub->qs + ib32 * 4u; \
+            const uint32_t ag = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16); \
+            const uint32_t as = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16); \
+            const float gdl = gd * (0.5f + (float)(as >> 28)) * 0.25f; \
+            const uint8_t *gg0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0)); \
+            const uint8_t *gg1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8)); \
+            const uint8_t *gg2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16)); \
+            const uint8_t *gg3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24)); \
+            const uint8_t gs0 = rocm_ksigns_iq2xs[(as >>  0) & 127u]; \
+            const uint8_t gs1 = rocm_ksigns_iq2xs[(as >>  7) & 127u]; \
+            const uint8_t gs2 = rocm_ksigns_iq2xs[(as >> 14) & 127u]; \
+            const uint8_t gs3 = rocm_ksigns_iq2xs[(as >> 21) & 127u]; \
+            const uint32_t uag = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16); \
+            const uint32_t uas = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16); \
+            const float udl = ud * (0.5f + (float)(uas >> 28)) * 0.25f; \
+            const uint8_t *ug0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >>  0)); \
+            const uint8_t *ug1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >>  8)); \
+            const uint8_t *ug2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >> 16)); \
+            const uint8_t *ug3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >> 24)); \
+            const uint8_t us0 = rocm_ksigns_iq2xs[(uas >>  0) & 127u]; \
+            const uint8_t us1 = rocm_ksigns_iq2xs[(uas >>  7) & 127u]; \
+            const uint8_t us2 = rocm_ksigns_iq2xs[(uas >> 14) & 127u]; \
+            const uint8_t us3 = rocm_ksigns_iq2xs[(uas >> 21) & 127u]; \
+            _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+                if ((uint32_t)p >= pt) continue; \
+                const float *y = x + (uint64_t)tk[p] * in_dim + (uint64_t)sub * 32u; \
+                float gacc = 0.0f, uacc = 0.0f; \
+                for (int j = 0; j < 8; j++) { \
+                    const float y0 = y[j +  0]; \
+                    const float y1 = y[j +  8]; \
+                    const float y2 = y[j + 16]; \
+                    const float y3 = y[j + 24]; \
+                    const float gv0 = (float)gg0[j] * (((gs0 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float gv1 = (float)gg1[j] * (((gs1 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float gv2 = (float)gg2[j] * (((gs2 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float gv3 = (float)gg3[j] * (((gs3 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float uv0 = (float)ug0[j] * (((us0 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float uv1 = (float)ug1[j] * (((us1 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float uv2 = (float)ug2[j] * (((us2 >> j) & 1u) ? -1.0f : 1.0f); \
+                    const float uv3 = (float)ug3[j] * (((us3 >> j) & 1u) ? -1.0f : 1.0f); \
+                    gacc += y0 * gv0 + y1 * gv1 + y2 * gv2 + y3 * gv3; \
+                    uacc += y0 * uv0 + y1 * uv1 + y2 * uv2 + y3 * uv3; \
+                } \
+                gate_v[p] += gdl * gacc; \
+                up_v[p]   += udl * uacc; \
+            } \
+        } \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+            gate_v[p] = rocm_wave32_sum(gate_v[p]); \
+            up_v[p]   = rocm_wave32_sum(up_v[p]); \
+        } \
+        if (lane == 0) { \
+            _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+                if ((uint32_t)p >= pt) continue; \
+                float gv = gate_v[p]; \
+                float uv = up_v[p]; \
+                if (clamp > 1.0e-6f) { \
+                    if (gv > clamp) gv = clamp; \
+                    if (uv > clamp) uv = clamp; \
+                    if (uv < -clamp) uv = -clamp; \
+                } \
+                const uint32_t pidx  = pair_base + (uint32_t)p; \
+                const uint32_t token = tk[p]; \
+                const uint32_t slot  = pair_slot[pidx]; \
+                const float w        = pair_weight[pidx]; \
+                mid[((uint64_t)token * n_used + slot) * mid_dim + row] = rocm_silu(gv) * uv * w; \
+            } \
+        } \
+    } \
+}
+ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_EM(8, 4)
+
+/* Expert-major Q2_K down kernel (pair-loop variant). */
+#define ROCM_DEFINE_MOE_DOWN_Q2K_EM(NROWS, CHUNK) \
+__global__ static void rocm_moe_down_q2k_em_n##NROWS##_c##CHUNK##_kernel( \
+        float *out, \
+        const uint8_t *down_pool, \
+        uint64_t down_expert_bytes, \
+        uint64_t down_row_bytes, \
+        const float *mid, \
+        const uint32_t *expert_ids, \
+        const uint32_t *expert_pair_offsets, \
+        const uint32_t *pair_token, \
+        const uint32_t *pair_slot, \
+        uint32_t mid_dim, \
+        uint32_t out_dim, \
+        uint32_t n_used) { \
+    const uint32_t e_dense    = blockIdx.x; \
+    const uint32_t row_base   = blockIdx.y * (uint32_t)(NROWS); \
+    const uint32_t pair_start = expert_pair_offsets[e_dense]; \
+    const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u]; \
+    if (pair_start >= pair_end) return; \
+    const uint32_t e    = expert_ids[e_dense]; \
+    const uint32_t lane = threadIdx.x & 31u; \
+    const uint32_t wave = threadIdx.x >> 5; \
+    const uint32_t row  = row_base + wave; \
+    if (row >= out_dim) return; \
+    const uint32_t nb = mid_dim / DS4_QK_K; \
+    const uint32_t total_qb = nb * 16u; \
+    const rocm_block_q2_K *down_row_p = (const rocm_block_q2_K *) \
+        (down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)row * down_row_bytes); \
+    for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += (uint32_t)(CHUNK)) { \
+        const uint32_t pt = (pair_end - pair_base < (uint32_t)(CHUNK)) \
+                            ? (pair_end - pair_base) : (uint32_t)(CHUNK); \
+        float acc[CHUNK]; \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) acc[p] = 0.0f; \
+        uint32_t tk[CHUNK], sl[CHUNK]; \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+            if ((uint32_t)p < pt) { \
+                tk[p] = pair_token[pair_base + (uint32_t)p]; \
+                sl[p] = pair_slot[pair_base + (uint32_t)p]; \
+            } else { tk[p] = 0u; sl[p] = 0u; } \
+        } \
+        for (uint32_t qb = lane; qb < total_qb; qb += 32u) { \
+            const uint32_t bi  = qb >> 4; \
+            const uint32_t inn = qb & 15u; \
+            const uint32_t k     = inn >> 3; \
+            const uint32_t inneri = inn & 7u; \
+            const uint32_t jstep = inneri >> 1; \
+            const uint32_t half  = inneri & 1u; \
+            const uint32_t shift = jstep * 2u; \
+            const rocm_block_q2_K *xb = down_row_p + bi; \
+            const float d    = rocm_f16_to_f32(xb->d); \
+            const float dmin = rocm_f16_to_f32(xb->dmin); \
+            const uint8_t sc = xb->scales[inn]; \
+            const float scale = (float)(sc & 0x0F); \
+            const float minv  = (float)(sc >> 4); \
+            const uint8_t *q = xb->qs + k * 32u + half * 16u; \
+            const uint64_t mid_base_off = (uint64_t)bi * DS4_QK_K + k * 128u + jstep * 32u + half * 16u; \
+            float qv[16]; \
+            for (int i = 0; i < 16; i++) qv[i] = (float)((q[i] >> shift) & 0x3); \
+            _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+                if ((uint32_t)p >= pt) continue; \
+                const float *y = mid + ((uint64_t)tk[p] * n_used + sl[p]) * mid_dim + mid_base_off; \
+                float dot = 0.0f, sumy = 0.0f; \
+                for (int i = 0; i < 16; i++) { \
+                    const float yv = y[i]; \
+                    dot  += yv * qv[i]; \
+                    sumy += yv; \
+                } \
+                acc[p] += d * scale * dot - dmin * minv * sumy; \
+            } \
+        } \
+        _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) acc[p] = rocm_wave32_sum(acc[p]); \
+        if (lane == 0) { \
+            _Pragma("unroll") for (int p = 0; p < (int)(CHUNK); p++) { \
+                if ((uint32_t)p >= pt) continue; \
+                atomicAdd(&out[(uint64_t)tk[p] * out_dim + row], acc[p]); \
+            } \
+        } \
+    } \
+}
+ROCM_DEFINE_MOE_DOWN_Q2K_EM(8, 4)
+
+/* Persistent device-side scratch for expert-major routed-MoE schedule.
+ * Allocated lazily; reused across rocm_moe_run() calls.  Sized for the
+ * largest n_tokens / n_used / n_total_experts seen so far. */
+static void   *g_moe_em_scratch_d  = NULL;
+static size_t  g_moe_em_scratch_bytes = 0;
+
+static int rocm_moe_em_scratch_ensure(size_t needed) {
+    if (g_moe_em_scratch_bytes >= needed) return 1;
+    if (g_moe_em_scratch_d) {
+        (void)hipFree(g_moe_em_scratch_d);
+        g_moe_em_scratch_d  = NULL;
+        g_moe_em_scratch_bytes = 0;
+    }
+    if (hipMalloc(&g_moe_em_scratch_d, needed) != hipSuccess) {
+        g_moe_em_scratch_d = NULL;
+        return 0;
+    }
+    g_moe_em_scratch_bytes = needed;
+    return 1;
+}
+
 static int rocm_moe_run(
         ds4_metal_tensor       *out,
         ds4_metal_tensor       *mid,
@@ -5579,6 +5917,112 @@ static int rocm_moe_run(
         rocm_defer_free(up_h);
         rocm_defer_free(down_h);
         return 0;
+    }
+
+    /* Expert-major fast path for prefill (n_tokens > 1) on the production
+     * IQ2_XXS gate/up + Q2_K down quant combo.  Schedules pairs by expert,
+     * then runs gate_up + down kernels that read each unique expert's row
+     * once per row tile and dot it against CHUNK matching pairs.
+     *
+     * NOTE: Disabled by default at the canonical 21-token prefill scale.
+     * Measurement on Strix Halo gfx1151 (2026-05-09) showed the legacy
+     * wave_n8 path at 29.7 t/s vs EM at 26.3 t/s end-to-end.  The expected
+     * weight-reuse win (codex estimated 1.4-1.6x for the MoE portion) is
+     * dominated by per-pair register pressure inside the CHUNK=4 unroll
+     * and by ~36% empty blocks in the worst-case max_dense grid.  At
+     * larger prefill chunks (n_tokens >= ~256, where pairs/expert grow
+     * from ~1.6 to >5) the math should flip in EM's favor; gate is set to
+     * a high tokens threshold so the kernels stay validated by the oracle
+     * (n_tokens=2 falls through to legacy now).
+     *
+     * Set DS4_ROCM_MOE_EM=1 to force-enable the EM path for benchmarking. */
+    static int g_em_enabled_cached = -1;
+    if (g_em_enabled_cached < 0) {
+        const char *env = getenv("DS4_ROCM_MOE_EM");
+        g_em_enabled_cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    const int em_path = g_em_enabled_cached &&
+                        (n_tokens > 1u) &&
+                        (gate_type == DS4_TENSOR_TYPE_IQ2_XXS) &&
+                        (up_type   == DS4_TENSOR_TYPE_IQ2_XXS) &&
+                        (down_type == DS4_TENSOR_TYPE_Q2_K);
+    if (em_path) {
+        const uint32_t max_dense   = n_tokens * n_used;
+        /* Header now reserves 2 uint32_t for {n_unique, max_pairs}. */
+        const size_t   hdr_bytes   = sizeof(uint32_t) * (2u + (uint32_t)total_experts + (max_dense + 1u));
+        const size_t   pair_bytes  = sizeof(uint32_t) * 2u * max_dense + sizeof(float) * max_dense;
+        const size_t   need_bytes  = hdr_bytes + pair_bytes;
+        if (rocm_moe_em_scratch_ensure(need_bytes)) {
+            const uint32_t sched_block        = 256u;
+            const size_t   sched_smem         = sizeof(uint32_t) * (2u * (uint32_t)total_experts + max_dense);
+            const uint32_t em_nrows           = 8u;
+            const uint32_t em_gu_row_blocks   = (expert_mid_dim + em_nrows - 1u) / em_nrows;
+            const uint32_t em_dn_row_blocks   = (out_dim        + em_nrows - 1u) / em_nrows;
+            const size_t   em_out_bytes       = (size_t)n_tokens * out_dim * sizeof(float);
+
+            uint8_t  *p                       = (uint8_t *)g_moe_em_scratch_d;
+            uint32_t *sched_n_unique          = (uint32_t *)p; p += sizeof(uint32_t) * 2u;
+            uint32_t *sched_expert_ids        = (uint32_t *)p; p += sizeof(uint32_t) * (uint32_t)total_experts;
+            uint32_t *sched_expert_pair_off   = (uint32_t *)p; p += sizeof(uint32_t) * (max_dense + 1u);
+            uint32_t *sched_pair_token        = (uint32_t *)p; p += sizeof(uint32_t) * max_dense;
+            uint32_t *sched_pair_slot         = (uint32_t *)p; p += sizeof(uint32_t) * max_dense;
+            float    *sched_pair_weight       = (float    *)p;
+
+            hipLaunchKernelGGL(rocm_moe_group_pairs_kernel,
+                               dim3(1u), dim3(sched_block),
+                               (uint32_t)sched_smem, 0,
+                               sched_n_unique, sched_expert_ids, sched_expert_pair_off,
+                               sched_pair_token, sched_pair_slot, sched_pair_weight,
+                               (const int32_t *)tensor_u8_const(selected),
+                               (const float   *)tensor_u8_const(weights),
+                               n_tokens, n_used, (uint32_t)total_experts, max_dense);
+            int em_ok = rocm_launch_done("moe schedule launch", "moe schedule completion");
+
+            /* Worst-case grid x = max_dense; empty blocks early-exit on the
+             * offsets[blockIdx.x] >= offsets[blockIdx.x+1] check.  Each block
+             * iterates ALL pairs that selected its expert in chunks of CHUNK
+             * pairs, so grid Z is always 1. */
+            const uint32_t n_unique  = max_dense;
+            (void)sched_n_unique;
+
+            if (em_ok && n_unique > 0u) {
+                dim3 gu_grid(n_unique, em_gu_row_blocks, 1);
+                dim3 gu_block(em_nrows * 32u, 1, 1);
+                hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_em_n8_c4_kernel, gu_grid, gu_block, 0, 0,
+                                   (float *)tensor_u8(mid),
+                                   (const uint8_t *)gate_d,
+                                   (const uint8_t *)up_d,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   up_expert_bytes, up_row_bytes,
+                                   (const float *)tensor_u8_const(x),
+                                   sched_expert_ids, sched_expert_pair_off,
+                                   sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                   expert_in_dim, expert_mid_dim, n_used, clamp);
+                em_ok = rocm_launch_done("moe em gate_up launch", "moe em gate_up completion");
+            }
+            if (em_ok) {
+                em_ok = (hipMemsetAsync(tensor_u8(out), 0, em_out_bytes, 0) == hipSuccess);
+            }
+            if (em_ok && n_unique > 0u) {
+                dim3 dn_grid(n_unique, em_dn_row_blocks, 1);
+                dim3 dn_block(em_nrows * 32u, 1, 1);
+                hipLaunchKernelGGL(rocm_moe_down_q2k_em_n8_c4_kernel, dn_grid, dn_block, 0, 0,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)down_d,
+                                   down_expert_bytes, down_row_bytes,
+                                   (const float *)tensor_u8_const(mid),
+                                   sched_expert_ids, sched_expert_pair_off,
+                                   sched_pair_token, sched_pair_slot,
+                                   expert_mid_dim, out_dim, n_used);
+                em_ok = rocm_launch_done("moe em down launch", "moe em down completion");
+            }
+
+            rocm_defer_free(gate_h);
+            if (up_h) (void)hipHostFree(up_h);
+            rocm_defer_free(down_h);
+            return em_ok;
+        }
+        /* scratch alloc failed: fall through to legacy path. */
     }
 
     /* Wave-per-row IQ2_XXS gate_up: 8 rows / block, one wave per row.

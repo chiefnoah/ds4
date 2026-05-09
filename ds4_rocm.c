@@ -630,6 +630,132 @@ __global__ static void rocm_matmul_q8_0_wave_##NROWS##_kernel( \
 ROCM_DEFINE_MATMUL_Q8_0_WAVE(8)
 ROCM_DEFINE_MATMUL_Q8_0_WAVE(4)
 
+/* Tiled Q8_0 wave matmul for prefill (n_tok > 1).  Each lane reads each
+ * Q8_0 weight block exactly ONCE per row pass and accumulates NTOK
+ * partial sums against NTOK x slices, eliminating the per-token weight
+ * reread that previously dominated prefill DRAM traffic.  For n_tok
+ * not a multiple of NTOK the bounds check `(t_base + t) < n_tok` skips
+ * stragglers; the dispatcher pads grid.y = ceil(n_tok / NTOK).
+ *
+ * Block layout matches the single-token wave kernel: NROWS waves of 32
+ * lanes each, one wave per output row, lane handles q8_0 block stride
+ * 32, in-wave shuffle reduction. */
+#define ROCM_DEFINE_MATMUL_Q8_0_TILE(NROWS, NTOK) \
+__global__ static void rocm_matmul_q8_0_tile_##NROWS##x##NTOK##_kernel( \
+        float *out, const uint8_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, \
+        uint64_t row_bytes) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t t_base  = blockIdx.y * (uint32_t)(NTOK); \
+    if (row >= out_dim) return; \
+    const uint32_t blocks = in_dim >> 5; \
+    const uint8_t *wr = w + (uint64_t)row * row_bytes; \
+    float sum[NTOK]; \
+    _Pragma("unroll") \
+    for (int t = 0; t < (int)(NTOK); t++) sum[t] = 0.0f; \
+    for (uint32_t b = lane; b < blocks; b += 32u) { \
+        const uint8_t *blk = wr + (uint64_t)b * 34u; \
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8); \
+        const float scale = rocm_f16_to_f32(scale_bits); \
+        const int8_t *qs = (const int8_t *)(blk + 2); \
+        const uint64_t x_off = ((uint64_t)b << 5); \
+        _Pragma("unroll") \
+        for (int t = 0; t < (int)(NTOK); t++) { \
+            if (t_base + (uint32_t)t < n_tok) { \
+                const float *xb = x + (uint64_t)(t_base + (uint32_t)t) * in_dim + x_off; \
+                float dot = 0.0f; \
+                _Pragma("unroll") \
+                for (int j = 0; j < 32; j++) dot += (float)qs[j] * xb[j]; \
+                sum[t] += scale * dot; \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (int t = 0; t < (int)(NTOK); t++) { \
+        float s = rocm_wave32_sum(sum[t]); \
+        if (lane == 0 && (t_base + (uint32_t)t) < n_tok) { \
+            out[(uint64_t)(t_base + (uint32_t)t) * out_dim + row] = s; \
+        } \
+    } \
+}
+
+ROCM_DEFINE_MATMUL_Q8_0_TILE(8, 8)
+ROCM_DEFINE_MATMUL_Q8_0_TILE(4, 8)
+
+/* Wave-per-row F16 matvec.  Same pattern as the Q8_0 wave kernel: one
+ * 32-lane wave computes one output row, with each lane summing
+ * in_dim/32 fp16 weights against the activation slice.  Only used for
+ * the n_tok=1 decode path; the legacy LDS-reduction kernel handles
+ * n_tok>1 prefill batches. */
+#define ROCM_DEFINE_MATMUL_F16_WAVE(NROWS) \
+__global__ static void rocm_matmul_f16_wave_##NROWS##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t tok     = blockIdx.y; \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const float    *xr = x + (uint64_t)tok * in_dim; \
+    float sum = 0.0f; \
+    for (uint32_t i = lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * xr[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_WAVE(8)
+ROCM_DEFINE_MATMUL_F16_WAVE(4)
+
+/* Tiled F16 wave matmul for prefill (n_tok > 1).  Matches the Q8_0 tile
+ * pattern: one wave per output row, each lane reads each weight element
+ * once and accumulates NTOK partial sums against NTOK x slices.  Only
+ * dispatched for n_tok > 1; n_tok=1 stays on the legacy LDS-reduction
+ * kernel because the wave-per-row variant regressed F16 decode (~13%)
+ * — F16's compute/byte ratio is too low for wave-per-row at n_tok=1
+ * to hide memory latency. */
+#define ROCM_DEFINE_MATMUL_F16_TILE(NROWS, NTOK) \
+__global__ static void rocm_matmul_f16_tile_##NROWS##x##NTOK##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t t_base  = blockIdx.y * (uint32_t)(NTOK); \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    float sum[NTOK]; \
+    _Pragma("unroll") \
+    for (int t = 0; t < (int)(NTOK); t++) sum[t] = 0.0f; \
+    for (uint32_t i = lane; i < in_dim; i += 32u) { \
+        const float wv = rocm_f16_to_f32(wr[i]); \
+        _Pragma("unroll") \
+        for (int t = 0; t < (int)(NTOK); t++) { \
+            if (t_base + (uint32_t)t < n_tok) { \
+                const float xv = x[(uint64_t)(t_base + (uint32_t)t) * in_dim + i]; \
+                sum[t] += wv * xv; \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (int t = 0; t < (int)(NTOK); t++) { \
+        float s = rocm_wave32_sum(sum[t]); \
+        if (lane == 0 && (t_base + (uint32_t)t) < n_tok) { \
+            out[(uint64_t)(t_base + (uint32_t)t) * out_dim + row] = s; \
+        } \
+    } \
+}
+
+ROCM_DEFINE_MATMUL_F16_TILE(8, 8)
+ROCM_DEFINE_MATMUL_F16_TILE(4, 8)
+
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,
                                                               float *split,
@@ -1607,21 +1733,48 @@ int ds4_metal_matmul_f16_tensor(
     const void *src = (const uint8_t *)model_map + weight_offset;
     if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "F16 weight upload")) return 0;
 
-    unsigned threads = 256;
-    while (threads > 1 && threads / 2 >= in_dim) threads >>= 1;
-    const dim3 block(threads);
-    const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
-    hipLaunchKernelGGL(rocm_matmul_f16_kernel,
-                       grid,
-                       block,
-                       threads * sizeof(float),
-                       0,
-                       (float *)tensor_u8(out),
-                       (const uint16_t *)w_dev,
-                       (const float *)tensor_u8_const(x),
-                       in_dim,
-                       out_dim);
-    int ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
+    int ok;
+    if (n_tok > 1u) {
+        /* Prefill path: tile NTOK=8 tokens per row pass to amortize the
+         * weight read.  See ROCM_DEFINE_MATMUL_F16_TILE. */
+        const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
+        const uint32_t ntok  = 8u;
+        const dim3 block(nrows * 32u);
+        const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),
+                        (unsigned)((n_tok + ntok - 1u) / ntok));
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_matmul_f16_tile_8x8_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        } else {
+            hipLaunchKernelGGL(rocm_matmul_f16_tile_4x8_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        }
+        ok = rocm_launch_done("F16 matmul tile launch", "F16 matmul tile completion");
+    } else {
+        unsigned threads = 256;
+        while (threads > 1 && threads / 2 >= in_dim) threads >>= 1;
+        const dim3 block(threads);
+        const dim3 grid((unsigned)out_dim, 1u);
+        hipLaunchKernelGGL(rocm_matmul_f16_kernel,
+                           grid,
+                           block,
+                           threads * sizeof(float),
+                           0,
+                           (float *)tensor_u8(out),
+                           (const uint16_t *)w_dev,
+                           (const float *)tensor_u8_const(x),
+                           in_dim,
+                           out_dim);
+        ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
+    }
     rocm_defer_free(w_host);
     return ok;
 }
@@ -1718,15 +1871,20 @@ int ds4_metal_matmul_q8_0_tensor(
     if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "Q8_0 weight upload")) return 0;
 
     int ok;
-    if (n_tok == 1u && (in_dim % 32u) == 0u) {
-        /* Decode-time matvec: wave32-per-row kernel.  See
-         * ROCM_DEFINE_MATMUL_Q8_0_WAVE; one wavefront computes one
-         * output row, lane handles q8_0 block stride 32, in-wave
-         * shuffle reduction, no LDS, no syncthreads.  Picks
-         * ROWS_PER_BLOCK=8 when out_dim is a multiple of 8 and small
-         * enough that the launched block count still saturates 40 CUs;
-         * falls back to NROWS=4 for out_dim that isn't divisible by 8
-         * or is small (e.g. attn_kv at out_dim=576).
+    if ((in_dim % 32u) == 0u) {
+        /* Wave-per-row Q8_0 matmul.  See ROCM_DEFINE_MATMUL_Q8_0_WAVE
+         * (n_tok=1) and ROCM_DEFINE_MATMUL_Q8_0_TILE (n_tok>1):
+         * one wavefront computes one output row, lane handles q8_0
+         * block stride 32, in-wave shuffle reduction, no LDS, no
+         * syncthreads.  Picks NROWS=8 when out_dim is a multiple of 8
+         * and large enough that the launched block count still
+         * saturates 40 CUs; falls back to NROWS=4 for out_dim that
+         * isn't divisible by 8 or is small (e.g. attn_kv at
+         * out_dim=576).
+         *
+         * For n_tok>1 (prefill), the tile kernel reuses each weight
+         * block across NTOK=8 tokens, eliminating per-token weight
+         * reread that previously dominated prefill DRAM traffic.
          *
          * The LDS-x cached variant (rocm_matmul_q8_0_lds_*_kernel) was
          * benchmarked and is ~4x SLOWER (48 vs 185 GiB/s on 4096^2):
@@ -1735,23 +1893,47 @@ int ds4_metal_matmul_q8_0_tensor(
          * Don't dispatch to it without first re-measuring occupancy. */
         const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
         const dim3 block(nrows * 32u);
-        const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows), (unsigned)n_tok);
-        if (nrows == 8u) {
-            hipLaunchKernelGGL(rocm_matmul_q8_0_wave_8_kernel,
-                               grid, block, 0, 0,
-                               (float *)tensor_u8(out),
-                               (const uint8_t *)w_dev,
-                               (const float *)tensor_u8_const(x),
-                               (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+        if (n_tok == 1u) {
+            const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows), 1u);
+            if (nrows == 8u) {
+                hipLaunchKernelGGL(rocm_matmul_q8_0_wave_8_kernel,
+                                   grid, block, 0, 0,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+            } else {
+                hipLaunchKernelGGL(rocm_matmul_q8_0_wave_4_kernel,
+                                   grid, block, 0, 0,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+            }
+            ok = rocm_launch_done("Q8_0 matmul wave launch", "Q8_0 matmul wave completion");
         } else {
-            hipLaunchKernelGGL(rocm_matmul_q8_0_wave_4_kernel,
-                               grid, block, 0, 0,
-                               (float *)tensor_u8(out),
-                               (const uint8_t *)w_dev,
-                               (const float *)tensor_u8_const(x),
-                               (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
+            const uint32_t ntok = 8u;
+            const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),
+                            (unsigned)((n_tok + ntok - 1u) / ntok));
+            if (nrows == 8u) {
+                hipLaunchKernelGGL(rocm_matmul_q8_0_tile_8x8_kernel,
+                                   grid, block, 0, 0,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim,
+                                   (uint32_t)n_tok, row_bytes);
+            } else {
+                hipLaunchKernelGGL(rocm_matmul_q8_0_tile_4x8_kernel,
+                                   grid, block, 0, 0,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim,
+                                   (uint32_t)n_tok, row_bytes);
+            }
+            ok = rocm_launch_done("Q8_0 matmul tile launch", "Q8_0 matmul tile completion");
         }
-        ok = rocm_launch_done("Q8_0 matmul wave launch", "Q8_0 matmul wave completion");
     } else {
         const dim3 block(256);
         const dim3 grid((unsigned)out_dim, (unsigned)n_tok);

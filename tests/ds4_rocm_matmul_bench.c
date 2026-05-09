@@ -5,10 +5,10 @@
  * via ds4_metal_set_model_map, then loops the wrapper.
  *
  * Usage:
- *   ./ds4_rocm_matmul_bench [in_dim] [out_dim] [iters]
- * Defaults: in_dim=4096 out_dim=4096 iters=2000.
+ *   ./ds4_rocm_matmul_bench [in_dim] [out_dim] [iters] [n_tok]
+ * Defaults: in_dim=4096 out_dim=4096 iters=2000 n_tok=1.
  *
- * Reports: ms/call, GiB/s effective, and whether we hit the wave kernel. */
+ * Reports: ms/call, ms/token, GiB/s effective. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -69,7 +69,9 @@ int main(int argc, char **argv) {
     uint64_t in_dim  = (argc > 1) ? (uint64_t)strtoull(argv[1], NULL, 10) : 4096ull;
     uint64_t out_dim = (argc > 2) ? (uint64_t)strtoull(argv[2], NULL, 10) : 4096ull;
     int iters        = (argc > 3) ? atoi(argv[3]) : 2000;
+    uint64_t n_tok   = (argc > 4) ? (uint64_t)strtoull(argv[4], NULL, 10) : 1ull;
     if (iters < 1) iters = 1;
+    if (n_tok < 1) n_tok = 1;
 
     if (!ds4_metal_init()) {
         fprintf(stderr, "matmul_bench: SKIP no ROCm device\n");
@@ -106,13 +108,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "set_model_map failed\n"); return 1;
     }
 
-    ds4_metal_tensor *tx   = ds4_metal_tensor_alloc(in_dim  * sizeof(float));
-    ds4_metal_tensor *tout = ds4_metal_tensor_alloc(out_dim * sizeof(float));
+    ds4_metal_tensor *tx   = ds4_metal_tensor_alloc(n_tok * in_dim  * sizeof(float));
+    ds4_metal_tensor *tout = ds4_metal_tensor_alloc(n_tok * out_dim * sizeof(float));
     if (!tx || !tout) { fprintf(stderr, "tensor alloc failed\n"); return 1; }
 
-    float *xh = (float *)malloc(in_dim * sizeof(float));
-    for (uint64_t i = 0; i < in_dim; i++) xh[i] = (float)((i * 1664525u + 1013904223u) & 255u) / 256.0f - 0.5f;
-    if (!ds4_metal_tensor_write(tx, 0, xh, in_dim * sizeof(float))) {
+    float *xh = (float *)malloc(n_tok * in_dim * sizeof(float));
+    for (uint64_t i = 0; i < n_tok * in_dim; i++) xh[i] = (float)((i * 1664525u + 1013904223u) & 255u) / 256.0f - 0.5f;
+    if (!ds4_metal_tensor_write(tx, 0, xh, n_tok * in_dim * sizeof(float))) {
         fprintf(stderr, "tensor write failed\n"); return 1;
     }
     free(xh);
@@ -121,7 +123,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) {
         const uint64_t off = (uint64_t)(i % (int)n_copies) * weight_bytes;
         if (!ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
-                                           in_dim, out_dim, tx, 1)) {
+                                           in_dim, out_dim, tx, n_tok)) {
             fprintf(stderr, "warmup matmul failed\n"); return 1;
         }
     }
@@ -131,7 +133,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < iters; i++) {
         const uint64_t off = (uint64_t)(i % (int)n_copies) * weight_bytes;
         if (!ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
-                                           in_dim, out_dim, tx, 1)) {
+                                           in_dim, out_dim, tx, n_tok)) {
             fprintf(stderr, "matmul iter %d failed\n", i); return 1;
         }
     }
@@ -139,15 +141,17 @@ int main(int argc, char **argv) {
     double dt = now_sec() - t0;
 
     const double ms_per = (dt * 1000.0) / (double)iters;
+    const double ms_tok = ms_per / (double)n_tok;
     const double gib_s  = ((double)weight_bytes / (1024.0 * 1024.0 * 1024.0))
                           / (dt / (double)iters);
     fprintf(stdout,
-            "matmul_q8_0 in=%llu out=%llu iters=%d  weight=%.2f MiB  copies=%llu  "
-            "%.4f ms/call  %.2f GiB/s\n",
-            (unsigned long long)in_dim, (unsigned long long)out_dim, iters,
+            "matmul_q8_0 in=%llu out=%llu n_tok=%llu iters=%d  weight=%.2f MiB  copies=%llu  "
+            "%.4f ms/call  %.4f ms/token  %.2f GiB/s (weight only)\n",
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            (unsigned long long)n_tok, iters,
             (double)weight_bytes / (1024.0 * 1024.0),
             (unsigned long long)n_copies,
-            ms_per, gib_s);
+            ms_per, ms_tok, gib_s);
 
     ds4_metal_tensor_free(tx);
     ds4_metal_tensor_free(tout);

@@ -1,0 +1,48 @@
+ROCm WMMA-based prefill matmul
+
+Status: PROPOSED (codex recommendation 2026-05-09, long-term)
+
+Goal:
+Use RDNA3.5 wave32 WMMA builtins to feed matrix-tile hardware on the
+dense Q8_0 prefill path.  Closest gfx1151 analogue to Metal
+simdgroup_matmul; needed to plausibly close the 8.4x prefill gap
+(29.7 -> 250 t/s).
+
+Why:
+Metal hits ~250 t/s prefill via simdgroup_matmul tiling.  Current ROCm
+uses scalar wave-per-row kernels that do not feed WMMA-shaped work.
+AMDGCN exposes:
+  __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32 (a_sign, a4, b_sign, b4, c8, clamp)
+  __builtin_amdgcn_wmma_f16_16x16x16_f16_w32 (a16, b16, c16, opsel)
+
+For DSv4 quant mix:
+- Q8_0 dense prefill: WMMA_I8 with activation int8 microquant
+- F16 dense paths: WMMA_F16 directly
+- IQ2/Q2 routed: NOT directly WMMA-able without weight transformation
+
+File pointers:
+- Q8_0 wave + tile matmul: /home/noah/repos/ds4/ds4_rocm.c:566+, 633+
+- F16 matmul: search rocm_matmul_f16_*
+- Decode Q8_0 already at 185 GiB/s ceiling so won't help decode
+
+Next steps:
+1. Decide on activation microquant (see tsk for sdot4 -- shared
+   prerequisite; if accepted, use same microquant + scales here)
+2. Prototype WMMA_I8 kernel for Q8_0 matmul at out_dim x n_tok shape with
+   16x16 tiles
+3. Tile alignment: pad in_dim/out_dim/n_tok to multiples of 16
+4. Compare to current tile kernel at end-to-end
+5. Microbench in tests/ds4_rocm_matmul_bench.c (extend with --wmma flag)
+
+Complexity: ~1000-2000 lines, 3-5 days.  Tile alignment + correctness
+are the hard parts.
+
+Related:
+- depends on activation microquant from sdot4 task
+- tsk-22 FlashAttention (could also use WMMA inside FA)
+- tsk-10 rocBLAS/hipBLASLt evaluation (alternative)
+
+Note: clpeak says theoretical f16 GEMM peak on this hardware ~30 TFLOPS
+and Q8_0 decode is bandwidth-bound at 25 t/s ceiling.  Prefill compute-
+bound regime may be where Metal pulls ahead, but 250 t/s requires either
+WMMA or much higher token reuse than current kernels expose.

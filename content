@@ -1,0 +1,54 @@
+ROCm MoE prefill: WMMA_I8 via lazy per-batch weight repack (proof first)
+
+Status: Open (started 2026-05-09).
+
+Goal
+Land WMMA_I8 routed-MoE prefill backed by a per-prefill-batch lazy repack of
+active experts (IQ2_XXS gate/up + Q2_K down -> Q8_0-shaped int8+fp16scale
+in scratch). Reuse activation microquant from tsk-25.
+
+Motivation
+- Routed MoE is the dominant slice of prefill compute and currently runs the
+  wave-per-row IQ2/Q2 kernels designed for decode (188 GiB/s = DRAM ceiling),
+  which leaves ALU on the table at higher n_tok where weights amortize.
+- WMMA_I8 prefill on Q8_0-shaped weights gave 1.6-3.6x in the dense matmul
+  microbench (tsk-25). MoE prefill should see similar lever.
+- Eager full-pool repack to int8 inflates ~26 GB IQ2/Q2 -> ~188 GB Q8_0,
+  doesn't fit in 96 GB UMA. Per-prefill-batch lazy repack of active experts
+  fits (peak ~300 MB/layer step at production dims).
+
+Key risk
+EM (expert-major) layout reorg lost at n_tokens=21 (29.7->26.3 t/s) per the
+in-source note at ds4_rocm.c:6238-6249. If the underlying limiter at 21 tokens
+is launch overhead or scheduling, WMMA_I8 won't help either. Need a
+microbench-driven proof before committing the full pipeline.
+
+Plan
+Stage 1 (proof): repack kernels + microbench measuring
+  (a) repack throughput per expert (target: <1 ms/expert at production dims)
+  (b) wave-per-row IQ2_XXS gate_up matvec at n_tok=21
+  (c) WMMA_I8 gate_up matvec at n_tok=21 from pre-repacked Q8_0 scratch
+  Project total cost (repack + WMMA) vs (b). Decision gate: >=20% savings
+  at n_tok=21 to proceed with Stage 2.
+Stage 2: wire repack + WMMA_I8 into rocm_moe_run behind DS4_ROCM_MOE_WMMA=1.
+  Reuse rocm_moe_group_pairs_kernel + g_moe_em_scratch_d. Add a parallel
+  scratch slab for repacked Q8_0 weights.
+Stage 3: kernel tests + end-to-end coherence + benchmark; set default if
+  positive at canonical prompt size.
+
+Validation
+- ./ds4_rocm_kernel_test must end with OK (40 tests + new repack tests).
+- ./ds4 --backend rocm -p "Briefly explain..." -n 200 --temp 0 --seed 42
+  must produce coherent multi-paragraph thinking-mode reply.
+- Capture prefill/decode t/s before and after each commit.
+
+Files
+- ds4_rocm.c: new repack kernels (~5300), new WMMA_I8 MoE kernels (~5800),
+  dispatcher mod (~6240).
+- tests/ds4_rocm_moe_repack_bench.c (new): Stage 1 microbench.
+- tests/ds4_rocm_kernel_test.c: repack roundtrip oracle.
+- Makefile: new bench target.
+
+Related
+tsk-25 (microquant + WMMA_I8), tsk-26 (WMMA F16 dense), tsk-21 (wave-per-row
+MoE done), tsk-24 (EM path notes).

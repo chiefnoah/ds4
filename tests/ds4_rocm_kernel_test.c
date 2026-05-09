@@ -1626,6 +1626,121 @@ int main(void) {
         free(model);
     }
 
+    STEP("routed_moe_one with registered model map (zero-copy path)");
+    {
+        const uint32_t in_dim = 256;
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 2;
+        const uint32_t n_total = 256;
+        const float clamp = 2.5f;
+        const uint64_t gate_row_bytes = sizeof(moe_block_iq2_xxs);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        /* Page-align so hipHostRegister is happy. */
+        const size_t page = 4096;
+        const size_t model_alloc = (model_size + page - 1) & ~(page - 1);
+        void *model_raw = NULL;
+        require(posix_memalign(&model_raw, page, model_alloc) == 0,
+                "moe registered model alloc");
+        uint8_t *model = (uint8_t *)model_raw;
+        memset(model, 0, model_alloc);
+
+        moe_block_iq2_xxs *gate_pool_p = (moe_block_iq2_xxs *)(model + 0);
+        moe_block_iq2_xxs *up_pool_p   = (moe_block_iq2_xxs *)(model + gate_pool);
+        moe_block_q2_K    *down_pool_p = (moe_block_q2_K    *)(model + gate_pool + gate_pool);
+
+        const int32_t selected_vals[2] = { 11, 250 };
+        const float weights_vals[2] = { 0.55f, 0.45f };
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                moe_build_iq2xxs_block(&gate_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 2003u + r * 17u);
+                moe_build_iq2xxs_block(&up_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 2011u + r * 19u);
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                moe_build_q2_K_block(&down_pool_p[(uint64_t)e * out_dim + r],
+                                     (uint32_t)e * 2017u + r * 23u);
+            }
+        }
+
+        require(ds4_metal_set_model_map_range(model, model_alloc, 0, model_alloc),
+                "register synthetic model map");
+
+        float xv[256];
+        for (uint32_t i = 0; i < 256; i++) xv[i] = 0.018f * (float)((int)(i % 17) - 8);
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc(sizeof(selected_vals));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc(sizeof(weights_vals));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "moe registered tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, sizeof(xv)), "moe reg x write");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, sizeof(selected_vals)), "moe reg sel write");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, sizeof(weights_vals)), "moe reg wts write");
+
+        require(ds4_metal_routed_moe_one_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                 model, model_alloc,
+                                                 0, gate_pool, gate_pool + gate_pool,
+                                                 16u, 10u,
+                                                 gate_expert_bytes, gate_row_bytes,
+                                                 down_expert_bytes, down_row_bytes,
+                                                 in_dim, mid_dim, out_dim,
+                                                 tsel, twts, n_used, clamp, tx),
+                "routed_moe_one registered");
+
+        float ref_mid[2 * 256];
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = selected_vals[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                float gate_v = moe_iq2xxs_dot_block_cpu(&gate_pool_p[(uint64_t)e * mid_dim + r], xv);
+                float up_v   = moe_iq2xxs_dot_block_cpu(&up_pool_p[(uint64_t)e * mid_dim + r], xv);
+                if (gate_v > clamp) gate_v = clamp;
+                if (up_v > clamp) up_v = clamp;
+                if (up_v < -clamp) up_v = -clamp;
+                const float silu = gate_v / (1.0f + expf(-gate_v));
+                ref_mid[s * mid_dim + r] = silu * up_v * weights_vals[s];
+            }
+        }
+        float got_mid[2 * 256];
+        read_tensor(tmid, got_mid, n_used * mid_dim);
+        for (uint32_t i = 0; i < n_used * mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 1e-4f), "routed_moe_one registered mid value");
+        }
+
+        float ref_out[256] = {0};
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t s = 0; s < n_used; s++) {
+                const int32_t e = selected_vals[s];
+                acc += moe_q2_K_dot_block_cpu(&down_pool_p[(uint64_t)e * out_dim + r],
+                                              ref_mid + (uint64_t)s * mid_dim);
+            }
+            ref_out[r] = acc;
+        }
+        float got_out[256];
+        read_tensor(tout_moe, got_out, out_dim);
+        for (uint32_t i = 0; i < out_dim; i++) {
+            require(nearf(got_out[i], ref_out[i], 1e-3f), "routed_moe_one registered out value");
+        }
+
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        /* `model` is intentionally leaked: ds4_metal_cleanup() runs after this
+         * step and unregisters it; freeing it here would unpin live device
+         * mappings.  The test exits right after cleanup so the OS reclaims. */
+    }
+
     STEP("cleanup");
     ds4_metal_tensor_free(tnorm);
     ds4_metal_tensor_free(thc_out);

@@ -28,6 +28,19 @@ static bool g_quality;
 static uint64_t g_live_bytes;
 static uint64_t g_peak_bytes;
 
+/* Registered model-map regions.  Each entry pins a model file's mmap'd tensor
+ * data so the GPU can read directly from it without a per-call upload.  On a
+ * Strix Halo APU the registered host pages are the same physical memory the
+ * iGPU sees, so reads cost nothing extra at the device side. */
+#define DS4_ROCM_MAX_REGISTRATIONS 4
+typedef struct {
+    const uint8_t *host_base;
+    uint8_t       *dev_base;
+    uint64_t       size;
+} rocm_registration;
+static rocm_registration g_registrations[DS4_ROCM_MAX_REGISTRATIONS];
+static int               g_registration_count;
+
 int ds4_metal_rms_norm_plain_rows_tensor(ds4_metal_tensor *out,
                                           const ds4_metal_tensor *x,
                                           uint32_t n,
@@ -147,6 +160,27 @@ static __device__ float rocm_e4m3fn_dequant(float x) {
     return sign * rocm_e4m3fn_value(best);
 }
 
+/* Returns the registered device pointer for a host range if it lies inside a
+ * pinned model-map registration; otherwise NULL.  A NULL return is the signal
+ * to fall back to a temporary mapped upload. */
+static uint8_t *rocm_registered_devptr(const void *host, uint64_t bytes) {
+    if (!host || bytes == 0) return NULL;
+    const uint8_t *h = (const uint8_t *)host;
+    for (int i = 0; i < g_registration_count; i++) {
+        const rocm_registration *r = &g_registrations[i];
+        if (h >= r->host_base && (uint64_t)(h - r->host_base) <= r->size &&
+            bytes <= r->size - (uint64_t)(h - r->host_base)) {
+            return r->dev_base + (uint64_t)(h - r->host_base);
+        }
+    }
+    return NULL;
+}
+
+/* Resolve src to a device pointer.  If src lies in a registered model-map
+ * region, *host_out stays NULL (no allocation) and the caller must skip
+ * hipHostFree.  Otherwise allocates a pinned mapped buffer, copies src into
+ * it, and returns the device pointer.  Callers are expected to NULL-check
+ * *host_out before freeing. */
 static int rocm_upload_mapped(const void *src,
                               uint64_t bytes,
                               void **host_out,
@@ -155,6 +189,11 @@ static int rocm_upload_mapped(const void *src,
     *host_out = NULL;
     *dev_out = NULL;
     if (bytes == 0) return 0;
+    uint8_t *registered = rocm_registered_devptr(src, bytes);
+    if (registered) {
+        *dev_out = registered;
+        return 1;
+    }
     if (!rocm_ok(hipHostMalloc(host_out, (size_t)bytes, hipHostMallocMapped), what)) {
         return 0;
     }
@@ -181,17 +220,24 @@ __global__ static void rocm_embed_token_hc_kernel(float *out,
 }
 
 __global__ static void rocm_embed_tokens_hc_kernel(float *out,
-                                                   const uint16_t *rows,
+                                                   const uint16_t *table,
+                                                   const int32_t *tokens,
                                                    uint32_t n_tokens,
                                                    uint32_t n_embd,
-                                                   uint32_t n_hc) {
+                                                   uint32_t n_hc,
+                                                   uint32_t n_vocab) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t total = (uint64_t)n_tokens * n_hc * n_embd;
     if (idx >= total) return;
     const uint32_t embd = (uint32_t)(idx % n_embd);
     const uint64_t token_pos = idx / ((uint64_t)n_hc * n_embd);
+    const int32_t tok = tokens[token_pos];
+    if (tok < 0 || (uint32_t)tok >= n_vocab) {
+        out[idx] = 0.0f;
+        return;
+    }
     __half_raw h;
-    h.x = rows[token_pos * n_embd + embd];
+    h.x = table[(uint64_t)tok * n_embd + embd];
     out[idx] = __half2float(h);
 }
 
@@ -558,6 +604,13 @@ int ds4_metal_init(void) {
 void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)hipDeviceSynchronize();
+    for (int i = 0; i < g_registration_count; i++) {
+        (void)hipHostUnregister((void *)g_registrations[i].host_base);
+        g_registrations[i].host_base = NULL;
+        g_registrations[i].dev_base = NULL;
+        g_registrations[i].size = 0;
+    }
+    g_registration_count = 0;
     g_initialized = 0;
     g_batch_open = 0;
     g_live_bytes = 0;
@@ -727,18 +780,51 @@ int ds4_metal_synchronize(void) {
     return rocm_ok(hipDeviceSynchronize(), "synchronize");
 }
 
+int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
+                                  uint64_t map_offset, uint64_t map_size);
+
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
-    (void)model_map;
-    (void)model_size;
-    return 1;
+    return ds4_metal_set_model_map_range(model_map, model_size, 0, model_size);
 }
 
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
                                   uint64_t map_offset, uint64_t map_size) {
-    (void)model_map;
-    (void)model_size;
-    (void)map_offset;
-    (void)map_size;
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!model_map || map_size == 0) return 0;
+    if (map_offset > model_size || map_size > model_size - map_offset) return 0;
+    if (g_registration_count >= DS4_ROCM_MAX_REGISTRATIONS) {
+        fprintf(stderr, "ds4: ROCm registration table full (max %d)\n",
+                DS4_ROCM_MAX_REGISTRATIONS);
+        return 0;
+    }
+    /* Avoid double-registering the same range. */
+    uint8_t *base = (uint8_t *)((uintptr_t)model_map + (uintptr_t)map_offset);
+    for (int i = 0; i < g_registration_count; i++) {
+        if (g_registrations[i].host_base == base &&
+            g_registrations[i].size == map_size) {
+            return 1;
+        }
+    }
+    if (!rocm_ok(hipHostRegister(base, (size_t)map_size, hipHostRegisterMapped),
+                 "model map registration")) {
+        return 0;
+    }
+    void *dev_base = NULL;
+    if (!rocm_ok(hipHostGetDevicePointer(&dev_base, base, 0),
+                 "model map device pointer")) {
+        (void)hipHostUnregister(base);
+        return 0;
+    }
+    rocm_registration *r = &g_registrations[g_registration_count++];
+    r->host_base = base;
+    r->dev_base  = (uint8_t *)dev_base;
+    r->size      = map_size;
+    if (rocm_trace()) {
+        fprintf(stderr,
+                "ds4: ROCm registered model map host=%p dev=%p bytes=%llu\n",
+                (const void *)base, (const void *)dev_base,
+                (unsigned long long)map_size);
+    }
     return 1;
 }
 
@@ -771,37 +857,24 @@ int ds4_metal_embed_token_hc_tensor(
     const uint64_t weight_bytes = (uint64_t)n_vocab * row_bytes;
     if (out_hc->bytes < out_bytes || weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
 
-    uint16_t *row_host = NULL;
-    uint16_t *row_dev = NULL;
-    if (!rocm_ok(hipHostMalloc(&row_host, (size_t)row_bytes, hipHostMallocMapped),
-                 "embedding row allocation")) {
-        return 0;
-    }
-    if (!rocm_ok(hipHostGetDevicePointer((void **)&row_dev, row_host, 0),
-                 "embedding row device pointer")) {
-        (void)hipHostFree(row_host);
-        return 0;
-    }
     const uint8_t *src = (const uint8_t *)model_map + weight_offset + (uint64_t)token * row_bytes;
-    memcpy(row_host, src, (size_t)row_bytes);
-    int ok = 1;
-    if (ok) {
-        const uint64_t total = (uint64_t)n_embd * n_hc;
-        const dim3 block(256);
-        const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
-        hipLaunchKernelGGL(rocm_embed_token_hc_kernel,
-                           grid,
-                           block,
-                           0,
-                           0,
-                           (float *)tensor_u8(out_hc),
-                           row_dev,
-                           n_embd,
-                           n_hc);
-        ok = rocm_ok(hipGetLastError(), "embed token launch") &&
+    void *row_host = NULL, *row_dev = NULL;
+    if (!rocm_upload_mapped(src, row_bytes, &row_host, &row_dev, "embed token row")) return 0;
+    const uint64_t total = (uint64_t)n_embd * n_hc;
+    const dim3 block(256);
+    const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
+    hipLaunchKernelGGL(rocm_embed_token_hc_kernel,
+                       grid,
+                       block,
+                       0,
+                       0,
+                       (float *)tensor_u8(out_hc),
+                       (const uint16_t *)row_dev,
+                       n_embd,
+                       n_hc);
+    int ok = rocm_ok(hipGetLastError(), "embed token launch") &&
              rocm_ok(hipDeviceSynchronize(), "embed token completion");
-    }
-    (void)hipHostFree(row_host);
+    if (row_host) (void)hipHostFree(row_host);
     return ok;
 }
 
@@ -820,60 +893,32 @@ int ds4_metal_embed_tokens_hc_tensor(
     const uint64_t out_bytes = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
     const uint64_t token_bytes = (uint64_t)n_tokens * sizeof(int32_t);
     const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
-    const uint64_t rows_bytes = (uint64_t)n_tokens * row_bytes;
     const uint64_t weight_bytes = (uint64_t)n_vocab * row_bytes;
     if (out_hc->bytes < out_bytes || tokens->bytes < token_bytes ||
         weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
 
-    int32_t *host_tokens = (int32_t *)malloc((size_t)token_bytes);
-    uint16_t *host_rows = NULL;
-    uint16_t *rows_dev = NULL;
-    if (!rocm_ok(hipHostMalloc(&host_rows, (size_t)rows_bytes, hipHostMallocMapped),
-                 "embedding rows allocation")) {
-        free(host_tokens);
-        return 0;
-    }
-    if (!rocm_ok(hipHostGetDevicePointer((void **)&rows_dev, host_rows, 0),
-                 "embedding rows device pointer")) {
-        (void)hipHostFree(host_rows);
-        free(host_tokens);
-        return 0;
-    }
-    if (!host_tokens || !host_rows) {
-        free(host_tokens);
-        if (host_rows) (void)hipHostFree(host_rows);
-        return 0;
-    }
-    int ok = ds4_metal_tensor_read(tokens, 0, host_tokens, token_bytes);
     const uint8_t *weights = (const uint8_t *)model_map + weight_offset;
-    for (uint32_t i = 0; ok && i < n_tokens; i++) {
-        if (host_tokens[i] < 0 || (uint32_t)host_tokens[i] >= n_vocab) {
-            ok = 0;
-            break;
-        }
-        memcpy(host_rows + (uint64_t)i * n_embd,
-               weights + (uint64_t)(uint32_t)host_tokens[i] * row_bytes,
-               (size_t)row_bytes);
-    }
-    if (ok) {
-        const uint64_t total = (uint64_t)n_tokens * n_hc * n_embd;
-        const dim3 block(256);
-        const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
-        hipLaunchKernelGGL(rocm_embed_tokens_hc_kernel,
-                           grid,
-                           block,
-                           0,
-                           0,
-                           (float *)tensor_u8(out_hc),
-                           rows_dev,
-                           n_tokens,
-                           n_embd,
-                           n_hc);
-        ok = rocm_ok(hipGetLastError(), "embed tokens launch") &&
+    void *table_host = NULL, *table_dev = NULL;
+    if (!rocm_upload_mapped(weights, weight_bytes, &table_host, &table_dev,
+                            "embed tokens table")) return 0;
+    const uint64_t total = (uint64_t)n_tokens * n_hc * n_embd;
+    const dim3 block(256);
+    const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
+    hipLaunchKernelGGL(rocm_embed_tokens_hc_kernel,
+                       grid,
+                       block,
+                       0,
+                       0,
+                       (float *)tensor_u8(out_hc),
+                       (const uint16_t *)table_dev,
+                       (const int32_t *)tensor_u8_const(tokens),
+                       n_tokens,
+                       n_embd,
+                       n_hc,
+                       n_vocab);
+    int ok = rocm_ok(hipGetLastError(), "embed tokens launch") &&
              rocm_ok(hipDeviceSynchronize(), "embed tokens completion");
-    }
-    if (host_rows) (void)hipHostFree(host_rows);
-    free(host_tokens);
+    if (table_host) (void)hipHostFree(table_host);
     return ok;
 }
 
@@ -1036,7 +1081,7 @@ int ds4_metal_matmul_f16_tensor(
                        out_dim);
     int ok = rocm_ok(hipGetLastError(), "F16 matmul launch") &&
              rocm_ok(hipDeviceSynchronize(), "F16 matmul completion");
-    (void)hipHostFree(w_host);
+    if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
 
@@ -1097,7 +1142,7 @@ int ds4_metal_matmul_f32_tensor(
                        out_dim);
     int ok = rocm_ok(hipGetLastError(), "F32 matmul launch") &&
              rocm_ok(hipDeviceSynchronize(), "F32 matmul completion");
-    (void)hipHostFree(w_host);
+    if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
 
@@ -1141,7 +1186,7 @@ int ds4_metal_matmul_q8_0_tensor(
                        row_bytes);
     int ok = rocm_ok(hipGetLastError(), "Q8_0 matmul launch") &&
              rocm_ok(hipDeviceSynchronize(), "Q8_0 matmul completion");
-    (void)hipHostFree(w_host);
+    if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
 
@@ -1196,7 +1241,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
                        eps);
     int ok = rocm_ok(hipGetLastError(), "weighted RMS norm launch") &&
              rocm_ok(hipDeviceSynchronize(), "weighted RMS norm completion");
-    (void)hipHostFree(w_host);
+    if (w_host) (void)hipHostFree(w_host);
     return ok;
 }
 
@@ -1320,9 +1365,9 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
                        norm_eps);
     ok = rocm_ok(hipGetLastError(), "HC split/sum/norm launch") &&
          rocm_ok(hipDeviceSynchronize(), "HC split/sum/norm completion");
-    (void)hipHostFree(scale_host);
-    (void)hipHostFree(base_host);
-    (void)hipHostFree(norm_host);
+    if (scale_host) (void)hipHostFree(scale_host);
+    if (base_host) (void)hipHostFree(base_host);
+    if (norm_host) (void)hipHostFree(norm_host);
     return ok;
 }
 
@@ -1587,8 +1632,8 @@ int ds4_metal_hc_split_sinkhorn_tensor(
                        n_hc, sinkhorn_iters, eps, (uint32_t)rows, (uint32_t)mix_hc);
     ok = rocm_ok(hipGetLastError(), "HC sinkhorn launch") &&
          rocm_ok(hipDeviceSynchronize(), "HC sinkhorn completion");
-    (void)hipHostFree(sh);
-    (void)hipHostFree(bh);
+    if (sh) (void)hipHostFree(sh);
+    if (bh) (void)hipHostFree(bh);
     return ok;
 }
 
@@ -1664,7 +1709,8 @@ int ds4_metal_output_hc_weights_tensor(
                        n_hc, (uint32_t)rows, eps);
     ok = rocm_ok(hipGetLastError(), "output_hc launch") &&
          rocm_ok(hipDeviceSynchronize(), "output_hc completion");
-    (void)hipHostFree(sh); (void)hipHostFree(bh);
+    if (sh) (void)hipHostFree(sh);
+    if (bh) (void)hipHostFree(bh);
     return ok;
 }
 
@@ -2582,7 +2628,7 @@ int ds4_metal_compressor_store_batch_tensor(
                        width, ratio, coff, pos0, n_tokens);
     int ok = rocm_ok(hipGetLastError(), "compressor store batch launch") &&
              rocm_ok(hipDeviceSynchronize(), "compressor store batch completion");
-    (void)hipHostFree(ape_h);
+    if (ape_h) (void)hipHostFree(ape_h);
     return ok;
 }
 
@@ -2921,7 +2967,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
                        width, pos0);
     int ok = rocm_ok(hipGetLastError(), "compressor ratio4 state launch") &&
              rocm_ok(hipDeviceSynchronize(), "compressor ratio4 state completion");
-    (void)hipHostFree(ape_h);
+    if (ape_h) (void)hipHostFree(ape_h);
     return ok;
 }
 
@@ -3113,7 +3159,7 @@ int ds4_metal_attention_decode_heads_tensor(
                        n_head, head_dim, n_raw, raw_cap, raw_start, n_comp, use_mask);
     int ok = rocm_ok(hipGetLastError(), "attn decode heads launch") &&
              rocm_ok(hipDeviceSynchronize(), "attn decode heads completion");
-    (void)hipHostFree(sink_h);
+    if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
 
@@ -3222,7 +3268,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
                        n_tokens, window, n_head, head_dim);
     int ok = rocm_ok(hipGetLastError(), "attn prefill raw launch") &&
              rocm_ok(hipDeviceSynchronize(), "attn prefill raw completion");
-    (void)hipHostFree(sink_h);
+    if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
 
@@ -3421,7 +3467,7 @@ static int rocm_attn_batch_dispatch(
     char done_msg[64];
     snprintf(done_msg, sizeof(done_msg), "attn batch %s completion", what);
     int ok = rocm_ok(hipGetLastError(), launch_msg) && rocm_ok(hipDeviceSynchronize(), done_msg);
-    (void)hipHostFree(sink_h);
+    if (sink_h) (void)hipHostFree(sink_h);
     return ok;
 }
 
@@ -3843,14 +3889,15 @@ __device__ __forceinline__ static float rocm_silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
-/* Pre-packed: experts uploaded as n_used contiguous slabs in slot order.  The
- * kernel reads slot s from gate_pack + s*expert_bytes (ignoring selected[]
- * for the pointer math) but still uses weights[t*n_used + s]. */
+/* The kernel reads experts directly from the full model-map pool, indexed by
+ * selected[t*n_used + s].  When the model map is registered (production path)
+ * the pool pointer comes for free; for tests we upload the whole pool once
+ * via rocm_upload_mapped. */
 
 __global__ static void rocm_moe_gate_up_matvec_kernel(
         float *mid,                    /* [n_tokens * n_used * mid_dim]   */
-        const uint8_t *gate_pack,      /* [n_tokens * n_used * gate_expert_bytes] */
-        const uint8_t *up_pack,        /* [n_tokens * n_used * up_expert_bytes]   */
+        const uint8_t *gate_pool,      /* full [n_total_experts * gate_expert_bytes] */
+        const uint8_t *up_pool,        /* full [n_total_experts * up_expert_bytes]   */
         uint32_t gate_type,
         uint32_t up_type,
         uint64_t gate_expert_bytes,
@@ -3858,23 +3905,30 @@ __global__ static void rocm_moe_gate_up_matvec_kernel(
         uint64_t up_expert_bytes,
         uint64_t up_row_bytes,
         const float *x,                /* [n_tokens * in_dim]             */
+        const int32_t *selected,       /* [n_tokens * n_used]             */
         const float *weights,          /* [n_tokens * n_used]             */
         uint32_t in_dim,
         uint32_t mid_dim,
         uint32_t n_used,
         uint32_t n_tokens,
+        uint32_t n_total_experts,
         float clamp) {
     const uint32_t slot   = blockIdx.x;
     const uint32_t row    = blockIdx.y * blockDim.x + threadIdx.x;
     const uint32_t token  = blockIdx.z;
     if (slot >= n_used || row >= mid_dim || token >= n_tokens) return;
 
+    const int32_t e = selected[(uint64_t)token * n_used + slot];
+    if (e < 0 || (uint32_t)e >= n_total_experts) {
+        mid[((uint64_t)token * n_used + slot) * mid_dim + row] = 0.0f;
+        return;
+    }
+
     const uint32_t nb = in_dim / DS4_QK_K;
     const uint32_t gate_bb = rocm_quant_block_bytes(gate_type);
     const uint32_t up_bb   = rocm_quant_block_bytes(up_type);
-    const uint64_t pack_idx = (uint64_t)token * n_used + slot;
-    const uint8_t *gate_row_p = gate_pack + pack_idx * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-    const uint8_t *up_row_p   = up_pack   + pack_idx * up_expert_bytes   + (uint64_t)row * up_row_bytes;
+    const uint8_t *gate_row_p = gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const uint8_t *up_row_p   = up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)row * up_row_bytes;
     const float *xp = x + (uint64_t)token * in_dim;
 
     float gate_v = 0.0f, up_v = 0.0f;
@@ -3896,15 +3950,17 @@ __global__ static void rocm_moe_gate_up_matvec_kernel(
 
 __global__ static void rocm_moe_down_matvec_kernel(
         float *out,                    /* [n_tokens * out_dim]            */
-        const uint8_t *down_pack,      /* [n_tokens * n_used * down_expert_bytes] */
+        const uint8_t *down_pool,      /* full [n_total_experts * down_expert_bytes] */
         uint32_t down_type,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         const float *mid,              /* [n_tokens * n_used * mid_dim]   */
+        const int32_t *selected,       /* [n_tokens * n_used]             */
         uint32_t mid_dim,
         uint32_t out_dim,
         uint32_t n_used,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t n_total_experts) {
     const uint32_t row   = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t token = blockIdx.y;
     if (row >= out_dim || token >= n_tokens) return;
@@ -3914,9 +3970,10 @@ __global__ static void rocm_moe_down_matvec_kernel(
 
     float acc = 0.0f;
     for (uint32_t s = 0; s < n_used; s++) {
-        const uint64_t pack_idx = (uint64_t)token * n_used + s;
-        const uint8_t *down_row_p = down_pack + pack_idx * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const float *mid_p = mid + pack_idx * mid_dim;
+        const int32_t e = selected[(uint64_t)token * n_used + s];
+        if (e < 0 || (uint32_t)e >= n_total_experts) continue;
+        const uint8_t *down_row_p = down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const float *mid_p = mid + ((uint64_t)token * n_used + s) * mid_dim;
         float dot = 0.0f;
         for (uint32_t b = 0; b < nb; b++) {
             dot += rocm_quant_dot_block(down_type, down_row_p + (uint64_t)b * down_bb, mid_p);
@@ -3925,38 +3982,6 @@ __global__ static void rocm_moe_down_matvec_kernel(
         acc += dot;
     }
     out[(uint64_t)token * out_dim + row] = acc;
-}
-
-/* Host helper: pack n_used per-token expert weight slabs from the model map
- * into a contiguous device-mappable buffer.  selected_host points at host-
- * readable int32_t indices; result is malloc'd and must be freed by caller. */
-static int rocm_moe_pack_experts(
-        const void *model_map,
-        uint64_t model_offset,
-        uint64_t expert_bytes,
-        uint64_t total_experts,
-        const int32_t *selected_host,
-        uint32_t n_used,
-        uint32_t n_tokens,
-        void **out_buf) {
-    const uint64_t pack_bytes = (uint64_t)n_tokens * n_used * expert_bytes;
-    uint8_t *buf = (uint8_t *)malloc((size_t)pack_bytes);
-    if (!buf) return 0;
-    const uint8_t *src_base = (const uint8_t *)model_map + model_offset;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t s = 0; s < n_used; s++) {
-            const int32_t e = selected_host[(uint64_t)t * n_used + s];
-            if (e < 0 || (uint64_t)e >= total_experts) {
-                free(buf);
-                return 0;
-            }
-            memcpy(buf + ((uint64_t)t * n_used + s) * expert_bytes,
-                   src_base + (uint64_t)e * expert_bytes,
-                   (size_t)expert_bytes);
-        }
-    }
-    *out_buf = buf;
-    return 1;
 }
 
 static int rocm_moe_run(
@@ -4012,33 +4037,17 @@ static int rocm_moe_run(
     if (selected->bytes < (uint64_t)n_tokens * n_used * sizeof(int32_t)) return 0;
     if (weights->bytes < (uint64_t)n_tokens * n_used * sizeof(float)) return 0;
 
-    const int32_t *sel_host = (const int32_t *)tensor_host_u8_const(selected);
-
-    void *gate_pack = NULL, *up_pack = NULL, *down_pack = NULL;
-    if (!rocm_moe_pack_experts(model_map, gate_offset, gate_expert_bytes, total_experts,
-                               sel_host, n_used, n_tokens, &gate_pack)) return 0;
-    if (!rocm_moe_pack_experts(model_map, up_offset, up_expert_bytes, total_experts,
-                               sel_host, n_used, n_tokens, &up_pack)) {
-        free(gate_pack); return 0;
-    }
-    if (!rocm_moe_pack_experts(model_map, down_offset, down_expert_bytes, total_experts,
-                               sel_host, n_used, n_tokens, &down_pack)) {
-        free(gate_pack); free(up_pack); return 0;
-    }
-
-    void *gate_h = NULL, *gate_d = NULL;
-    void *up_h = NULL, *up_d = NULL;
-    void *down_h = NULL, *down_d = NULL;
-    const uint64_t gate_bytes = (uint64_t)n_tokens * n_used * gate_expert_bytes;
-    const uint64_t up_bytes   = (uint64_t)n_tokens * n_used * up_expert_bytes;
-    const uint64_t down_bytes = (uint64_t)n_tokens * n_used * down_expert_bytes;
-    int ok = rocm_upload_mapped(gate_pack, gate_bytes, &gate_h, &gate_d, "moe gate pack upload") &&
-             rocm_upload_mapped(up_pack,   up_bytes,   &up_h,   &up_d,   "moe up pack upload")   &&
-             rocm_upload_mapped(down_pack, down_bytes, &down_h, &down_d, "moe down pack upload");
-
-    free(gate_pack);
-    free(up_pack);
-    free(down_pack);
+    /* Resolve each pool to a device pointer.  Hits the registered model-map
+     * fast path on production runs; falls back to a one-shot pinned upload
+     * (e.g. in tests) per pool.  No per-call packing or per-token copies. */
+    void *gate_h = NULL, *up_h = NULL, *down_h = NULL;
+    void *gate_d = NULL, *up_d = NULL, *down_d = NULL;
+    int ok = rocm_upload_mapped((const uint8_t *)model_map + gate_offset, gate_pool,
+                                &gate_h, &gate_d, "moe gate pool")
+          && rocm_upload_mapped((const uint8_t *)model_map + up_offset, up_pool,
+                                &up_h, &up_d, "moe up pool")
+          && rocm_upload_mapped((const uint8_t *)model_map + down_offset, down_pool,
+                                &down_h, &down_d, "moe down pool");
     if (!ok) {
         if (gate_h) (void)hipHostFree(gate_h);
         if (up_h)   (void)hipHostFree(up_h);
@@ -4059,8 +4068,10 @@ static int rocm_moe_run(
                            gate_expert_bytes, gate_row_bytes,
                            up_expert_bytes, up_row_bytes,
                            (const float *)tensor_u8_const(x),
+                           (const int32_t *)tensor_u8_const(selected),
                            (const float *)tensor_u8_const(weights),
-                           expert_in_dim, expert_mid_dim, n_used, n_tokens, clamp);
+                           expert_in_dim, expert_mid_dim, n_used, n_tokens,
+                           (uint32_t)total_experts, clamp);
     }
     ok = rocm_ok(hipGetLastError(), "moe gate_up launch") &&
          rocm_ok(hipDeviceSynchronize(), "moe gate_up completion");
@@ -4076,14 +4087,16 @@ static int rocm_moe_run(
                            down_type,
                            down_expert_bytes, down_row_bytes,
                            (const float *)tensor_u8_const(mid),
-                           expert_mid_dim, out_dim, n_used, n_tokens);
+                           (const int32_t *)tensor_u8_const(selected),
+                           expert_mid_dim, out_dim, n_used, n_tokens,
+                           (uint32_t)total_experts);
         ok = rocm_ok(hipGetLastError(), "moe down launch") &&
              rocm_ok(hipDeviceSynchronize(), "moe down completion");
     }
 
-    (void)hipHostFree(gate_h);
-    (void)hipHostFree(up_h);
-    (void)hipHostFree(down_h);
+    if (gate_h) (void)hipHostFree(gate_h);
+    if (up_h)   (void)hipHostFree(up_h);
+    if (down_h) (void)hipHostFree(down_h);
     return ok;
 }
 

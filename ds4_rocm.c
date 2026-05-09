@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -28,15 +31,25 @@ static bool g_quality;
 static uint64_t g_live_bytes;
 static uint64_t g_peak_bytes;
 
-/* Registered model-map regions.  Each entry pins a model file's mmap'd tensor
- * data so the GPU can read directly from it without a per-call upload.  On a
- * Strix Halo APU the registered host pages are the same physical memory the
- * iGPU sees, so reads cost nothing extra at the device side. */
+/* Registered model-map regions.  Each entry mirrors a slice of the mmap'd
+ * model file into a device-resident buffer so kernels can dereference the
+ * registered device pointer without per-call uploads.
+ *
+ * Two registration modes:
+ *   - "host_pinned": host_owned is non-NULL.  hipHostRegister'd a slice of
+ *     the source mmap; dev_base aliases the same physical pages.  Used for
+ *     small synthetic test maps that fit in pinned host RAM.
+ *   - "device_copy": host_owned is NULL.  hipMalloc'd a separate device
+ *     allocation and hipMemcpy'd the source bytes in.  Used for production
+ *     models larger than physical host RAM (BIOS reserves most of the
+ *     APU's UMA for GPU use, leaving only ~30 GB host-pinnable). */
 #define DS4_ROCM_MAX_REGISTRATIONS 4
 typedef struct {
-    const uint8_t *host_base;
-    uint8_t       *dev_base;
+    const uint8_t *host_base;     /* Source pointer the kernels supply. */
+    uint8_t       *dev_base;      /* Device pointer to use instead. */
     uint64_t       size;
+    void          *host_owned;    /* Non-NULL when hipHostRegister'd. */
+    void          *dev_owned;     /* Non-NULL when hipMalloc'd a copy. */
 } rocm_registration;
 static rocm_registration g_registrations[DS4_ROCM_MAX_REGISTRATIONS];
 static int               g_registration_count;
@@ -465,7 +478,17 @@ __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
             }
             for (uint32_t j = 0; j < 4; j++) r[i][j] = r[i][j] / row_sum + eps;
         }
-        for (uint32_t iter = 0; iter < sinkhorn_iters; iter++) {
+        /* Match Metal kernel_dsv4_hc_split_weighted_sum_norm4: do one col-norm
+         * after the row-softmax-with-eps init, then (sinkhorn_iters - 1) more
+         * iterations of (row, col).  The fused-loop variant we used to have did
+         * an extra row-norm before the first col-norm, which silently diverged
+         * from Metal numerics across 43+ layers. */
+        for (uint32_t j = 0; j < 4; j++) {
+            float col_sum = eps;
+            for (uint32_t i = 0; i < 4; i++) col_sum += r[i][j];
+            for (uint32_t i = 0; i < 4; i++) r[i][j] /= col_sum;
+        }
+        for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
             for (uint32_t i = 0; i < 4; i++) {
                 float row_sum = eps;
                 for (uint32_t j = 0; j < 4; j++) row_sum += r[i][j];
@@ -605,10 +628,17 @@ void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)hipDeviceSynchronize();
     for (int i = 0; i < g_registration_count; i++) {
-        (void)hipHostUnregister((void *)g_registrations[i].host_base);
+        if (g_registrations[i].host_owned) {
+            (void)hipHostUnregister(g_registrations[i].host_owned);
+        }
+        if (g_registrations[i].dev_owned) {
+            (void)hipFree(g_registrations[i].dev_owned);
+        }
         g_registrations[i].host_base = NULL;
         g_registrations[i].dev_base = NULL;
         g_registrations[i].size = 0;
+        g_registrations[i].host_owned = NULL;
+        g_registrations[i].dev_owned = NULL;
     }
     g_registration_count = 0;
     g_initialized = 0;
@@ -783,6 +813,36 @@ int ds4_metal_synchronize(void) {
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
                                   uint64_t map_offset, uint64_t map_size);
 
+/* Walk /proc/self/maps to find the file backing a host pointer.  Returns the
+ * length of the path written to out (0 if no file-backed mapping covers
+ * addr).  Used to recover the source GGUF path so we can pread() it at full
+ * disk bandwidth instead of relying on synchronous mmap page faults. */
+static int rocm_resolve_mmap_path(const void *addr, char *out, size_t out_len) {
+    if (!out || out_len == 0) return 0;
+    out[0] = '\0';
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    const uintptr_t target = (uintptr_t)addr;
+    char line[4096];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo, hi;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+        if (target < lo || target >= hi) continue;
+        char *path = strchr(line, '/');
+        if (!path) break;
+        char *nl = strchr(path, '\n');
+        if (nl) *nl = '\0';
+        const size_t n = strlen(path);
+        if (n + 1 > out_len) break;
+        memcpy(out, path, n + 1);
+        found = (int)n;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_metal_set_model_map_range(model_map, model_size, 0, model_size);
 }
@@ -797,7 +857,6 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
                 DS4_ROCM_MAX_REGISTRATIONS);
         return 0;
     }
-    /* Avoid double-registering the same range. */
     uint8_t *base = (uint8_t *)((uintptr_t)model_map + (uintptr_t)map_offset);
     for (int i = 0; i < g_registration_count; i++) {
         if (g_registrations[i].host_base == base &&
@@ -805,24 +864,136 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size,
             return 1;
         }
     }
-    if (!rocm_ok(hipHostRegister(base, (size_t)map_size, hipHostRegisterMapped),
-                 "model map registration")) {
+    rocm_registration *r = &g_registrations[g_registration_count];
+
+    /* First try host pinning -- cheapest path, no device-side memcpy.  Caps
+     * out at the system memlock budget (Strix Halo BIOS reserves most of
+     * UMA for the iGPU, so only ~30 GB is host-pinnable in practice). */
+    if (hipHostRegister(base, (size_t)map_size, hipHostRegisterMapped) == hipSuccess) {
+        void *dev_base = NULL;
+        if (!rocm_ok(hipHostGetDevicePointer(&dev_base, base, 0),
+                     "model map device pointer")) {
+            (void)hipHostUnregister(base);
+            return 0;
+        }
+        r->host_base  = base;
+        r->dev_base   = (uint8_t *)dev_base;
+        r->size       = map_size;
+        r->host_owned = base;
+        r->dev_owned  = NULL;
+        g_registration_count++;
+        if (rocm_trace()) {
+            fprintf(stderr,
+                    "ds4: ROCm pinned model map host=%p dev=%p bytes=%llu\n",
+                    (const void *)base, (const void *)dev_base,
+                    (unsigned long long)map_size);
+        }
+        return 1;
+    }
+    (void)hipGetLastError();  /* Clear sticky error from the failed attempt. */
+
+    /* Fall back to a device-resident copy.  Allocates from the GPU's UMA
+     * partition (the 96 GB reserved by firmware), then streams the mmap'd
+     * file bytes in via hipMemcpy.  One-time cost at engine startup. */
+    void *dev_alloc = NULL;
+    if (!rocm_ok(hipMalloc(&dev_alloc, (size_t)map_size),
+                 "model map device allocation")) {
         return 0;
     }
-    void *dev_base = NULL;
-    if (!rocm_ok(hipHostGetDevicePointer(&dev_base, base, 0),
-                 "model map device pointer")) {
-        (void)hipHostUnregister(base);
-        return 0;
+    fprintf(stderr,
+            "ds4: ROCm copying %.2f GiB of model into device memory (one-time at startup)...\n",
+            (double)map_size / (1024.0 * 1024.0 * 1024.0));
+    /* Recover the underlying file path from /proc/self/maps so we can read
+     * with explicit pread().  hipMemcpy from the mmap'd source bottlenecks
+     * because each 4 KiB page faults synchronously before DMA starts; an
+     * explicit read() into a pinned staging buffer issues the disk reads
+     * at full NVMe bandwidth and overlaps with the device copy. */
+    char src_path[4096] = {0};
+    const int fd = rocm_resolve_mmap_path(base, src_path, sizeof(src_path)) > 0
+        ? open(src_path, O_RDONLY)
+        : -1;
+    /* Pinned staging buffer.  Sized to amortize per-call overhead; smaller
+     * is fine, larger is fine until host memlock budget is exhausted. */
+    const uint64_t stage_bytes = 256ull * 1024ull * 1024ull;
+    void *stage_host = NULL;
+    if (fd >= 0 && hipHostMalloc(&stage_host, (size_t)stage_bytes,
+                                 hipHostMallocDefault) != hipSuccess) {
+        stage_host = NULL;
     }
-    rocm_registration *r = &g_registrations[g_registration_count++];
-    r->host_base = base;
-    r->dev_base  = (uint8_t *)dev_base;
-    r->size      = map_size;
+    if (fd >= 0 && stage_host) {
+        /* Hint disk readahead while we DMA the previous chunk -- pipeline
+         * disk reads with device copies. */
+        (void)posix_fadvise(fd, 0, (off_t)map_size, POSIX_FADV_SEQUENTIAL);
+        (void)posix_fadvise(fd, 0, (off_t)map_size, POSIX_FADV_WILLNEED);
+        const off_t base_off = (off_t)((const uint8_t *)base -
+                                        (const uint8_t *)model_map);
+        for (uint64_t off = 0; off < map_size; off += stage_bytes) {
+            const uint64_t n = (map_size - off < stage_bytes) ? (map_size - off) : stage_bytes;
+            ssize_t got = pread(fd, stage_host, (size_t)n, base_off + (off_t)off);
+            if (got != (ssize_t)n) {
+                fprintf(stderr,
+                        "ds4: ROCm model read at offset %llu got %zd of %llu bytes\n",
+                        (unsigned long long)(base_off + off),
+                        got, (unsigned long long)n);
+                (void)hipHostFree(stage_host);
+                (void)close(fd);
+                (void)hipFree(dev_alloc);
+                return 0;
+            }
+            if (!rocm_ok(hipMemcpy((uint8_t *)dev_alloc + off,
+                                   stage_host, (size_t)n,
+                                   hipMemcpyHostToDevice),
+                         "model map staged copy")) {
+                (void)hipHostFree(stage_host);
+                (void)close(fd);
+                (void)hipFree(dev_alloc);
+                return 0;
+            }
+            if ((off + n) % (4ull * stage_bytes) == 0 || off + n == map_size) {
+                fprintf(stderr, "ds4: ROCm model copy %llu / %llu MiB\n",
+                        (unsigned long long)((off + n) >> 20),
+                        (unsigned long long)(map_size >> 20));
+            }
+        }
+        (void)hipHostFree(stage_host);
+        (void)close(fd);
+    } else {
+        /* Fallback: source mmap is the only thing we can read from.  Slower
+         * because each 4 KiB page faults synchronously before hipMemcpy DMAs
+         * it.  Used when /proc/self/maps lookup fails (e.g. test buffers
+         * that aren't backed by a file). */
+        if (fd >= 0) (void)close(fd);
+        if (stage_host) (void)hipHostFree(stage_host);
+        (void)madvise(base, (size_t)map_size, MADV_SEQUENTIAL);
+        (void)madvise(base, (size_t)map_size, MADV_WILLNEED);
+        const uint64_t chunk = 1ull * 1024ull * 1024ull * 1024ull;
+        for (uint64_t off = 0; off < map_size; off += chunk) {
+            const uint64_t n = (map_size - off < chunk) ? (map_size - off) : chunk;
+            if (!rocm_ok(hipMemcpy((uint8_t *)dev_alloc + off,
+                                   base + off, (size_t)n,
+                                   hipMemcpyHostToDevice),
+                         "model map device copy")) {
+                (void)hipFree(dev_alloc);
+                return 0;
+            }
+            if ((off + n) % (8ull * chunk) == 0 || off + n == map_size) {
+                fprintf(stderr, "ds4: ROCm model copy %llu / %llu MiB\n",
+                        (unsigned long long)((off + n) >> 20),
+                        (unsigned long long)(map_size >> 20));
+            }
+        }
+        (void)madvise(base, (size_t)map_size, MADV_DONTNEED);
+    }
+    r->host_base  = base;
+    r->dev_base   = (uint8_t *)dev_alloc;
+    r->size       = map_size;
+    r->host_owned = NULL;
+    r->dev_owned  = dev_alloc;
+    g_registration_count++;
     if (rocm_trace()) {
         fprintf(stderr,
-                "ds4: ROCm registered model map host=%p dev=%p bytes=%llu\n",
-                (const void *)base, (const void *)dev_base,
+                "ds4: ROCm device-mirrored model map host=%p dev=%p bytes=%llu\n",
+                (const void *)base, (const void *)dev_alloc,
                 (unsigned long long)map_size);
     }
     return 1;
@@ -850,6 +1021,7 @@ int ds4_metal_embed_token_hc_tensor(
         uint32_t          token,
         uint32_t          n_embd,
         uint32_t          n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_embed_token_hc_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !model_map || n_vocab == 0 || token >= n_vocab || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t out_bytes = (uint64_t)n_embd * n_hc * sizeof(float);
@@ -888,6 +1060,7 @@ int ds4_metal_embed_tokens_hc_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_embed_tokens_hc_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out_hc || !tokens || !model_map || n_vocab == 0 || n_tokens == 0 || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t out_bytes = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
@@ -927,6 +1100,7 @@ int ds4_metal_repeat_hc_tensor(
         const ds4_metal_tensor *row,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_repeat_hc_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !row || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
@@ -954,6 +1128,7 @@ int ds4_metal_rms_norm_plain_tensor(
         const ds4_metal_tensor *x,
         uint32_t                n,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_plain_tensor\n");
     return ds4_metal_rms_norm_plain_rows_tensor(out, x, n, 1, eps);
 }
 
@@ -963,6 +1138,7 @@ int ds4_metal_rms_norm_plain_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_plain_rows_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !x || n == 0 || rows == 0 || (n & 3u) != 0) return 0;
     const uint64_t bytes = (uint64_t)n * rows * sizeof(float);
@@ -992,6 +1168,7 @@ int ds4_metal_swiglu_tensor(
         uint32_t                n,
         float                   clamp,
         float                   weight) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_swiglu_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !gate || !up || n == 0) return 0;
     if (fabsf(clamp) > 1.0e-12f || fabsf(weight - 1.0f) > 1.0e-12f) {
@@ -1021,6 +1198,7 @@ int ds4_metal_add_tensor(
         const ds4_metal_tensor *a,
         const ds4_metal_tensor *b,
         uint32_t                n) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_add_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !a || !b || n == 0) return 0;
     const uint64_t bytes = (uint64_t)n * sizeof(float);
@@ -1050,6 +1228,7 @@ int ds4_metal_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1096,6 +1275,7 @@ int ds4_metal_matmul_f16_pair_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_pair_tensor\n");
     return ds4_metal_matmul_f16_tensor(out_a, model_map, model_size,
                                        weight_a_offset, in_dim, out_dim, x, n_tok) &&
            ds4_metal_matmul_f16_tensor(out_b, model_map, model_size,
@@ -1111,6 +1291,7 @@ int ds4_metal_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f32_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1155,6 +1336,7 @@ int ds4_metal_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *x,
         uint64_t                n_tok) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1198,6 +1380,7 @@ int ds4_metal_rms_norm_weight_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_weight_tensor\n");
     return ds4_metal_rms_norm_weight_rows_tensor(out, x, model_map, model_size,
                                                  weight_offset, n, 1, eps);
 }
@@ -1211,6 +1394,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_norm_weight_rows_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !x || !model_map || n == 0 || rows == 0 || (n & 3u) != 0) return 0;
     const uint64_t bytes = (uint64_t)n * rows * sizeof(float);
@@ -1258,6 +1442,7 @@ int ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_qkv_rms_norm_rows_tensor\n");
     return ds4_metal_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
                                                  q_weight_offset, q_n, rows, eps) &&
            ds4_metal_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
@@ -1270,6 +1455,7 @@ int ds4_metal_head_rms_norm_tensor(
         uint32_t          n_head,
         uint32_t          head_dim,
         float             eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_head_rms_norm_tensor\n");
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0) return 0;
     return ds4_metal_rms_norm_plain_rows_tensor(x, x, head_dim, n_tok * n_head, eps);
 }
@@ -1290,6 +1476,7 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_weighted_sum_norm_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
@@ -1386,6 +1573,7 @@ int ds4_metal_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rope_tail_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) {
         return 0;
@@ -1425,6 +1613,7 @@ int ds4_metal_dsv4_fp8_kv_quantize_tensor(
         uint32_t          n_tok,
         uint32_t          head_dim,
         uint32_t          n_rot) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_fp8_kv_quantize_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!x || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
     if (n_rot == head_dim) return 1;
@@ -1507,6 +1696,7 @@ int ds4_metal_hc_weighted_sum_tensor(
         const ds4_metal_tensor *weights,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_weighted_sum_tensor\n");
     return rocm_hc_weighted_sum_strided(out, residual_hc, weights, 0,
                                         (uint64_t)n_hc * sizeof(float),
                                         n_embd, n_hc, "HC weighted sum");
@@ -1518,6 +1708,7 @@ int ds4_metal_hc_weighted_sum_split_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_weighted_sum_split_tensor\n");
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     return rocm_hc_weighted_sum_strided(out, residual_hc, split, 0,
                                         mix_hc * sizeof(float),
@@ -1601,6 +1792,7 @@ int ds4_metal_hc_split_sinkhorn_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_sinkhorn_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !mix || !model_map || n_hc == 0 || n_hc > 16) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -1650,6 +1842,7 @@ int ds4_metal_hc_split_weighted_sum_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_split_weighted_sum_tensor\n");
     /* Compose split (sinkhorn) + weighted_sum_split.  The fused norm variant
      * already lives in a dedicated kernel; this two-stage path matches the
      * Metal reference fallback used by the graph driver. */
@@ -1683,6 +1876,7 @@ int ds4_metal_output_hc_weights_tensor(
         uint64_t                base_offset,
         uint32_t                n_hc,
         float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_output_hc_weights_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !pre || !model_map || n_hc == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
@@ -1803,6 +1997,7 @@ int ds4_metal_hc_expand_tensor(
         const ds4_metal_tensor *comb,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_tensor\n");
     /* post is [n_hc, n_tokens] dense, comb is [n_hc, n_hc, n_tokens] dense. */
     return rocm_hc_expand_dispatch(out_hc, block_out, NULL, residual_hc, post, comb,
                                    (uint64_t)n_hc, (uint64_t)n_hc * n_hc,
@@ -1816,6 +2011,7 @@ int ds4_metal_hc_expand_split_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_split_tensor\n");
     /* split layout per row: [pre[n_hc] | post[n_hc] | comb[n_hc*n_hc]] */
     if (!split) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -1843,6 +2039,7 @@ int ds4_metal_hc_expand_add_split_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_hc_expand_add_split_tensor\n");
     if (!split) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     ds4_metal_tensor *post_view = ds4_metal_tensor_view(split, (uint64_t)n_hc * sizeof(float),
@@ -1879,6 +2076,7 @@ int ds4_metal_store_raw_kv_tensor(
         uint32_t                raw_cap,
         uint32_t                row,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_store_raw_kv_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap || head_dim == 0) return 0;
     const uint64_t needed = ((uint64_t)row + 1u) * head_dim * sizeof(float);
@@ -1899,6 +2097,7 @@ int ds4_metal_store_raw_kv_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_store_raw_kv_batch_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!raw_cache || !kv || head_dim == 0 || n_tokens == 0) return 0;
     if ((uint64_t)pos0 + n_tokens > raw_cap) return 0;
@@ -1956,6 +2155,7 @@ int ds4_metal_kv_fp8_store_raw_tensor(
         uint32_t          row,
         uint32_t          head_dim,
         uint32_t          n_rot) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_kv_fp8_store_raw_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv || !raw_cache || head_dim == 0 || n_rot > head_dim || row >= raw_cap) return 0;
     if (kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -1982,6 +2182,7 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_metal_tensor *x) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_shared_gate_up_swiglu_q8_0_tensor\n");
     if (!gate || !up || !mid) return 0;
     if (!ds4_metal_matmul_q8_0_tensor(gate, model_map, model_size, gate_offset, in_dim, out_dim, x, 1)) return 0;
     if (!ds4_metal_matmul_q8_0_tensor(up, model_map, model_size, up_offset, in_dim, out_dim, x, 1)) return 0;
@@ -2001,6 +2202,7 @@ int ds4_metal_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_metal_tensor *heads) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_low_q8_tensor\n");
     /* heads is laid out as n_groups blocks of group_dim; produce one column of
      * size n_groups * rank by running n_groups independent Q8_0 matvecs.
      * Each matvec consumes group_dim inputs and produces `rank` outputs.
@@ -2043,6 +2245,7 @@ int ds4_metal_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_metal_tensor *heads,
         uint32_t                n_tokens) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_output_q8_batch_tensor\n");
     /* For each token, compute low = Wa @ heads (per-group Q8 matvec), then
      * out = Wb @ low (single Q8 matvec of dim n_groups*rank -> out_dim). */
     (void)group_tmp;
@@ -2085,6 +2288,7 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_hc_expand_tensor\n");
     /* Compose Q8 matmul (block_out = W . x) with HC expand (split layout). */
     if (!ds4_metal_matmul_q8_0_tensor(block_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, x, 1)) return 0;
@@ -2105,6 +2309,7 @@ int ds4_metal_shared_down_hc_expand_q8_0_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_shared_down_hc_expand_q8_0_tensor\n");
     /* shared_out = W . shared_mid (Q8); then HC expand uses (routed_out + shared_out) as block. */
     if (!ds4_metal_matmul_q8_0_tensor(shared_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, shared_mid, 1)) return 0;
@@ -2212,6 +2417,7 @@ int ds4_metal_indexer_score_one_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_score_one_tensor\n");
     /* one-token decode at any position; visibility handled by caller via n_comp.
      * We pass ratio=0 so all rows up to n_comp are visible. */
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
@@ -2230,6 +2436,7 @@ int ds4_metal_indexer_scores_prefill_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_scores_prefill_tensor\n");
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
                                         n_comp, n_tokens, n_head, head_dim,
                                         0, ratio, scale);
@@ -2247,6 +2454,7 @@ int ds4_metal_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_scores_decode_batch_tensor\n");
     return rocm_indexer_scores_dispatch(scores, q, weights, index_comp,
                                         n_comp, n_tokens, n_head, head_dim,
                                         pos0, ratio, scale);
@@ -2297,6 +2505,7 @@ int ds4_metal_indexer_topk_tensor(
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_indexer_topk_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0) return 0;
     if (selected->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) return 0;
@@ -2343,6 +2552,7 @@ int ds4_metal_dsv4_topk_mask_tensor(
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_dsv4_topk_mask_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0) return 0;
     if (mask->bytes < (uint64_t)n_comp * n_tokens * sizeof(float)) return 0;
@@ -2427,8 +2637,13 @@ int ds4_metal_router_select_tensor(
         bool                    has_bias,
         bool                    hash_mode,
         const ds4_metal_tensor *logits) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_router_select_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
-    if (!selected || !weights || !probs || !logits || n_expert_groups == 0 || n_group_used == 0) return 0;
+    if (!selected || !weights || !probs || !logits) return 0;
+    /* Call sites pass (0, 0) to mean "use DS4 defaults" -- the Metal driver
+     * also hardcodes these.  256 expert groups, 6 used per token. */
+    if (n_expert_groups == 0) n_expert_groups = 256u;
+    if (n_group_used == 0) n_group_used = 6u;
     if (selected->bytes < (uint64_t)n_group_used * sizeof(int32_t)) return 0;
     if (weights->bytes < (uint64_t)n_group_used * sizeof(float)) return 0;
     if (probs->bytes < (uint64_t)n_expert_groups * sizeof(float)) return 0;
@@ -2499,7 +2714,10 @@ int ds4_metal_router_select_batch_tensor(
         const ds4_metal_tensor *logits,
         const ds4_metal_tensor *tokens,
         uint32_t                n_tokens) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_router_select_batch_tensor\n");
     if (!selected || !weights || !probs || !logits || !tokens) return 0;
+    if (n_expert_groups == 0) n_expert_groups = 256u;
+    if (n_group_used == 0) n_group_used = 6u;
     /* Per-token loop is fine for small batch sizes; prefill hits hash-mode anyway. */
     const int32_t *toks = (const int32_t *)tensor_u8_const(tokens);
     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -2591,10 +2809,10 @@ int ds4_metal_compressor_store_batch_tensor(
         uint32_t                ratio,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_store_batch_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
-        head_dim == 0 || n_tokens == 0 ||
-        (ratio != 1u && ratio != 2u && ratio != 4u) ||
+        head_dim == 0 || n_tokens == 0 || ratio == 0u ||
         (ape_type != 0u && ape_type != 1u)) return 0;
 
     const uint32_t coff = (ratio == 4u) ? 2u : 1u;
@@ -2751,9 +2969,10 @@ int ds4_metal_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_update_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache || !model_map ||
-        head_dim == 0 || (ratio != 1u && ratio != 2u && ratio != 4u) ||
+        head_dim == 0 || ratio == 0u ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u) return 0;
 
@@ -2838,9 +3057,11 @@ int ds4_metal_compressor_prefill_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_tensor head_dim=%u ratio=%u pos0=%u n_tokens=%u n_rot=%u ape_type=%u norm_type=%u\n",
+                              head_dim, ratio, pos0, n_tokens, n_rot, ape_type, norm_type);
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
-        head_dim == 0 || (ratio != 1u && ratio != 2u && ratio != 4u) || n_tokens == 0 ||
+        head_dim == 0 || ratio == 0u || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u) return 0;
 
@@ -2931,6 +3152,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
         uint32_t                ape_type,
         uint32_t                head_dim,
         uint32_t                pos0) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_state_ratio4_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
         head_dim == 0 || (ape_type != 0u && ape_type != 1u)) return 0;
@@ -2996,6 +3218,7 @@ int ds4_metal_compressor_prefill_ratio4_replay_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_compressor_prefill_ratio4_replay_tensor\n");
     /* Replay is a ratio-4 prefill that requires aligned pos0 and full-period
      * n_tokens.  Semantically identical to compressor_prefill with ratio==4. */
     if (n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0) return 0;
@@ -3125,6 +3348,7 @@ int ds4_metal_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3241,6 +3465,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_raw_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || window == 0 || n_head == 0 || head_dim == 0) return 0;
@@ -3486,6 +3711,7 @@ int ds4_metal_attention_decode_raw_batch_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_raw_batch_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3518,6 +3744,7 @@ int ds4_metal_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_decode_mixed_batch_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3552,6 +3779,7 @@ int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_indexed_mixed_batch_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -3579,6 +3807,7 @@ int ds4_metal_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_static_mixed_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
@@ -3608,6 +3837,7 @@ int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_attention_prefill_masked_mixed_heads_tensor\n");
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_mask ||
         n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0u ||
@@ -4158,6 +4388,7 @@ int ds4_metal_routed_moe_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_metal_tensor *x) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_routed_moe_one_tensor\n");
     (void)gate; (void)up; (void)experts;
     return rocm_moe_run(out, mid, model_map, model_size,
                         gate_offset, up_offset, down_offset,
@@ -4194,6 +4425,7 @@ int ds4_metal_routed_moe_batch_tensor(
         float                   clamp,
         const ds4_metal_tensor *x,
         uint32_t                n_tokens) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_routed_moe_batch_tensor\n");
     (void)gate; (void)up; (void)experts;
     return rocm_moe_run(out, mid, model_map, model_size,
                         gate_offset, up_offset, down_offset,

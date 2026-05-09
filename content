@@ -1,0 +1,47 @@
+ROCm prefill: batch router/top-k and compressor paths
+
+# Status
+Open. This is prefill-throughput focused and can be worked independently after correctness is stable.
+
+# Host/platform context
+- AMD gfx1151 STRXLGEN on ROCm 7.0.3. Wave32-friendly reductions and avoiding CPU involvement are important.
+- Current production baseline from tsk-3: prefill about 7.11 t/s with chunk=2048; decode about 6.85 t/s.
+
+# Bottleneck A: router batch is effectively serial
+`ds4_metal_router_select_batch_tensor` loops over tokens on the CPU and calls `ds4_metal_router_select_tensor` once per token. The one-token path also computes `probs := sqrt(softplus(logits))` on the CPU by directly writing host-mapped tensor memory, then launches a 1-thread kernel for top selection. With device-local tensors this becomes incorrect unless rewritten, and even today it serializes prefill routing.
+
+# Evidence A
+- ds4_rocm.c:2600-2710 one-token router path uses CPU loop for softplus/sqrt and a one-thread selection kernel.
+- ds4_rocm.c:2715-2764 batch path loops over every token and calls the one-token path.
+- ds4.c:11990-12026 calls router select batch once per FFN layer during prefill.
+
+# Instructions A
+1. Implement a true batch router kernel: one block or wave per token, compute softplus/sqrt on GPU, select top 6 experts/hash rows, normalize weights, and write `[n_tokens, 6]` outputs.
+2. In hash mode, avoid rereading/uploading hash/bias per token. Resolve model-map pointers once and use them in the batch kernel.
+3. Keep deterministic ordering compatible with Metal/CPU. Selected experts must be sorted/normalized exactly enough to satisfy existing kernel tests and coherent inference.
+4. Delete the CPU tensor mutation from the hot path once device-local tensors are enabled by tsk-5.
+
+# Bottleneck B: compressor prefill replays one token at a time
+`ds4_metal_compressor_prefill_tensor` clears state then loops over every token, creates tensor views, calls `ds4_metal_compressor_update_tensor`, and on emit boundaries calls pool, RMS norm, RoPE, shift, and optional FP8 quantize as separate synchronized kernels. For long prefill chunks this is a huge launch/sync multiplier.
+
+# Evidence B
+- ds4_rocm.c:3045-3128 explicitly documents and implements multi-token prefill by iterating single-token compressor_update.
+- ds4_rocm.c:2961-3028 update path calls store_batch, pool, RMS norm, RoPE, shift.
+- ds4.c:10947-11238 uses compressor paths in batched attention prefill.
+
+# Instructions B
+1. Replace prefill replay with a chunk-level kernel for ratio 2 and ratio 4 that writes all emitted comp rows directly from `[n_tokens, width]` kv/sc.
+2. Fuse or at least batch the pool + RMS norm + RoPE + optional FP8 quantization per emitted row. Ratio 4 should avoid per-emission shift kernels by computing final state directly.
+3. Keep `ds4_metal_compressor_prefill_state_ratio4_tensor` semantics: decode after prefill must see the same rolling state as single-token decode.
+4. Add focused kernel-test coverage for chunk sizes not divisible by ratio, nonzero `pos0`, and ratio-4 final state.
+
+# Expected impact
+These changes target prefill throughput specifically. Router batching removes CPU/token loops in every FFN layer; compressor batching removes O(tokens) launch overhead in compressed attention layers and should make large chunk prefill much closer to the intended layer-major GPU path.
+
+# Regression gate
+Run tsk-3 plus existing compressor/router sections of `ds4_rocm_kernel_test`. Use `DS4_METAL_GRAPH_PREFILL_PROFILE=1` to verify router/compressor stages shrink; avoid changing decode output drift.
+
+# Files
+- ds4_rocm.c:2600-2764 router select one/batch.
+- ds4_rocm.c:2760-3248 compressor store/update/prefill/state.
+- ds4.c:10947-11238 compressor prefill call sites; 11990-12026 router prefill call site.

@@ -1,0 +1,24 @@
+ROCm timing: replace enqueue-only wrapper measurements
+
+Status: Open
+
+Goal
+Fix the misleading DS4_ROCM_TIME measurements introduced while deferring per-kernel synchronization. Once wrappers return after hipGetLastError(), ROCM_TIME_SCOPE mostly measures CPU launch/enqueue latency, so values like 0.001 ms/call are not completed GPU kernel time.
+
+Context
+Related: tsk-13 and tsk-4. The batching work is still useful, but its current timing evidence is invalid unless timing includes stream completion or HIP events.
+
+Evidence
+- ds4_rocm.c rocm_launch_done() can skip hipDeviceSynchronize() in batched mode.
+- Existing ROCM_TIME_SCOPE wall-clock scopes surround wrapper calls, so deferred launches make per-call ms/call look artificially tiny.
+- tsk-13 records corrupted output plus the misleading 0.001 ms/call claim.
+
+Next steps
+1. Decide timing semantics: either measure synchronized graph regions (begin/flush/end) or add HIP event timing around launched kernels on the active stream.
+2. If keeping per-kernel histograms, record elapsed GPU time with hipEventRecord/hipEventElapsedTime and drain/read events at flush/end/cleanup, not by synchronizing each wrapper.
+3. Keep launch/enqueue timing separate if it remains useful; label it explicitly as CPU enqueue time.
+4. Re-run DS4_ROCM_TIME=1 only after coherent output is restored for tsk-13, then compare with DS4_METAL_GRAPH_TOKEN_PROFILE=1 and DS4_METAL_GRAPH_PREFILL_PROFILE=1.
+
+Validation
+- Timing output should not report near-zero kernel times merely because sync is deferred.
+- Regression gate from tsk-3 still passes: build, 40 kernel tests ending in OK, coherent 200-token ROCm inference, and recorded prefill/decode t/s.

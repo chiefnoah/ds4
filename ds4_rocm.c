@@ -4374,6 +4374,193 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
  *   - use_comp_mask: comp_mask is added to each comp score (used to mask
  *     dropped indexer top-k slots in non-indexed prefill).
  */
+
+/* FlashAttention-style streaming-softmax variant of the batch kernel.
+ * Same outputs as rocm_attn_batch_kernel, but:
+ *   - holds a tile of BR Q rows in LDS so K/V streams are amortized BR×
+ *   - keeps online (m, l, o) state in registers (no n_keys-sized score array)
+ *   - one wave (32 lanes) per Q row; BR waves per block; each lane owns
+ *     head_dim/32 consecutive output dims.
+ *
+ * The MLA-compressed path has K == V (raw_kv and comp_kv each serve as
+ * both), so a single cooperative LDS load per key is reused for the QK
+ * dot product and the V accumulation.
+ *
+ * Sink is treated as a virtual "first" key with v = 0 by initializing
+ * (m, l) = (sinks[h], 1) before the streaming loop.
+ *
+ * Constraints:
+ *   - head_dim must be a multiple of 32 (one wave does the dot)
+ *   - dim_per_lane (head_dim/32) capped at 32 → head_dim ≤ 1024
+ *   - use_topk path is NOT supported here (legacy kernel handles it)
+ */
+#define ROCM_ATTN_FA_BR 4
+
+__global__ static void rocm_attn_fa_kernel(
+        float *out,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        int use_comp_mask,
+        int mode_static) {
+    extern __shared__ float smem[];
+    const uint32_t BR     = (uint32_t)ROCM_ATTN_FA_BR;
+    float *q_lds          = smem;
+    float *kv_buf         = smem + BR * head_dim;
+
+    const uint32_t tid    = threadIdx.x;
+    const uint32_t lane   = tid & 31u;
+    const uint32_t wave   = tid >> 5;
+    const uint32_t bs     = blockDim.x;
+
+    const uint32_t t_base = blockIdx.x * BR;
+    const uint32_t h      = blockIdx.y;
+    if (h >= n_head) return;
+
+    const uint32_t t      = t_base + wave;
+    const int active      = (t < n_tokens);
+
+    /* 1. Cooperative load of Q tile into LDS. Pad past-n_tokens rows with 0. */
+    for (uint32_t row = 0; row < BR; row++) {
+        const uint32_t tt   = t_base + row;
+        const int row_active = (tt < n_tokens);
+        const float *qsrc   = row_active
+            ? q + ((uint64_t)tt * n_head + h) * head_dim
+            : (const float *)NULL;
+        for (uint32_t d = tid; d < head_dim; d += bs) {
+            q_lds[row * head_dim + d] = row_active ? qsrc[d] : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const float kq_scale         = rsqrtf((float)head_dim);
+    const uint32_t qpos          = pos0 + t;
+    const uint32_t first_raw_pos = mode_static ? 0u : pos0 + n_tokens - n_raw;
+    const uint32_t n_visible_comp = ratio == 0u ? 0u : (qpos + 1u) / ratio;
+
+    /* Online softmax state (sink baked in as virtual first key, v = 0). */
+    float m = active ? sinks[h] : -1.0e30f;
+    float l = active ? 1.0f      :  0.0f;
+
+    /* Per-thread output slice in registers. dim_per_lane = head_dim / 32. */
+    const uint32_t dim_per_lane = head_dim >> 5;
+    float o_acc[32];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) o_acc[i] = 0.0f;
+
+    /* === Raw keys === */
+    for (uint32_t r = 0; r < n_raw; r++) {
+        const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap;
+        const float *kv_src   = raw_kv + (uint64_t)actual * head_dim;
+
+        for (uint32_t d = tid; d < head_dim; d += bs) kv_buf[d] = kv_src[d];
+        __syncthreads();
+
+        if (active) {
+            const uint32_t kpos = first_raw_pos + r;
+            const int valid = (kpos <= qpos) &&
+                              (window == 0u || qpos - kpos < window);
+            float score;
+            if (!valid) {
+                score = -1.0e30f;
+            } else {
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint32_t i = 0; i < 32; i++) {
+                    if (i < dim_per_lane) {
+                        const uint32_t d = i * 32u + lane;
+                        partial += q_lds[wave * head_dim + d] * kv_buf[d];
+                    }
+                }
+                partial = rocm_wave32_sum(partial);
+                partial = __shfl(partial, 0);
+                score   = partial * kq_scale;
+            }
+
+            const float m_new = fmaxf(m, score);
+            const float alpha = __expf(m - m_new);
+            const float vs    = (score <= -5.0e29f) ? 0.0f : __expf(score - m_new);
+            l = l * alpha + vs;
+            m = m_new;
+
+            #pragma unroll
+            for (uint32_t i = 0; i < 32; i++) {
+                if (i < dim_per_lane) {
+                    const uint32_t d = i * 32u + lane;
+                    o_acc[i] = o_acc[i] * alpha + vs * kv_buf[d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    /* === Comp keys === */
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const float *kv_src = comp_kv + (uint64_t)c * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += bs) kv_buf[d] = kv_src[d];
+        __syncthreads();
+
+        if (active) {
+            float score;
+            if (c >= n_visible_comp) {
+                score = -1.0e30f;
+            } else {
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint32_t i = 0; i < 32; i++) {
+                    if (i < dim_per_lane) {
+                        const uint32_t d = i * 32u + lane;
+                        partial += q_lds[wave * head_dim + d] * kv_buf[d];
+                    }
+                }
+                partial = rocm_wave32_sum(partial);
+                partial = __shfl(partial, 0);
+                score   = partial * kq_scale + (use_comp_mask ? comp_mask[c] : 0.0f);
+            }
+
+            const float m_new = fmaxf(m, score);
+            const float alpha = __expf(m - m_new);
+            const float vs    = (score <= -5.0e29f) ? 0.0f : __expf(score - m_new);
+            l = l * alpha + vs;
+            m = m_new;
+
+            #pragma unroll
+            for (uint32_t i = 0; i < 32; i++) {
+                if (i < dim_per_lane) {
+                    const uint32_t d = i * 32u + lane;
+                    o_acc[i] = o_acc[i] * alpha + vs * kv_buf[d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Write normalized output. */
+    if (active) {
+        float *out_th     = out + ((uint64_t)t * n_head + h) * head_dim;
+        const float inv_l = 1.0f / l;
+        #pragma unroll
+        for (uint32_t i = 0; i < 32; i++) {
+            if (i < dim_per_lane) {
+                const uint32_t d = i * 32u + lane;
+                out_th[d] = o_acc[i] * inv_l;
+            }
+        }
+    }
+}
+
 __global__ static void rocm_attn_batch_kernel(
         float *out,
         const float *q,
@@ -4538,21 +4725,45 @@ static int rocm_attn_batch_dispatch(
     if (!rocm_upload_mapped((const uint8_t *)model_map + sinks_offset, sink_bytes,
                             &sink_h, &sink_d, "attention sinks upload")) return 0;
 
-    const uint32_t threads = 128;
-    const uint32_t n_keys = n_raw + n_comp;
-    const uint64_t smem_bytes = ((uint64_t)n_keys + threads) * sizeof(float);
-    dim3 grid(n_tokens, n_head, 1);
-    dim3 block(threads, 1, 1);
-    hipLaunchKernelGGL(rocm_attn_batch_kernel, grid, block, (uint32_t)smem_bytes, 0,
-                       (float *)tensor_u8(heads),
-                       (const float *)tensor_u8_const(q),
-                       (const float *)tensor_u8_const(raw_kv),
-                       n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
-                       use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
-                       use_topk ? (const int32_t *)tensor_u8_const(topk) : (const int32_t *)NULL,
-                       (const float *)sink_d,
-                       n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
-                       n_comp, window, ratio, top_k, use_topk, use_comp_mask, mode_static);
+    /* FlashAttention-style streaming softmax handles the non-topk paths and
+     * amortizes K/V DRAM reads across BR Q rows. Falls back to the legacy
+     * scratch-array kernel when use_topk is set or head_dim is not a clean
+     * wave32 multiple. */
+    const int fa_ok = !use_topk &&
+                      head_dim >= 32u && (head_dim % 32u) == 0u &&
+                      (head_dim / 32u) <= 32u;
+    if (fa_ok) {
+        const uint32_t BR = (uint32_t)ROCM_ATTN_FA_BR;
+        const uint32_t threads = BR * 32u;
+        const uint64_t smem_bytes = (uint64_t)(BR + 1u) * head_dim * sizeof(float);
+        dim3 grid((n_tokens + BR - 1u) / BR, n_head, 1);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_attn_fa_kernel, grid, block, (uint32_t)smem_bytes, 0,
+                           (float *)tensor_u8(heads),
+                           (const float *)tensor_u8_const(q),
+                           (const float *)tensor_u8_const(raw_kv),
+                           n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                           use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                           (const float *)sink_d,
+                           n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                           n_comp, window, ratio, use_comp_mask, mode_static);
+    } else {
+        const uint32_t threads = 128;
+        const uint32_t n_keys = n_raw + n_comp;
+        const uint64_t smem_bytes = ((uint64_t)n_keys + threads) * sizeof(float);
+        dim3 grid(n_tokens, n_head, 1);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_attn_batch_kernel, grid, block, (uint32_t)smem_bytes, 0,
+                           (float *)tensor_u8(heads),
+                           (const float *)tensor_u8_const(q),
+                           (const float *)tensor_u8_const(raw_kv),
+                           n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                           use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                           use_topk ? (const int32_t *)tensor_u8_const(topk) : (const int32_t *)NULL,
+                           (const float *)sink_d,
+                           n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                           n_comp, window, ratio, top_k, use_topk, use_comp_mask, mode_static);
+    }
     char launch_msg[64];
     snprintf(launch_msg, sizeof(launch_msg), "attn batch %s launch", what);
     char done_msg[64];

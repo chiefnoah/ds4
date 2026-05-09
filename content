@@ -1,0 +1,24 @@
+ROCm graph: fuse small elementwise kernels to reduce launch count and memory traffic
+
+Status: Open
+
+Goal
+Reduce decode/prefill overhead by fusing cheap kernels that currently launch separately and round-trip through global memory. This should be considered after stream-batching correctness is restored so measurements are meaningful.
+
+Context
+Related: tsk-4, tsk-11, tsk-14. Many wrappers are small elementwise or short-vector transforms: RMS norm, add/residual, SwiGLU, RoPE tail, fill, masks, FP8/KV store helpers, HC split/weighted/sinkhorn/output helpers. Individually they may be cheap, but each launch costs CPU time and each intermediate tensor burns memory bandwidth.
+
+Evidence
+- ds4_rocm.c has separate wrappers for repeat, RMS, SwiGLU, add, RoPE tail, top-k mask init/scatter, compressor fill/shift/pool, and HC/output helper kernels.
+- ds4.c decode graph launches these repeatedly per layer/token.
+
+Next steps
+1. Use corrected timing from tsk-14 plus call-site attribution from tsk-11 to identify high-count low-duration kernels.
+2. Pick one low-risk fusion first, e.g. top-k mask init+scatter, RMS+following projection preparation, residual add+next norm, or HC split/weighted/norm adjacent stages.
+3. Keep fused wrappers ABI-compatible with ds4.c or add narrow graph-level fast paths.
+4. Verify numerical equivalence against existing kernel tests and coherent inference.
+
+Validation
+- tsk-3 gate passes.
+- Kernel launch count decreases in DS4_ROCM_TRACE=1 call trace.
+- Generation/prefill t/s improves on quiet-system benchmark; no change in output tokens for seed 42/temp=0.

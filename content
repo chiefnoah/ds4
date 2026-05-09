@@ -1,0 +1,37 @@
+ROCm tests: expand kernel coverage for optimization work
+
+# Status
+Open. Test-planning task; no source edits yet.
+
+# Goal
+Before kernel rewrites land, add targeted tests to `tests/ds4_rocm_kernel_test.c` so tsk-4 through tsk-7 can move quickly without silent correctness drift. Existing coverage is broad, but several optimized-path edge cases are missing or too small to catch batching/device-local/async mistakes.
+
+# Existing useful coverage
+- Basic add/swiglu/repeat/RMS/embed/matmul f16/f32/q8.
+- Compressor store/update/prefill and ratio-4 state.
+- Attention decode, batch decode, indexed/masked/static prefill.
+- Routed MoE one/batch and quant edge cases.
+- Router select one-token default and bias cases.
+- Fused/compound Q8 wrappers: attention output low, shared gate/up/swiglu, q8 hc expand, shared down hc expand.
+
+# Missing coverage to add
+1. `ds4_metal_router_select_batch_tensor` correctness for `n_tokens > 1`, including hash mode and bias mode. Today the test only exercises one-token router selection. This is required before tsk-7 rewrites batch routing.
+2. Compressor prefill edge cases: nonzero `pos0`, chunk length not divisible by ratio, ratio=4 with partial final period, and `quantize_fp8=true` where head_dim is 128. Current tests cover ratio=2 n_tokens=4 and ratio-4 state separately but not enough chunk-boundary combinations.
+3. Matmul/projection larger shapes: f16/q8 with `n_tok > 2`, `in_dim > 256`, `out_dim` not a tiny constant, and row_bytes/padding edge cases. This will catch tiled kernel indexing mistakes for tsk-6.
+4. Command batching correctness: run a short sequence inside one begin/end with multiple dependent kernels and no intermediate readback, then compare once at the end. This catches tsk-4 stream/synchronization bugs.
+5. Device-local tensor path: once tsk-5 adds an env toggle, run the whole kernel test once with host-mapped fallback and once with device-local tensors. Add a visible skip or mode print so CI output shows which path ran.
+6. Attention larger context smoke: use n_raw/n_comp large enough to stress dynamic shared memory limits and ring wrap, not just tiny 2-4 row cases. Keep it deterministic and small enough for quick tests.
+
+# Instructions
+- Keep tests self-contained and synthetic; do not require the full GGUF model.
+- Prefer CPU oracles already present in the file. Extend them rather than creating separate ad hoc checks.
+- Keep tolerances aligned with existing kernels; for optimized reductions, allow only justified small FP accumulation drift.
+- Add STEP labels that correspond to the task they protect, e.g. `router_select_batch hash`, `compressor_prefill pos0 partial`, `device_local command chain`.
+
+# Files
+- tests/ds4_rocm_kernel_test.c.
+- ds4_rocm.c only if a test requires a temporary env toggle already introduced by an optimization task.
+
+# Related tasks
+- tsk-3 remains the top-level gate.
+- tsk-4/5/6/7 should each update this task with the specific tests added before implementation is considered done.

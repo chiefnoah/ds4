@@ -1,0 +1,44 @@
+ROCm perf: build prefill/decode call-site attribution map
+
+# Status
+Open. Read-only analysis task; safe to do alongside Claude.
+
+# Goal
+Produce a concise attribution map from high-level DS4 stages to ROCm wrapper calls, then combine it with `DS4_ROCM_TIME=1` output from tsk-8. This will show which task should be prioritized after command batching and device-local memory are addressed.
+
+# Why
+The backend has many wrapper-level timings and many ds4.c stage profiles. Without mapping them, totals like `matmul_q8_0` or `routed_moe_batch` are hard to tie back to user-visible prefill/decode stages. This task is pure analysis and does not conflict with kernel or load-path edits.
+
+# Map to create
+For decode path `metal_graph_encode_decode_layer` / `metal_graph_encode_token_raw_swa`:
+- attn_hc_pre -> RMS, HC mix F16, HC split/weighted sum.
+- attn_norm -> weighted RMS.
+- q_path -> Q A/B Q8, q RMS, head RMS, RoPE.
+- kv_path -> KV projection, raw cache store, compressor/indexer setup.
+- attention -> decode heads / mixed attention.
+- attn_output -> attention output low/out Q8 wrappers.
+- ffn_hc_pre/norm/router/routed_moe/shared_gate_up/shared_down/ffn_hc_post -> corresponding wrappers.
+- output head -> output pre F16 and logits Q8.
+
+For prefill path `metal_graph_encode_layer_attention_batch` / `metal_graph_encode_layer_ffn_batch`:
+- HC pre/norm/Q path/KV path/compressor/indexer/attention/output_proj/HC post.
+- FFN HC pre/norm/router/routed_moe/shared_gate_up/shared_down/HC post.
+- Chunked prefill overhead: prompt token upload, embedding, per-layer begin/end, final output head.
+
+# Instructions
+1. Use `rg`/source inspection only; do not edit code.
+2. Record for each stage: ds4.c function, ROCm wrapper names, tensor shapes where obvious (`n_tokens`, `n_head`, `head_dim`, `DS4_N_EMBD`, `DS4_N_HC`, etc.), and whether it is decode-only, prefill-only, or shared.
+3. After tsk-8 has timing output, paste a ranked table into this task: stage, wrapper bucket, calls, total ms, avg ms, suspected bottleneck, linked optimization task.
+4. Identify false aggregation problems: e.g. one `ds4_metal_matmul_q8_0_tensor` bucket mixes output head, shared experts, Q projections, and attention output B. If needed, file a follow-up task to split timing labels by call-site without changing behavior.
+
+# Expected output
+A short task update that lets an implementer answer: “For a 2048-token prefill, which five wrapper/stage pairs consume the most time?” and “For decode, which five pairs dominate per-token latency?”
+
+# Files
+- ds4.c around decode graph: `metal_graph_encode_decode_layer`, `metal_graph_encode_token_raw_swa`, output head.
+- ds4.c around prefill graph: `metal_graph_encode_layer_attention_batch`, `metal_graph_encode_layer_ffn_batch`, chunked prefill.
+- ds4_rocm.c `ROCM_TIME_SCOPE` labels and wrapper implementations.
+
+# Related tasks
+- tsk-8 baseline capture.
+- tsk-4/5/6/7 optimization tasks.

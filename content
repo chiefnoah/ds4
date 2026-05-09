@@ -1,0 +1,29 @@
+FlashAttention prefill+decode landed (tsk-22 done)
+
+Status: COMPLETED at commit 7771ea3.
+
+rocm_attn_fa_kernel added as drop-in for rocm_attn_batch_kernel on the
+non-topk paths.  One block per (Q-tile, head); BR=4 Q rows per block, one
+wave (32 lanes) per row.  Sink baked in as virtual first key.  K and V
+share cooperative LDS load (MLA path: raw_kv and comp_kv each serve as
+both K and V).
+
+Validation:
+  - 40 oracle tests pass
+  - canonical 21-tok benchmark: 29.62 / 29.75 / 29.71 t/s prefill (3 runs),
+    decode 13.61 t/s -- flat vs 29.17 baseline
+
+The gain is structural (constant LDS, no n_keys-sized scratch, BR-fold
+fewer K/V reads).  At 21 prefill tokens, attention is too small a slice
+(~3% of histogram) for the win to show.  At longer prefill / chunked
+prefill, gains will compound.
+
+Non-FA paths preserved:
+  - use_topk: legacy kernel still handles indexed_mixed_batch
+  - head_dim not divisible by 32: legacy kernel handles
+
+Next lever: codex query running for ranked recommendations; expect MoE
+expert-major regrouping for prefill or HIP graph capture (tsk-16/20) to
+be the next-biggest win.
+
+Related: tsk-22 (this implements it)

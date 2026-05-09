@@ -1,0 +1,38 @@
+ROCm decode: HIP graph capture for whole-token replay (resume after compact)
+
+Status: NEXT. Picks up where 2026-05-09 session left off after blocking-sync fix made per-token CPU sync visible as the real remaining bottleneck.
+
+Context (preserved across compaction)
+- Decode baseline this branch: 15.35 t/s with blocking sync (DS4_ROCM_SCHEDULE_BLOCKING). Was 14.0 t/s pre-router-fusion. Prefill 39.5 t/s.
+- Wall per token = ~65 ms. user CPU now ~3.6s / 33s wall (was 18s spinning).
+- Production decode driver: metal_graph_eval_token_raw_swa_top at ds4.c:12201.
+- Per-token kernel count: ~250 launches across 43 layers + output head + indexer topk + sampling.
+- ds4_metal_end_commands at ds4_rocm.c:1433 calls hipDeviceSynchronize — one per token.
+
+Goal
+Capture the whole-token decode graph once during the first decoded token, then hipGraphLaunch + hipDeviceSynchronize per subsequent token. Eliminate per-kernel CPU launch overhead from the HIP runtime side.
+
+Approach
+1. Add a session-scoped HIP graph capture wrapper in ds4_rocm.c: ds4_metal_begin_capture / ds4_metal_end_capture. Use hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal) on a dedicated stream + hipStreamEndCapture into a hipGraph_t, then hipGraphInstantiate.
+2. Refactor ds4_metal_begin_commands / ds4_metal_end_commands to optionally route launches to the capture stream when capture is active. Currently launches go to default stream (NULL).
+3. In ds4.c metal_graph_eval_token_raw_swa_top: on first decode token after a stable shape is reached, call begin_capture, replay the existing kernel sequence, end_capture, store hipGraphExec_t in the graph struct. On subsequent tokens, call hipGraphLaunch + readback + sync.
+4. Constraints: pos changes per token (it is a kernel arg). HIP graphs support kparam updates via hipGraphExecKernelNodeSetParams, but that adds complexity. Alternative: pass pos via a small device-side scalar tensor that the host updates with hipMemcpyAsync before each replay. Pick the simpler path first.
+5. Sampling readback (g->comp_selected, 4 bytes) stays the same — that is one tensor_read per token, unavoidable for greedy sampling.
+
+Risks
+- Graph capture rejects calls that allocate (rocm_upload_mapped happens for non-registered weights, but production weights ARE registered so the upload just returns the registered devptr — no allocation). Verify this before capturing.
+- Per-token state changes other than pos: layer_raw_cache rotation, n_raw counter, comp state. Audit metal_graph_encode_token_raw_swa for any host-side branches that change graph topology between tokens.
+- HIP graphs on gfx1151 had ~1.10x speedup at noop-level in prior testing (tsk-16 / tsk-20). Real decode might be larger because per-token sync overhead is visible now. Expected: 5-15% decode improvement.
+
+Validation gates
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test ends OK (40 tests)
+- Coherence: time ./ds4 --backend rocm -p \"Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip.\" -n 200 --temp 0 --seed 42 — multi-paragraph thinking-mode reply identical to baseline.
+- Compare wall and user CPU vs baseline (15.35 t/s, user 3.6s).
+
+Uncommitted changes in this branch (not yet committed; user has not asked)
+- ds4_rocm.c: router_select fusion (rocm_router_softplus_select_one_kernel + batch variant + wrapper branch); HC4 expand fusion (ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND macro + dispatch); blocking sync (hipSetDeviceFlags); Q8_0 + F16 audit instrumentation (env-gated); 4 dead F16 wave/ksplit kernels (warning-level cruft, kept as scaffolding for redo with N-element-per-lane unroll).
+
+Related
+- tsk-16 (HIP graph capture exploration), tsk-20 (graph capture or weight repack), tsk-32/tsk-33 (router + HC fusion landed).
+- feedback_blocking_sync_fix.md, feedback_fusion_neutral_in_batched_mode.md, feedback_real_gpu_time.md.

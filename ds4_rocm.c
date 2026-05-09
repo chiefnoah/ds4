@@ -2645,6 +2645,44 @@ __global__ static void rocm_attn_out_low_q8_fused_kernel(
     if (tid == 0) low[((uint64_t)tok * n_groups + g) * rank + r] = sh[0];
 }
 
+/* Wave-per-row variant of attn_out_low_q8.  Same wave32 mapping as
+ * rocm_matmul_q8_0_wave_*_kernel: one wave computes one (r, g, tok)
+ * output, ROWS_PER_BLOCK rows per block packed in the rank dimension.
+ * Used when group_dim is a multiple of 32 (true for production
+ * shapes with group_dim = DS4_N_HEAD_DIM * group_heads = 4096). */
+#define ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(NROWS) \
+__global__ static void rocm_attn_out_low_q8_wave_##NROWS##_kernel( \
+        float *low, const uint8_t *w, const float *heads, \
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups, \
+        uint64_t row_bytes, uint64_t group_w_bytes) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t r       = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    const uint32_t g       = blockIdx.y; \
+    const uint32_t tok     = blockIdx.z; \
+    if (r >= rank) return; \
+    const float   *xr  = heads + ((uint64_t)tok * n_groups + g) * group_dim; \
+    const uint8_t *wr  = w + (uint64_t)g * group_w_bytes + (uint64_t)r * row_bytes; \
+    const uint32_t qblocks = group_dim >> 5; \
+    float sum = 0.0f; \
+    for (uint32_t b = lane; b < qblocks; b += 32u) { \
+        const uint8_t *blk = wr + (uint64_t)b * 34u; \
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8); \
+        const int8_t *qs = (const int8_t *)(blk + 2); \
+        const float *xb = xr + ((uint64_t)b << 5); \
+        float dot = 0.0f; \
+        _Pragma("unroll") \
+        for (int j = 0; j < 32; j++) dot += (float)qs[j] * xb[j]; \
+        sum += rocm_f16_to_f32(scale_bits) * dot; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) low[((uint64_t)tok * n_groups + g) * rank + r] = sum; \
+}
+
+ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(8)
+ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(4)
+
 static int rocm_attention_output_low_q8_dispatch(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -2672,21 +2710,50 @@ static int rocm_attention_output_low_q8_dispatch(
                              &w_host, &w_dev,
                              "attn out low Q8 weight upload")) return 0;
 
-    /* Same blockDim=256 as the legacy matmul_q8_0_kernel; on this host the
-     * 8-wave block hides scalar-reduction latency well even if the inner
-     * loop has half the threads idle for tiny qblocks. */
-    const uint32_t threads = 256u;
-    dim3 grid((unsigned)rank, (unsigned)n_groups, (unsigned)n_tokens);
-    dim3 block(threads, 1, 1);
-    hipLaunchKernelGGL(rocm_attn_out_low_q8_fused_kernel,
-                       grid, block, threads * sizeof(float), 0,
-                       (float *)tensor_u8(low),
-                       (const uint8_t *)w_dev,
-                       (const float *)tensor_u8_const(heads),
-                       (uint32_t)group_dim, (uint32_t)rank, n_groups,
-                       row_bytes, group_w_bytes);
-    int ok = rocm_launch_done("attn out low Q8 launch",
+    int ok;
+    if ((group_dim % 32u) == 0u) {
+        /* Wave-per-row dispatch: same gfx1151 win as ds4_metal_matmul_q8_0_tensor.
+         * For DSv4 attention output, group_dim = 4096 (DS4_N_HEAD_DIM * 8),
+         * rank = 1024, n_groups = 8. blockDim=256 here was wasting half the
+         * threads in the inner block loop. */
+        const uint32_t nrows = ((rank % 8u) == 0u && rank >= 256u) ? 8u : 4u;
+        dim3 grid((unsigned)((rank + nrows - 1u) / nrows),
+                  (unsigned)n_groups, (unsigned)n_tokens);
+        dim3 block(nrows * 32u, 1, 1);
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_8_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(low),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(heads),
+                               (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                               row_bytes, group_w_bytes);
+        } else {
+            hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_4_kernel,
+                               grid, block, 0, 0,
+                               (float *)tensor_u8(low),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(heads),
+                               (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                               row_bytes, group_w_bytes);
+        }
+        ok = rocm_launch_done("attn out low Q8 wave launch",
+                              "attn out low Q8 wave completion");
+    } else {
+        /* Fallback for non-32-divisible group_dim. */
+        const uint32_t threads = 256u;
+        dim3 grid((unsigned)rank, (unsigned)n_groups, (unsigned)n_tokens);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_attn_out_low_q8_fused_kernel,
+                           grid, block, threads * sizeof(float), 0,
+                           (float *)tensor_u8(low),
+                           (const uint8_t *)w_dev,
+                           (const float *)tensor_u8_const(heads),
+                           (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                           row_bytes, group_w_bytes);
+        ok = rocm_launch_done("attn out low Q8 launch",
                               "attn out low Q8 completion");
+    }
     rocm_defer_free(w_host);
     return ok;
 }

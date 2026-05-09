@@ -1,0 +1,33 @@
+ROCm throughput: move hot tensors off host-mapped memory
+
+# Status
+Open. Coordinate with Claude; no code changes yet.
+
+# Host/platform context
+- AMD gfx1151 / STRXLGEN Strix Halo-class UMA host, ROCm driver 7.0.3.
+- `rocm-smi` reports 103079215104 bytes VRAM and about 87056060416 bytes used during inspection.
+- UMA means CPU/GPU share physical memory bandwidth, but mapped host allocations still route GPU accesses through a path that is much worse for hot activation tensors than device-local allocations in the GPU partition.
+
+# Bottleneck
+`ds4_metal_tensor_alloc` currently allocates every runtime tensor with `hipHostMalloc(..., hipHostMallocMapped)` and marks it as `host=1`. That was useful during bring-up after H2D copies to `hipMalloc` reportedly faulted, but it means every activation, KV cache, intermediate batch buffer, MoE mid buffer, logits row, etc. is GPU-read/written as mapped host memory. For prefill and decode this likely dominates bandwidth and cache behavior, especially for repeated layer activations and KV/cache reads. The model weights are already mirrored into device memory in production; hot tensors should get the same treatment.
+
+# Evidence in code
+- ds4_rocm.c:650-690 `ds4_metal_tensor_alloc` always uses host-mapped allocation.
+- ds4_rocm.c:732-789 tensor write/read/copy branches on `tensor->host`, so device-local tensors are partially supported already.
+- ds4_rocm.c:893-1005 model map fallback uses `hipMalloc` successfully for the large model mirror on this host, so device allocation itself works in at least one critical path.
+- Prefill batch tensors in ds4.c are large and repeatedly reused across all 43 layers; keeping them mapped makes every kernel pay.
+
+# Instructions
+1. Add a device-local allocation path for normal runtime tensors: `hipMalloc` for `dev_ptr`, `host=0`, no `host_ptr`. Keep a fallback env/debug path such as `DS4_ROCM_HOST_MAPPED_TENSORS=1`.
+2. Keep tiny CPU-facing staging uses host-accessible where needed, but make graph hot tensors device-local by default. Tensor reads/writes should use `hipMemcpy`/`hipMemcpyAsync` for `host=0`.
+3. Re-test the old failure mode that motivated host-mapped tensors. If direct H2D into hipMalloc still faults for some specific size/path, isolate it to writes or create a pinned staging copy instead of making all tensors mapped.
+4. Combine with tsk-4 stream work if possible: tensor writes inside command batches should enqueue copies on the graph stream, and reads should synchronize only for CPU visibility.
+5. Benchmark prefill/decode before and after. Expect the biggest wins in attention KV reads, Q8/F16 matmuls over activations, MoE mid/down passes, and large batch prefill buffers.
+
+# Regression gate
+Run tsk-3 after the change. Also run a small prompt with `DS4_ROCM_TRACE=1` once to confirm tensors are device-local by default and model map registration still resolves weights without per-call uploads.
+
+# Files
+- ds4_rocm.c:650-789 tensor allocation/read/write/copy.
+- ds4_rocm.c:893-1005 model-map device mirror, useful precedent for hipMalloc on this host.
+- ds4.c graph allocations around `metal_graph_alloc` if selective allocation policy needs shape/type context.

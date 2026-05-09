@@ -111,6 +111,10 @@ ds4_rocm_kernel_test: tests/ds4_rocm_kernel_test.c ds4_rocm.o ds4_metal.h
 	$(CC) $(CFLAGS) -c -o ds4_rocm_kernel_test.o tests/ds4_rocm_kernel_test.c
 	$(ROCMCC) $(CFLAGS) -o $@ ds4_rocm_kernel_test.o ds4_rocm.o $(ROCMLDLIBS)
 
+ds4_rocm_matmul_bench: tests/ds4_rocm_matmul_bench.c ds4_rocm.o ds4_metal.h
+	$(CC) $(CFLAGS) -c -o ds4_rocm_matmul_bench.o tests/ds4_rocm_matmul_bench.c
+	$(ROCMCC) $(CFLAGS) -o $@ ds4_rocm_matmul_bench.o ds4_rocm.o $(ROCMLDLIBS)
+
 test: ds4_test
 	./ds4_test
 

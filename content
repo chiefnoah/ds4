@@ -1,0 +1,67 @@
+Implement ROCm FlashAttention prefill+decode
+
+# Status
+
+PENDING. Largest remaining structural gap to Metal after the tiled
+Q8_0/F16 prefill matmul (committed 1840dc5, 9.58 -> 23.07 t/s).
+
+# Goal
+
+Replace the per-(token, head) softmax-over-keys attention kernel with
+a FlashAttention-style block-tiled streaming softmax + accumulation.
+
+# Background
+
+For each token, head, ROCm computes
+  - load Q
+  - for each key k: dot(Q, K[k]), apply mask
+  - softmax over n_keys
+  - weighted sum of V[k] by softmax probabilities
+
+Metal uses block-tiled FA: stream K/V in tiles, maintain online softmax
+(running max + running denom), no materialized n_keys-wide attention
+matrix. This:
+  - reads K and V once per Q tile (vs once per token)
+  - keeps the softmax state in registers/LDS, no n_keys spill
+  - allows multiple heads/tokens to share K/V tile loads
+
+Metal references (flash_attn.metal):
+  - prefill: kernel_flash_attn_ext_f16_dk512_dv512 at lines 921-925
+  - decode: vector FA at lines 939-961
+  - split-K reduce at lines 1384-1392
+
+ROCm wrappers to replace:
+  - rocm_attn_batch_kernel (ds4_rocm.c:4117-4132) -- raw KV path
+  - rocm_attn_batch_kernel for compressed (ds4_rocm.c:4312-4326)
+  - decode-time single-token attention (likely in same file)
+
+# Approach
+
+1. Start with raw-KV prefill path. Block tile: BR Q rows x BC K cols
+   per threadblock. Each block streams K and V columns, maintains
+   running (m_i, l_i, acc_i) per Q row, writes final O = acc / l.
+   Reference ggml/llama.cpp HIP FA implementations.
+
+2. Validate against existing kernel via tests/ds4_rocm_kernel_test.c.
+   The existing harness is the canonical correctness oracle.
+
+3. Extend to compressed-KV and decode paths.
+
+# Validation
+
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test -- must end with OK
+- time ./ds4 --backend rocm -p "...long prompt..." -n 200 --temp 0 --seed 42
+  - target: prefill at least 100 t/s (vs 23 t/s today)
+  - generation must remain coherent multi-paragraph
+
+# Files
+
+- ds4_rocm.c (rocm_attn_batch_kernel and friends)
+- ds4_metal.m (FA reference dispatch)
+- metal/flash_attn.metal (FA kernel reference)
+- tests/ds4_rocm_kernel_test.c (correctness oracle)
+
+# Source
+
+Codex structural diagnosis 2026-05-09. Top action #1 for prefill.

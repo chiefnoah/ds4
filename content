@@ -1,0 +1,35 @@
+ROCm load path: 80GB GGUF → device
+
+# Status
+
+In progress.
+
+# Baseline
+
+- 80.76 GiB model copy
+- Sequential pread(256 MiB) + hipMemcpy: ~30 sec total → 2.7 GiB/s
+- Two-stage pinned pipeline (reader thread + 256 MiB stages × 3, hipMemcpyAsync on alternating streams): ~36 sec → 2.21 GiB/s — WORSE
+- Cached run still 2.4 GiB/s; the bottleneck is host RAM bandwidth, not disk
+
+# Why pipelining didn't help
+
+Strix Halo is UMA. Both pread (CPU memcpy from page-cache to pinned host buf) and hipMemcpy (DMA from pinned host buf to GPU partition) draw on the same memory bus. Overlapping them adds latency hiding only, not bandwidth. The extra 768 MB of pinned staging actively hurts because it evicts useful page-cache.
+
+# What might help (UMA-specific)
+
+1. **Single hipMemcpy from mmap** with MADV_WILLNEED prefetch, no staging. Reduces 2 RAM copies → 1.
+   - Cached benchmark: 14.47 GiB/s (1 GiB chunk from mmap)
+   - Cold: 1.19 GiB/s (synchronous page faults serialize disk reads)
+   - Need a worker that prefaults pages on a thread to overlap disk reads with hipMemcpy
+2. Skip read entirely: hipHostRegister(file mmap) — fails because BIOS reserves most UMA for GPU, only ~30 GB host-pinnable
+3. NUMA-aware: pin the pread thread to the I/O complex's CCD if the topology shows that
+
+# Next experiments
+
+- Drop the staging buffer; use mmap directly + a prefetch thread that touches pages ahead of hipMemcpy
+- Try MAP_POPULATE on the mmap to prefault before any hipMemcpy
+
+# Files
+
+- ds4_rocm.c:850-1100 (set_model_map_range and reader thread)
+- ds4_rocm.c:818-921 (rocm_load_reader_thread helper struct)

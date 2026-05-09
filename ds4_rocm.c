@@ -2863,6 +2863,42 @@ int ds4_metal_indexer_scores_decode_batch_tensor(
                                         pos0, ratio, scale);
 }
 
+/* Parallel argmax for top_k=1.  One block per token, 256 threads
+ * cooperate via LDS tree reduction.  Used both by the indexer top-k
+ * dispatcher (when top_k==1) and by the greedy decode path to avoid
+ * reading 129 K logits to host every token. */
+#define ROCM_ARGMAX_BLOCK 256u
+
+__global__ static void rocm_argmax_kernel(int32_t *selected,
+                                          const float *scores,
+                                          uint32_t n_comp) {
+    __shared__ float    s_val[ROCM_ARGMAX_BLOCK];
+    __shared__ int32_t  s_idx[ROCM_ARGMAX_BLOCK];
+    const uint32_t tok = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const float *src = scores + (uint64_t)tok * n_comp;
+    float   best_v = -3.4028234663852886e38f;
+    int32_t best_i = -1;
+    for (uint32_t i = tid; i < n_comp; i += ROCM_ARGMAX_BLOCK) {
+        const float v = src[i];
+        if (v > best_v) { best_v = v; best_i = (int32_t)i; }
+    }
+    s_val[tid] = best_v;
+    s_idx[tid] = best_i;
+    __syncthreads();
+    for (uint32_t s = ROCM_ARGMAX_BLOCK / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float v_other = s_val[tid + s];
+            if (v_other > s_val[tid]) {
+                s_val[tid] = v_other;
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) selected[tok] = s_idx[0];
+}
+
 __global__ static void rocm_indexer_topk_kernel(int32_t *selected,
                                                 const float *scores,
                                                 uint32_t n_comp,
@@ -2915,6 +2951,18 @@ int ds4_metal_indexer_topk_tensor(
     if (selected->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) return 0;
     if (scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) return 0;
 
+    if (top_k == 1u) {
+        /* Specialized parallel argmax: 256-thread block per token,
+         * LDS tree reduction.  Bypasses the O(n_comp * top_k) serial
+         * scan below and is essential for greedy decode where n_comp
+         * == DS4_N_VOCAB == 129280. */
+        hipLaunchKernelGGL(rocm_argmax_kernel, dim3(n_tokens),
+                           dim3(ROCM_ARGMAX_BLOCK), 0, 0,
+                           (int32_t *)tensor_u8(selected),
+                           (const float *)tensor_u8_const(scores),
+                           n_comp);
+        return rocm_launch_done("argmax launch", "argmax completion");
+    }
     /* Note: this O(n_comp * top_k) per-token loop is correct but slow; revisit
      * with a proper bitonic top-k once correctness is validated. */
     hipLaunchKernelGGL(rocm_indexer_topk_kernel, dim3(n_tokens), dim3(1), 0, 0,

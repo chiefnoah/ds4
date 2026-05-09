@@ -14596,6 +14596,12 @@ static int generate_metal_graph_raw_swa(
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
+    /* Greedy temp=0 doesn't need the full vocab on the host; argmax on
+     * the device and read back one int per token instead of 129 K
+     * floats.  Skipping that readback measurably improves decode t/s on
+     * Strix Halo where the only sampler implemented here is greedy.
+     * trace_top still needs the full logits for its diagnostic dump. */
+    int next_token = sample_argmax(logits, DS4_N_VOCAB);
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -14604,7 +14610,7 @@ static int generate_metal_graph_raw_swa(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
 
-        int token = sample_argmax(logits, DS4_N_VOCAB);
+        int token = next_token;
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
@@ -14616,12 +14622,25 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = metal_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
+        if (trace_top) {
+            ok = metal_graph_eval_token_raw_swa(&g,
+                                                model,
+                                                weights,
+                                                (uint32_t)token,
+                                                (uint32_t)pos,
+                                                logits);
+            if (ok) next_token = sample_argmax(logits, DS4_N_VOCAB);
+        } else {
+            int top_id = -1;
+            ok = metal_graph_eval_token_raw_swa_top(&g,
+                                                    model,
+                                                    weights,
+                                                    (uint32_t)token,
+                                                    (uint32_t)pos,
+                                                    &top_id,
+                                                    NULL);
+            if (ok) next_token = top_id;
+        }
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();

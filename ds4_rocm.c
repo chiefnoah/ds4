@@ -685,41 +685,14 @@ __global__ static void rocm_matmul_q8_0_tile_##NROWS##x##NTOK##_kernel( \
 ROCM_DEFINE_MATMUL_Q8_0_TILE(8, 8)
 ROCM_DEFINE_MATMUL_Q8_0_TILE(4, 8)
 
-/* Wave-per-row F16 matvec.  Same pattern as the Q8_0 wave kernel: one
- * 32-lane wave computes one output row, with each lane summing
- * in_dim/32 fp16 weights against the activation slice.  Only used for
- * the n_tok=1 decode path; the legacy LDS-reduction kernel handles
- * n_tok>1 prefill batches. */
-#define ROCM_DEFINE_MATMUL_F16_WAVE(NROWS) \
-__global__ static void rocm_matmul_f16_wave_##NROWS##_kernel( \
-        float *out, const uint16_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim) { \
-    const uint32_t tid     = threadIdx.x; \
-    const uint32_t row_idx = tid >> 5; \
-    const uint32_t lane    = tid & 31u; \
-    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
-    const uint32_t tok     = blockIdx.y; \
-    if (row >= out_dim) return; \
-    const uint16_t *wr = w + (uint64_t)row * in_dim; \
-    const float    *xr = x + (uint64_t)tok * in_dim; \
-    float sum = 0.0f; \
-    for (uint32_t i = lane; i < in_dim; i += 32u) { \
-        sum += rocm_f16_to_f32(wr[i]) * xr[i]; \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    if (lane == 0) out[(uint64_t)tok * out_dim + row] = sum; \
-}
-
-ROCM_DEFINE_MATMUL_F16_WAVE(8)
-ROCM_DEFINE_MATMUL_F16_WAVE(4)
-
 /* Tiled F16 wave matmul for prefill (n_tok > 1).  Matches the Q8_0 tile
  * pattern: one wave per output row, each lane reads each weight element
  * once and accumulates NTOK partial sums against NTOK x slices.  Only
- * dispatched for n_tok > 1; n_tok=1 stays on the legacy LDS-reduction
- * kernel because the wave-per-row variant regressed F16 decode (~13%)
- * — F16's compute/byte ratio is too low for wave-per-row at n_tok=1
- * to hide memory latency. */
+ * dispatched for n_tok > 1; n_tok=1 stays on the legacy per-row LDS-
+ * reduction kernel.  A wave-per-row F16 variant for n_tok=1 was tried
+ * and regressed decode by ~13% — F16's 0.33 ops/byte compute density
+ * doesn't have enough work per memory load to hide latency at the
+ * lower thread-per-row count. */
 #define ROCM_DEFINE_MATMUL_F16_TILE(NROWS, NTOK) \
 __global__ static void rocm_matmul_f16_tile_##NROWS##x##NTOK##_kernel( \
         float *out, const uint16_t *w, const float *x, \
@@ -2654,6 +2627,18 @@ __global__ static void rocm_store_raw_kv_kernel(float *raw,
     raw[i] = (float)((__half)kv[i]);
 }
 
+__global__ static void rocm_store_raw_kv_batch_kernel(float *raw_base,
+                                                      const float *kv,
+                                                      uint32_t head_dim,
+                                                      uint32_t pos0,
+                                                      uint32_t n_tokens) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (i >= head_dim || t >= n_tokens) return;
+    const uint64_t row = (uint64_t)(pos0 + t);
+    raw_base[row * head_dim + i] = (float)((__half)kv[(uint64_t)t * head_dim + i]);
+}
+
 int ds4_metal_store_raw_kv_tensor(
         ds4_metal_tensor       *raw_cache,
         const ds4_metal_tensor *kv,
@@ -2688,14 +2673,13 @@ int ds4_metal_store_raw_kv_batch_tensor(
     if ((uint64_t)pos0 + n_tokens > raw_cap) return 0;
     if (kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     if (raw_cache->bytes < ((uint64_t)pos0 + n_tokens) * head_dim * sizeof(float)) return 0;
-    /* Process row by row (small n_tokens path; prefill) */
-    for (uint32_t i = 0; i < n_tokens; i++) {
-        ds4_metal_tensor src = *kv;
-        src.offset = kv->offset + (uint64_t)i * head_dim * sizeof(float);
-        src.bytes = (uint64_t)head_dim * sizeof(float);
-        if (!ds4_metal_store_raw_kv_tensor(raw_cache, &src, raw_cap, pos0 + i, head_dim)) return 0;
-    }
-    return 1;
+    const dim3 block(256);
+    const dim3 grid((head_dim + block.x - 1u) / block.x, n_tokens);
+    hipLaunchKernelGGL(rocm_store_raw_kv_batch_kernel, grid, block, 0, 0,
+                       (float *)tensor_u8(raw_cache),
+                       (const float *)tensor_u8_const(kv),
+                       head_dim, pos0, n_tokens);
+    return rocm_launch_done("store raw kv batch launch", "store raw kv batch completion");
 }
 
 __global__ static void rocm_kv_fp8_store_raw_kernel(float *kv,
@@ -3373,6 +3357,66 @@ __global__ static void rocm_router_softplus_sqrt_kernel(float *probs,
     probs[i] = sqrtf(sp > 0.0f ? sp : 0.0f);
 }
 
+__global__ static void rocm_router_softplus_sqrt_batch_kernel(float *probs,
+                                                              const float *logits,
+                                                              uint32_t n_expert,
+                                                              uint32_t n_tokens) {
+    const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (e >= n_expert || t >= n_tokens) return;
+    const uint64_t off = (uint64_t)t * n_expert + e;
+    const float l = logits[off];
+    const float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+    probs[off] = sqrtf(sp > 0.0f ? sp : 0.0f);
+}
+
+/* One block per token; each block runs the same single-thread routine
+ * as the per-token kernel but reads its own probs/logits row and writes
+ * its own selected/weights row.  Eliminates the 21-launch loop in the
+ * per-token batch wrapper. */
+__global__ static void rocm_router_select_batch_kernel(int32_t *selected,
+                                                       float *weights,
+                                                       const float *probs,
+                                                       const float *bias,
+                                                       const int32_t *hash,
+                                                       const int32_t *tokens,
+                                                       uint32_t n_expert,
+                                                       uint32_t n_used,
+                                                       uint32_t hash_rows,
+                                                       int has_bias,
+                                                       int hash_mode) {
+    if (threadIdx.x != 0) return;
+    const uint32_t t = blockIdx.x;
+    int32_t *sel_t = selected + (uint64_t)t * n_used;
+    float   *w_t   = weights  + (uint64_t)t * n_used;
+    const float *probs_t = probs + (uint64_t)t * n_expert;
+    const uint32_t token = (uint32_t)tokens[t];
+
+    if (hash_mode) {
+        const uint32_t row = token < hash_rows ? token : hash_rows - 1u;
+        for (uint32_t i = 0; i < n_used; i++) sel_t[i] = hash[row * n_used + i];
+    } else {
+        for (uint32_t k = 0; k < n_used; k++) {
+            float best_v = -3.4028234663852886e38f;
+            int32_t best_i = -1;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                float v = probs_t[e];
+                if (has_bias) v += bias[e];
+                int taken = 0;
+                for (uint32_t kk = 0; kk < k; kk++) if (sel_t[kk] == (int32_t)e) { taken = 1; break; }
+                if (taken) continue;
+                if (v > best_v) { best_v = v; best_i = (int32_t)e; }
+            }
+            sel_t[k] = best_i;
+        }
+    }
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_used; i++) sum += probs_t[sel_t[i]];
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t i = 0; i < n_used; i++) w_t[i] = probs_t[sel_t[i]] / sum * 1.5f;
+}
+
 __global__ static void rocm_router_select_one_kernel(int32_t *selected,
                                                      float *weights,
                                                      const float *probs,
@@ -3506,32 +3550,63 @@ int ds4_metal_router_select_batch_tensor(
         uint32_t                n_tokens) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_router_select_batch_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_router_select_batch_tensor");
-    if (!selected || !weights || !probs || !logits || !tokens) return 0;
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!selected || !weights || !probs || !logits || !tokens || n_tokens == 0) return 0;
     if (n_expert_groups == 0) n_expert_groups = 256u;
     if (n_group_used == 0) n_group_used = 6u;
-    /* Per-token loop is fine for small batch sizes; prefill hits hash-mode anyway. */
-    const int32_t *toks = (const int32_t *)tensor_u8_const(tokens);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        ds4_metal_tensor sel_v = *selected;
-        sel_v.offset = selected->offset + (uint64_t)t * n_group_used * sizeof(int32_t);
-        sel_v.bytes = (uint64_t)n_group_used * sizeof(int32_t);
-        ds4_metal_tensor w_v = *weights;
-        w_v.offset = weights->offset + (uint64_t)t * n_group_used * sizeof(float);
-        w_v.bytes = (uint64_t)n_group_used * sizeof(float);
-        ds4_metal_tensor p_v = *probs;
-        p_v.offset = probs->offset + (uint64_t)t * n_expert_groups * sizeof(float);
-        p_v.bytes = (uint64_t)n_expert_groups * sizeof(float);
-        ds4_metal_tensor l_v = *logits;
-        l_v.offset = logits->offset + (uint64_t)t * n_expert_groups * sizeof(float);
-        l_v.bytes = (uint64_t)n_expert_groups * sizeof(float);
-        if (!ds4_metal_router_select_tensor(&sel_v, &w_v, &p_v, model_map, model_size,
-                                            bias_offset, hash_offset, hash_rows,
-                                            (uint32_t)toks[t], n_expert_groups,
-                                            n_group_used, has_bias, hash_mode, &l_v)) {
-            return 0;
+    if (selected->bytes < (uint64_t)n_tokens * n_group_used * sizeof(int32_t)) return 0;
+    if (weights->bytes  < (uint64_t)n_tokens * n_group_used * sizeof(float))   return 0;
+    if (probs->bytes    < (uint64_t)n_tokens * n_expert_groups * sizeof(float))return 0;
+    if (logits->bytes   < (uint64_t)n_tokens * n_expert_groups * sizeof(float))return 0;
+    if (tokens->bytes   < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+
+    /* Batched probs := sqrt(softplus(logits)) over (n_expert × n_tokens). */
+    {
+        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
+        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
+        const dim3 grid(blocks, n_tokens);
+        const dim3 block(threads);
+        hipLaunchKernelGGL(rocm_router_softplus_sqrt_batch_kernel, grid, block, 0, 0,
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           n_expert_groups, n_tokens);
+        if (!rocm_launch_done("router softplus_sqrt batch launch",
+                              "router softplus_sqrt batch completion")) return 0;
+    }
+
+    void *bh = NULL, *bd = NULL;
+    void *hh = NULL, *hd = NULL;
+    if (has_bias) {
+        if (bias_offset > model_size ||
+            (uint64_t)n_expert_groups * sizeof(float) > model_size - bias_offset) return 0;
+        if (!rocm_upload_mapped((const uint8_t *)model_map + bias_offset,
+                                (uint64_t)n_expert_groups * sizeof(float),
+                                &bh, &bd, "router bias upload")) return 0;
+    }
+    if (hash_mode) {
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_group_used * sizeof(int32_t);
+        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) {
+            rocm_defer_free(bh); return 0;
+        }
+        if (!rocm_upload_mapped((const uint8_t *)model_map + hash_offset, hash_bytes,
+                                &hh, &hd, "router hash upload")) {
+            rocm_defer_free(bh); return 0;
         }
     }
-    return 1;
+
+    hipLaunchKernelGGL(rocm_router_select_batch_kernel, dim3(n_tokens), dim3(1), 0, 0,
+                       (int32_t *)tensor_u8(selected),
+                       (float *)tensor_u8(weights),
+                       (const float *)tensor_u8_const(probs),
+                       (const float *)bd,
+                       (const int32_t *)hd,
+                       (const int32_t *)tensor_u8_const(tokens),
+                       n_expert_groups, n_group_used, hash_rows,
+                       has_bias ? 1 : 0, hash_mode ? 1 : 0);
+    int ok = rocm_launch_done("router select batch launch", "router select batch completion");
+    rocm_defer_free(bh);
+    rocm_defer_free(hh);
+    return ok;
 }
 
 /* =========================================================================

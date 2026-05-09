@@ -1,0 +1,26 @@
+ROCm CPU hotspots: attribute two-core benchmark load and move sampling/readback GPU-side
+
+Status: Open
+
+Goal
+Explain and reduce the two-core CPU spike observed during ROCm benchmark runs. Confirm which time is HIP runtime/driver synchronization and command submission versus actual inference-side CPU work, then move avoidable per-token CPU work onto the GPU.
+
+Context
+The ROCm path is not a wholesale CPU inference fallback: generation calls metal_graph_prefill_* and metal_graph_eval_token_raw_swa(), which submit ROCm kernels. However, each decode token still uses the CPU to encode/launch many wrappers, synchronize at command boundaries, read back the full logits tensor, and run sample_argmax() over DS4_N_VOCAB. HIP/ROCm may also spin one host thread during hipDeviceSynchronize().
+
+Evidence
+- ds4.c metal_generate(): after each GPU eval, token selection is sample_argmax(logits, DS4_N_VOCAB).
+- ds4.c metal_graph_eval_token_raw_swa(): begin commands, encode graph, end commands, then ds4_metal_tensor_read(g->logits, full vocab).
+- ds4_rocm.c command boundaries currently use hipDeviceSynchronize(); tensor_read copies full logits to host.
+- ds4_rocm.c still uses host-mapped tensors and some host memcpy/memmove paths.
+
+Next steps
+1. Measure first: run benchmark under perf/top with thread names if possible and compare DS4_METAL_GRAPH_TOKEN_PROFILE=1 plus DS4_ROCM_TIME=1. Attribute CPU to ds4 main thread, ROCm runtime threads, memcpy/readback, or sampling.
+2. Add a GPU argmax/top-k wrapper for logits so argmax decode reads back only one int token instead of the full vocab logits. Keep full logits readback only for debug, sampling modes that require it, or API callers that request logits.
+3. For temp=0 CLI generation, thread the GPU-selected token through decode so the next token can be fed without scanning logits on CPU.
+4. Longer term: reduce CPU launch overhead with real stream-backed command batching, HIP graphs, or larger fused kernels; command encoding itself cannot disappear without coarser GPU work units.
+5. Audit host-mapped tensors and tensor_write/tensor_copy calls during open batches; move hot activations to device memory and use stream-ordered async copies where CPU visibility is not required.
+
+Validation
+- Compare per-token CPU utilization and generation t/s before/after on the same prompt, n, seed, temp=0.
+- tsk-3 gate still passes: build, 40 ROCm kernel tests ending in OK, coherent 200-token ROCm inference.

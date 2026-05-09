@@ -419,6 +419,63 @@ static void moe_build_q2_K_block(moe_block_q2_K *b, uint32_t seed) {
     }
 }
 
+/* Build a Q8_0 weight matrix into `dst` covering `out_dim` rows of `in_dim`
+ * inputs.  `gen(r, c)` returns the desired float value for row r, column c.
+ * Each block holds 32 quantized int8 values + 2-byte FP16 scale; rows are laid
+ * out as ((in_dim+31)/32) blocks contiguously per row.
+ *
+ * Returns the number of bytes written. */
+typedef float (*q8_gen_fn)(uint32_t r, uint32_t c, void *ctx);
+__attribute__((unused))
+static uint64_t build_q8_0_matrix(uint8_t *dst, uint64_t in_dim, uint64_t out_dim,
+                                   q8_gen_fn gen, void *ctx) {
+    const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks_per_row * 34u;
+    for (uint64_t r = 0; r < out_dim; r++) {
+        for (uint64_t b = 0; b < blocks_per_row; b++) {
+            float vals[32];
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) {
+                const uint64_t c = b * 32u + i;
+                vals[i] = (c < in_dim) ? gen((uint32_t)r, (uint32_t)c, ctx) : 0.0f;
+                if (fabsf(vals[i]) > amax) amax = fabsf(vals[i]);
+            }
+            float scale = amax / 127.0f;
+            if (scale == 0.0f) scale = 1.0f;
+            uint16_t hf = f32_to_f16(scale);
+            uint8_t *blk = dst + r * row_bytes + b * 34u;
+            blk[0] = (uint8_t)(hf & 0xffu);
+            blk[1] = (uint8_t)(hf >> 8);
+            for (uint32_t i = 0; i < 32; i++) {
+                int q = (int)roundf(vals[i] / scale);
+                if (q < -127) q = -127;
+                if (q > 127) q = 127;
+                blk[2 + i] = (uint8_t)(int8_t)q;
+            }
+        }
+    }
+    return out_dim * row_bytes;
+}
+
+/* CPU oracle for a single Q8_0 row: dot product of row r of W against x[in_dim]. */
+static float q8_0_row_dot(const uint8_t *W, uint64_t in_dim, uint64_t r, const float *x) {
+    const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks_per_row * 34u;
+    const uint8_t *row = W + r * row_bytes;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks_per_row; b++) {
+        const uint8_t *blk = row + b * 34u;
+        const uint16_t hf = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const float scale = f16_to_f32(hf);
+        for (uint32_t i = 0; i < 32; i++) {
+            const uint64_t c = b * 32u + i;
+            if (c >= in_dim) break;
+            acc += scale * (float)(int8_t)blk[2 + i] * x[c];
+        }
+    }
+    return acc;
+}
+
 int main(void) {
     STEP("init");
     if (!ds4_metal_init()) {
@@ -2051,6 +2108,961 @@ int main(void) {
         /* `model` is intentionally leaked: ds4_metal_cleanup() runs after this
          * step and unregisters it; freeing it here would unpin live device
          * mappings.  The test exits right after cleanup so the OS reclaims. */
+    }
+
+    STEP("hc_split_weighted_sum_norm with non-trivial params (multi-token)");
+    {
+        const uint32_t n_embd = 16;
+        const uint32_t n_hc = 4;
+        const uint32_t n_tokens = 3;
+        const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc; /* 24 */
+        const uint32_t sinkhorn_iters = 2;
+        const float eps = 1e-6f;
+        const float norm_eps = 1e-5f;
+
+        float scales[3] = { 0.75f, 1.25f, -0.5f };
+        float bases[24];
+        for (uint32_t i = 0; i < 24; i++) bases[i] = 0.05f * (float)i - 0.4f;
+        float norm_w[16];
+        for (uint32_t i = 0; i < 16; i++) norm_w[i] = 0.5f + 0.1f * (float)i;
+
+        float mix[3 * 24];
+        float residual[3 * 4 * 16];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < mix_hc; i++)
+                mix[t * mix_hc + i] = 0.2f * sinf((float)(t * 31 + i + 1));
+            for (uint32_t h = 0; h < n_hc; h++) {
+                for (uint32_t d = 0; d < n_embd; d++) {
+                    residual[(t * n_hc + h) * n_embd + d] =
+                        0.1f * cosf((float)(t * 17 + h * 7 + d) * 0.3f);
+                }
+            }
+        }
+
+        ds4_metal_tensor *tmix2  = ds4_metal_tensor_alloc(sizeof(mix));
+        ds4_metal_tensor *tres2  = ds4_metal_tensor_alloc(sizeof(residual));
+        ds4_metal_tensor *tsplit2 = ds4_metal_tensor_alloc(sizeof(mix));
+        ds4_metal_tensor *thc2   = ds4_metal_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(float));
+        ds4_metal_tensor *tnorm2 = ds4_metal_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(float));
+        require(tmix2 && tres2 && tsplit2 && thc2 && tnorm2, "hc nontrivial alloc");
+        require(ds4_metal_tensor_write(tmix2, 0, mix, sizeof(mix)), "hc nontrivial mix");
+        require(ds4_metal_tensor_write(tres2, 0, residual, sizeof(residual)), "hc nontrivial res");
+
+        uint8_t blob[sizeof(scales) + sizeof(bases) + sizeof(norm_w)];
+        memcpy(blob, scales, sizeof(scales));
+        memcpy(blob + sizeof(scales), bases, sizeof(bases));
+        memcpy(blob + sizeof(scales) + sizeof(bases), norm_w, sizeof(norm_w));
+        require(ds4_metal_hc_split_weighted_sum_norm_tensor(
+                    thc2, tnorm2, tsplit2, tmix2, tres2, blob, sizeof(blob),
+                    0, sizeof(scales), sizeof(scales) + sizeof(bases),
+                    n_embd, n_hc, sinkhorn_iters, eps, norm_eps),
+                "hc nontrivial");
+
+        float ref_split[3 * 24];
+        float ref_out[3 * 16];
+        float ref_norm[3 * 16];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            float *sp = ref_split + t * mix_hc;
+            const float *mp = mix + t * mix_hc;
+            float pre_arr[4];
+            for (uint32_t h = 0; h < 4; h++) {
+                float z = mp[h] * scales[0] + bases[h];
+                pre_arr[h] = 1.0f / (1.0f + expf(-z)) + eps;
+                sp[h] = pre_arr[h];
+            }
+            for (uint32_t h = 0; h < 4; h++) {
+                float z = mp[4 + h] * scales[1] + bases[4 + h];
+                sp[4 + h] = 2.0f / (1.0f + expf(-z));
+            }
+            float r[4][4];
+            for (uint32_t i = 0; i < 4; i++) {
+                float maxv = -3.4028234663852886e38f;
+                for (uint32_t j = 0; j < 4; j++) {
+                    r[i][j] = mp[8 + i * 4 + j] * scales[2] + bases[8 + i * 4 + j];
+                    if (r[i][j] > maxv) maxv = r[i][j];
+                }
+                float row_sum = 0.0f;
+                for (uint32_t j = 0; j < 4; j++) {
+                    r[i][j] = expf(r[i][j] - maxv);
+                    row_sum += r[i][j];
+                }
+                for (uint32_t j = 0; j < 4; j++) r[i][j] = r[i][j] / row_sum + eps;
+            }
+            /* Matches Metal kernel_dsv4_hc_split_weighted_sum_norm4: one col-norm
+             * then (sinkhorn_iters - 1) of (row, col), with +eps in every denom. */
+            for (uint32_t j = 0; j < 4; j++) {
+                float col_sum = eps;
+                for (uint32_t i = 0; i < 4; i++) col_sum += r[i][j];
+                for (uint32_t i = 0; i < 4; i++) r[i][j] /= col_sum;
+            }
+            for (uint32_t it = 1; it < sinkhorn_iters; it++) {
+                for (uint32_t i = 0; i < 4; i++) {
+                    float row_sum = eps;
+                    for (uint32_t j = 0; j < 4; j++) row_sum += r[i][j];
+                    for (uint32_t j = 0; j < 4; j++) r[i][j] /= row_sum;
+                }
+                for (uint32_t j = 0; j < 4; j++) {
+                    float col_sum = eps;
+                    for (uint32_t i = 0; i < 4; i++) col_sum += r[i][j];
+                    for (uint32_t i = 0; i < 4; i++) r[i][j] /= col_sum;
+                }
+            }
+            for (uint32_t i = 0; i < 4; i++)
+                for (uint32_t j = 0; j < 4; j++) sp[8 + i * 4 + j] = r[i][j];
+
+            float ss = 0.0f;
+            for (uint32_t d = 0; d < n_embd; d++) {
+                float v = 0.0f;
+                for (uint32_t h = 0; h < 4; h++)
+                    v += residual[(t * 4 + h) * n_embd + d] * pre_arr[h];
+                ref_out[t * n_embd + d] = v;
+                ss += v * v;
+            }
+            float ns = 1.0f / sqrtf(ss / (float)n_embd + norm_eps);
+            for (uint32_t d = 0; d < n_embd; d++) {
+                ref_norm[t * n_embd + d] = ref_out[t * n_embd + d] * ns * norm_w[d];
+            }
+        }
+
+        float got_split[3 * 24], got_out[3 * 16], got_norm[3 * 16];
+        read_tensor(tsplit2, got_split, n_tokens * mix_hc);
+        read_tensor(thc2, got_out, n_tokens * n_embd);
+        read_tensor(tnorm2, got_norm, n_tokens * n_embd);
+        for (uint32_t i = 0; i < n_tokens * mix_hc; i++)
+            require(nearf(got_split[i], ref_split[i], 1e-5f), "hc nontrivial split");
+        for (uint32_t i = 0; i < n_tokens * n_embd; i++)
+            require(nearf(got_out[i], ref_out[i], 1e-5f), "hc nontrivial out");
+        for (uint32_t i = 0; i < n_tokens * n_embd; i++)
+            require(nearf(got_norm[i], ref_norm[i], 1e-5f), "hc nontrivial norm");
+
+        ds4_metal_tensor_free(tnorm2);
+        ds4_metal_tensor_free(thc2);
+        ds4_metal_tensor_free(tsplit2);
+        ds4_metal_tensor_free(tres2);
+        ds4_metal_tensor_free(tmix2);
+    }
+
+    STEP("output_hc_weights with non-trivial bias");
+    {
+        const uint32_t n_hc = 4;
+        const uint32_t n_tokens = 5;
+        const float eps = 1e-6f;
+        float pre_in[5 * 4];
+        for (uint32_t i = 0; i < 20; i++) pre_in[i] = 0.5f * sinf((float)(i + 1) * 0.4f);
+        float scale = 1.5f;
+        float base[4] = { -0.3f, 0.4f, 0.0f, 0.7f };
+
+        ds4_metal_tensor *tpre = ds4_metal_tensor_alloc(sizeof(pre_in));
+        ds4_metal_tensor *touw = ds4_metal_tensor_alloc(sizeof(pre_in));
+        require(tpre && touw, "output_hc alloc");
+        require(ds4_metal_tensor_write(tpre, 0, pre_in, sizeof(pre_in)), "output_hc pre");
+
+        uint8_t blob[sizeof(scale) + sizeof(base)];
+        memcpy(blob, &scale, sizeof(scale));
+        memcpy(blob + sizeof(scale), base, sizeof(base));
+        require(ds4_metal_output_hc_weights_tensor(touw, tpre, blob, sizeof(blob),
+                                                   0, sizeof(scale), n_hc, eps),
+                "output_hc");
+        float got[20];
+        read_tensor(touw, got, 20);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t h = 0; h < 4; h++) {
+                float z = pre_in[t * 4 + h] * scale + base[h];
+                float ref = 1.0f / (1.0f + expf(-z)) + eps;
+                require(nearf(got[t * 4 + h], ref, 1e-6f), "output_hc value");
+            }
+        }
+        ds4_metal_tensor_free(touw);
+        ds4_metal_tensor_free(tpre);
+    }
+
+    STEP("hc_weighted_sum with non-trivial weights (multi-token)");
+    {
+        const uint32_t n_embd = 12;
+        const uint32_t n_hc = 4;
+        const uint32_t n_tokens = 3;
+        float resid[3 * 4 * 12];
+        float w[3 * 4];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t h = 0; h < 4; h++) {
+                w[t * 4 + h] = 0.1f + 0.2f * (float)(t * 4 + h);
+                for (uint32_t d = 0; d < n_embd; d++) {
+                    resid[(t * 4 + h) * n_embd + d] = sinf((float)(t * 11 + h * 5 + d) * 0.7f);
+                }
+            }
+        }
+        ds4_metal_tensor *tres3 = ds4_metal_tensor_alloc(sizeof(resid));
+        ds4_metal_tensor *tw3 = ds4_metal_tensor_alloc(sizeof(w));
+        ds4_metal_tensor *tout3 = ds4_metal_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(float));
+        require(tres3 && tw3 && tout3, "hc wsum alloc");
+        require(ds4_metal_tensor_write(tres3, 0, resid, sizeof(resid)), "hc wsum res");
+        require(ds4_metal_tensor_write(tw3, 0, w, sizeof(w)), "hc wsum w");
+        require(ds4_metal_hc_weighted_sum_tensor(tout3, tres3, tw3, n_embd, n_hc),
+                "hc weighted_sum");
+        float got[3 * 12];
+        read_tensor(tout3, got, n_tokens * n_embd);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                float ref = 0.0f;
+                for (uint32_t h = 0; h < 4; h++)
+                    ref += resid[(t * 4 + h) * n_embd + d] * w[t * 4 + h];
+                require(nearf(got[t * n_embd + d], ref, 1e-5f), "hc weighted_sum value");
+            }
+        }
+        ds4_metal_tensor_free(tout3);
+        ds4_metal_tensor_free(tw3);
+        ds4_metal_tensor_free(tres3);
+    }
+
+    STEP("hc_expand_split (block + comb*residual via split layout)");
+    {
+        const uint32_t n_embd = 8;
+        const uint32_t n_hc = 4;
+        const uint32_t n_tokens = 2;
+        const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc; /* 24 */
+        float block_in[2 * 8];
+        float resid[2 * 4 * 8];
+        float split_in[2 * 24];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t d = 0; d < n_embd; d++)
+                block_in[t * n_embd + d] = 0.5f * sinf((float)(t * 13 + d) * 0.5f);
+            for (uint32_t h = 0; h < n_hc; h++)
+                for (uint32_t d = 0; d < n_embd; d++)
+                    resid[(t * n_hc + h) * n_embd + d] = 0.3f * cosf((float)(t * 7 + h * 3 + d) * 0.4f);
+            for (uint32_t i = 0; i < mix_hc; i++)
+                split_in[t * mix_hc + i] = 0.1f * (float)((int)i - 11) + 0.05f * (float)t;
+        }
+        ds4_metal_tensor *tblk = ds4_metal_tensor_alloc(sizeof(block_in));
+        ds4_metal_tensor *tres4 = ds4_metal_tensor_alloc(sizeof(resid));
+        ds4_metal_tensor *tspl = ds4_metal_tensor_alloc(sizeof(split_in));
+        ds4_metal_tensor *tout4 = ds4_metal_tensor_alloc(sizeof(resid));
+        require(tblk && tres4 && tspl && tout4, "hc expand_split alloc");
+        require(ds4_metal_tensor_write(tblk, 0, block_in, sizeof(block_in)), "");
+        require(ds4_metal_tensor_write(tres4, 0, resid, sizeof(resid)), "");
+        require(ds4_metal_tensor_write(tspl, 0, split_in, sizeof(split_in)), "");
+        require(ds4_metal_hc_expand_split_tensor(tout4, tblk, tres4, tspl, n_embd, n_hc),
+                "hc expand_split");
+        float got[2 * 4 * 8];
+        read_tensor(tout4, got, n_tokens * n_hc * n_embd);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const float *post = split_in + t * mix_hc + n_hc;
+            const float *comb = split_in + t * mix_hc + 2u * n_hc;
+            for (uint32_t dst_hc = 0; dst_hc < 4; dst_hc++) {
+                for (uint32_t d = 0; d < n_embd; d++) {
+                    float ref = block_in[t * n_embd + d] * post[dst_hc];
+                    for (uint32_t src_hc = 0; src_hc < 4; src_hc++)
+                        ref += comb[dst_hc * 4 + src_hc] * resid[(t * n_hc + src_hc) * n_embd + d];
+                    require(nearf(got[(t * n_hc + dst_hc) * n_embd + d], ref, 1e-5f),
+                            "hc expand_split value");
+                }
+            }
+        }
+        ds4_metal_tensor_free(tout4);
+        ds4_metal_tensor_free(tspl);
+        ds4_metal_tensor_free(tres4);
+        ds4_metal_tensor_free(tblk);
+    }
+
+    STEP("hc_expand_add_split (block_out + block_add)");
+    {
+        const uint32_t n_embd = 6;
+        const uint32_t n_hc = 4;
+        const uint32_t n_tokens = 2;
+        const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+        float bo[2 * 6], ba[2 * 6];
+        float resid[2 * 4 * 6];
+        float split_in[2 * 24];
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                bo[t * n_embd + d] = 0.4f * cosf((float)(t * 5 + d) * 0.6f);
+                ba[t * n_embd + d] = 0.3f * sinf((float)(t * 9 + d) * 0.5f);
+            }
+            for (uint32_t h = 0; h < n_hc; h++)
+                for (uint32_t d = 0; d < n_embd; d++)
+                    resid[(t * n_hc + h) * n_embd + d] = 0.2f * sinf((float)(t * 3 + h * 11 + d) * 0.7f);
+            for (uint32_t i = 0; i < mix_hc; i++)
+                split_in[t * mix_hc + i] = 0.05f * (float)((int)i - 12) - 0.02f * (float)t;
+        }
+        ds4_metal_tensor *tbo = ds4_metal_tensor_alloc(sizeof(bo));
+        ds4_metal_tensor *tba = ds4_metal_tensor_alloc(sizeof(ba));
+        ds4_metal_tensor *tres5 = ds4_metal_tensor_alloc(sizeof(resid));
+        ds4_metal_tensor *tspl5 = ds4_metal_tensor_alloc(sizeof(split_in));
+        ds4_metal_tensor *tout5 = ds4_metal_tensor_alloc(sizeof(resid));
+        require(tbo && tba && tres5 && tspl5 && tout5, "hc expand_add alloc");
+        require(ds4_metal_tensor_write(tbo, 0, bo, sizeof(bo)), "");
+        require(ds4_metal_tensor_write(tba, 0, ba, sizeof(ba)), "");
+        require(ds4_metal_tensor_write(tres5, 0, resid, sizeof(resid)), "");
+        require(ds4_metal_tensor_write(tspl5, 0, split_in, sizeof(split_in)), "");
+        require(ds4_metal_hc_expand_add_split_tensor(tout5, tbo, tba, tres5, tspl5, n_embd, n_hc),
+                "hc expand_add_split");
+        float got[2 * 4 * 6];
+        read_tensor(tout5, got, n_tokens * n_hc * n_embd);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const float *post = split_in + t * mix_hc + n_hc;
+            const float *comb = split_in + t * mix_hc + 2u * n_hc;
+            for (uint32_t dst_hc = 0; dst_hc < 4; dst_hc++) {
+                for (uint32_t d = 0; d < n_embd; d++) {
+                    float bv = bo[t * n_embd + d] + ba[t * n_embd + d];
+                    float ref = bv * post[dst_hc];
+                    for (uint32_t src_hc = 0; src_hc < 4; src_hc++)
+                        ref += comb[dst_hc * 4 + src_hc] * resid[(t * n_hc + src_hc) * n_embd + d];
+                    require(nearf(got[(t * n_hc + dst_hc) * n_embd + d], ref, 1e-5f),
+                            "hc expand_add_split value");
+                }
+            }
+        }
+        ds4_metal_tensor_free(tout5);
+        ds4_metal_tensor_free(tspl5);
+        ds4_metal_tensor_free(tres5);
+        ds4_metal_tensor_free(tba);
+        ds4_metal_tensor_free(tbo);
+    }
+
+    STEP("matmul_f16_pair (two independent F16 matmuls)");
+    {
+        const uint32_t in_dim = 8;
+        const uint32_t out_dim = 5;
+        const uint32_t n_tok = 3;
+        uint16_t Wa[5 * 8], Wb[5 * 8];
+        float xv[3 * 8];
+        for (uint32_t r = 0; r < out_dim; r++) {
+            for (uint32_t c = 0; c < in_dim; c++) {
+                Wa[r * in_dim + c] = f32_to_f16(0.1f * (float)(r + 1) + 0.05f * (float)c);
+                Wb[r * in_dim + c] = f32_to_f16(-0.2f * (float)(r + 1) + 0.03f * (float)c);
+            }
+        }
+        for (uint32_t i = 0; i < n_tok * in_dim; i++) xv[i] = sinf((float)(i + 1) * 0.4f);
+        uint8_t blob[2 * sizeof(Wa)];
+        memcpy(blob, Wa, sizeof(Wa));
+        memcpy(blob + sizeof(Wa), Wb, sizeof(Wb));
+        ds4_metal_tensor *tx_p = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *toa = ds4_metal_tensor_alloc((uint64_t)n_tok * out_dim * sizeof(float));
+        ds4_metal_tensor *tob = ds4_metal_tensor_alloc((uint64_t)n_tok * out_dim * sizeof(float));
+        require(tx_p && toa && tob, "matmul_f16_pair alloc");
+        require(ds4_metal_tensor_write(tx_p, 0, xv, sizeof(xv)), "matmul_f16_pair x");
+        require(ds4_metal_matmul_f16_pair_tensor(toa, tob, blob, sizeof(blob),
+                                                  0, sizeof(Wa), in_dim, out_dim, tx_p, n_tok),
+                "matmul_f16_pair");
+        float ga[3 * 5], gb[3 * 5];
+        read_tensor(toa, ga, n_tok * out_dim);
+        read_tensor(tob, gb, n_tok * out_dim);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float refa = 0.0f, refb = 0.0f;
+                for (uint32_t c = 0; c < in_dim; c++) {
+                    refa += f16_to_f32(Wa[r * in_dim + c]) * xv[t * in_dim + c];
+                    refb += f16_to_f32(Wb[r * in_dim + c]) * xv[t * in_dim + c];
+                }
+                require(nearf(ga[t * out_dim + r], refa, 1e-3f), "f16_pair a value");
+                require(nearf(gb[t * out_dim + r], refb, 1e-3f), "f16_pair b value");
+            }
+        }
+        ds4_metal_tensor_free(tob);
+        ds4_metal_tensor_free(toa);
+        ds4_metal_tensor_free(tx_p);
+    }
+
+    STEP("kv_fp8_store_raw (FP8 nope + identity rot, ring offset)");
+    {
+        const uint32_t head_dim = 16;
+        const uint32_t n_rot = 4;
+        const uint32_t n_nope = head_dim - n_rot;
+        const uint32_t raw_cap = 4;
+        const uint32_t row = 2;
+        float kv_in[16];
+        for (uint32_t i = 0; i < head_dim; i++) kv_in[i] = 0.6f * sinf((float)(i + 1) * 0.5f);
+        float kv_orig[16];
+        memcpy(kv_orig, kv_in, sizeof(kv_in));
+
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv_in));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
+        require(tkv && traw, "kv_fp8_store alloc");
+        float zeros[4 * 16] = {0};
+        require(ds4_metal_tensor_write(traw, 0, zeros, sizeof(zeros)), "kv_fp8 raw zero");
+        require(ds4_metal_tensor_write(tkv, 0, kv_in, sizeof(kv_in)), "kv_fp8 kv");
+
+        require(ds4_metal_kv_fp8_store_raw_tensor(tkv, traw, raw_cap, row, head_dim, n_rot),
+                "kv_fp8_store_raw");
+
+        float got_kv[16], got_raw[4 * 16];
+        read_tensor(tkv, got_kv, head_dim);
+        read_tensor(traw, got_raw, raw_cap * head_dim);
+        /* Reconstruct expected FP8 round-trip on n_nope. */
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < n_nope; i++) if (fabsf(kv_orig[i]) > amax) amax = fabsf(kv_orig[i]);
+        if (amax < 1.0e-4f) amax = 1.0e-4f;
+        float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+        for (uint32_t i = 0; i < n_nope; i++) {
+            float ref = e4m3fn_dequant(fminf(fmaxf(kv_orig[i] / scale, -448.0f), 448.0f)) * scale;
+            require(nearf(got_kv[i], ref, 1e-6f), "kv_fp8 kv nope");
+            /* raw stores f16(ref); for small E4M3 magnitudes this round-trip is lossless. */
+            float raw_ref = f16_to_f32(f32_to_f16(ref));
+            require(nearf(got_raw[row * head_dim + i], raw_ref, 1e-6f), "kv_fp8 raw nope");
+        }
+        for (uint32_t i = n_nope; i < head_dim; i++) {
+            /* kv is unchanged for the RoPE region; raw stores f16(kv). */
+            require(nearf(got_kv[i], kv_orig[i], 1e-6f), "kv_fp8 kv rot identity");
+            float raw_ref = f16_to_f32(f32_to_f16(kv_orig[i]));
+            require(nearf(got_raw[row * head_dim + i], raw_ref, 1e-6f), "kv_fp8 raw rot identity");
+        }
+        /* Other ring rows must remain zero. */
+        for (uint32_t r = 0; r < raw_cap; r++) {
+            if (r == row) continue;
+            for (uint32_t i = 0; i < head_dim; i++) {
+                require(nearf(got_raw[r * head_dim + i], 0.0f, 1e-6f), "kv_fp8 other rows untouched");
+            }
+        }
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("attention_output_low_q8 (per-group Q8 matvec)");
+    {
+        const uint64_t group_dim = 32;          /* one Q8 block per row */
+        const uint64_t rank = 4;
+        const uint32_t n_groups = 3;
+        const uint64_t row_bytes = ((group_dim + 31u) / 32u) * 34u; /* 34 */
+        const uint64_t group_w_bytes = row_bytes * rank;
+        const uint64_t total_w = (uint64_t)n_groups * group_w_bytes;
+        uint8_t *W = (uint8_t *)calloc(1, (size_t)total_w);
+        require(W != NULL, "out_low_q8 W alloc");
+
+        struct gen_ctx { uint32_t group; } ctx_dummy = {0}; (void)ctx_dummy;
+        for (uint32_t g = 0; g < n_groups; g++) {
+            /* deterministic but distinct values per (g, r, c) */
+            for (uint32_t r = 0; r < rank; r++) {
+                /* build one row using a closure-ish manual pass */
+                const uint64_t blocks_per_row = (group_dim + 31u) / 32u;
+                const uint64_t this_row_bytes = blocks_per_row * 34u;
+                uint8_t *dst = W + (uint64_t)g * group_w_bytes + (uint64_t)r * this_row_bytes;
+                float vals[32];
+                float amax = 0.0f;
+                for (uint32_t c = 0; c < group_dim; c++) {
+                    vals[c] = 0.1f * sinf((float)(g * 17 + r * 5 + c) * 0.3f);
+                    if (fabsf(vals[c]) > amax) amax = fabsf(vals[c]);
+                }
+                float scale = amax / 127.0f;
+                if (scale == 0.0f) scale = 1.0f;
+                uint16_t hf = f32_to_f16(scale);
+                dst[0] = (uint8_t)(hf & 0xffu);
+                dst[1] = (uint8_t)(hf >> 8);
+                for (uint32_t c = 0; c < 32; c++) {
+                    int q = (int)roundf(vals[c] / scale);
+                    if (q < -127) q = -127;
+                    if (q > 127) q = 127;
+                    dst[2 + c] = (uint8_t)(int8_t)q;
+                }
+            }
+        }
+
+        float heads[3 * 32];
+        for (uint32_t i = 0; i < n_groups * group_dim; i++) heads[i] = cosf((float)(i + 1) * 0.4f);
+        ds4_metal_tensor *theads = ds4_metal_tensor_alloc(sizeof(heads));
+        ds4_metal_tensor *tlow = ds4_metal_tensor_alloc((uint64_t)n_groups * rank * sizeof(float));
+        require(theads && tlow, "out_low_q8 tensor alloc");
+        require(ds4_metal_tensor_write(theads, 0, heads, sizeof(heads)), "out_low_q8 heads");
+        require(ds4_metal_attention_output_low_q8_tensor(tlow, W, total_w, 0,
+                                                          group_dim, rank, n_groups, theads),
+                "attention_output_low_q8");
+        float got[3 * 4];
+        read_tensor(tlow, got, n_groups * rank);
+        for (uint32_t g = 0; g < n_groups; g++) {
+            const uint8_t *Wg = W + (uint64_t)g * group_w_bytes;
+            const float *xg = heads + (uint64_t)g * group_dim;
+            for (uint32_t r = 0; r < rank; r++) {
+                float ref = q8_0_row_dot(Wg, group_dim, r, xg);
+                require(nearf(got[g * rank + r], ref, 1e-3f), "attn out_low_q8 value");
+            }
+        }
+        ds4_metal_tensor_free(tlow);
+        ds4_metal_tensor_free(theads);
+        free(W);
+    }
+
+    STEP("shared_gate_up_swiglu_q8_0 (Q8 gate, Q8 up, SwiGLU fuse)");
+    {
+        const uint64_t in_dim = 32;
+        const uint64_t out_dim = 6;
+        const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+        const uint64_t row_bytes = blocks_per_row * 34u;
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        uint8_t *W = (uint8_t *)calloc(1, 2u * (size_t)weight_bytes);
+        require(W != NULL, "shared_gate_up W alloc");
+        /* Build Wg in [0, weight_bytes), Wu in [weight_bytes, 2*weight_bytes). */
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float gvals[32], uvals[32];
+            float amax_g = 0.0f, amax_u = 0.0f;
+            for (uint32_t c = 0; c < in_dim; c++) {
+                gvals[c] = 0.15f * cosf((float)(r * 7 + c) * 0.5f);
+                uvals[c] = 0.12f * sinf((float)(r * 11 + c) * 0.4f);
+                if (fabsf(gvals[c]) > amax_g) amax_g = fabsf(gvals[c]);
+                if (fabsf(uvals[c]) > amax_u) amax_u = fabsf(uvals[c]);
+            }
+            float sg = amax_g / 127.0f; if (sg == 0.0f) sg = 1.0f;
+            float su = amax_u / 127.0f; if (su == 0.0f) su = 1.0f;
+            uint16_t hg = f32_to_f16(sg);
+            uint16_t hu = f32_to_f16(su);
+            uint8_t *dg = W + (uint64_t)r * row_bytes;
+            uint8_t *du = W + weight_bytes + (uint64_t)r * row_bytes;
+            dg[0] = (uint8_t)(hg & 0xff); dg[1] = (uint8_t)(hg >> 8);
+            du[0] = (uint8_t)(hu & 0xff); du[1] = (uint8_t)(hu >> 8);
+            for (uint32_t c = 0; c < 32; c++) {
+                int qg = (int)roundf(gvals[c] / sg); if (qg<-127)qg=-127; if (qg>127)qg=127;
+                int qu = (int)roundf(uvals[c] / su); if (qu<-127)qu=-127; if (qu>127)qu=127;
+                dg[2 + c] = (uint8_t)(int8_t)qg;
+                du[2 + c] = (uint8_t)(int8_t)qu;
+            }
+        }
+        float xv[32];
+        for (uint32_t i = 0; i < in_dim; i++) xv[i] = 0.2f * sinf((float)(i + 1) * 0.6f);
+        ds4_metal_tensor *tx_s = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tg = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        ds4_metal_tensor *tu = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        ds4_metal_tensor *tmid_s = ds4_metal_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        require(tx_s && tg && tu && tmid_s, "shared_gate_up tensor alloc");
+        require(ds4_metal_tensor_write(tx_s, 0, xv, sizeof(xv)), "shared_gate_up x");
+        require(ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
+                    tg, tu, tmid_s, W, 2u * weight_bytes,
+                    0, weight_bytes, in_dim, out_dim, tx_s),
+                "shared_gate_up_swiglu_q8_0");
+        float gg[6], gu[6], gmid[6];
+        read_tensor(tg, gg, out_dim);
+        read_tensor(tu, gu, out_dim);
+        read_tensor(tmid_s, gmid, out_dim);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float refg = q8_0_row_dot(W, in_dim, r, xv);
+            float refu = q8_0_row_dot(W + weight_bytes, in_dim, r, xv);
+            require(nearf(gg[r], refg, 1e-3f), "shared_gate value");
+            require(nearf(gu[r], refu, 1e-3f), "shared_up value");
+            float silu = refg / (1.0f + expf(-refg));
+            require(nearf(gmid[r], silu * refu, 1e-3f), "shared_mid swiglu");
+        }
+        ds4_metal_tensor_free(tmid_s);
+        ds4_metal_tensor_free(tu);
+        ds4_metal_tensor_free(tg);
+        ds4_metal_tensor_free(tx_s);
+        free(W);
+    }
+
+    STEP("matmul_q8_0_hc_expand (Q8 matmul + hc_expand_split)");
+    {
+        const uint64_t in_dim = 32;
+        const uint32_t n_embd = 8;
+        const uint64_t out_dim = n_embd;
+        const uint32_t n_hc = 4;
+        const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc; /* 24 */
+        const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+        const uint64_t row_bytes = blocks_per_row * 34u;
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        uint8_t *W = (uint8_t *)calloc(1, (size_t)weight_bytes);
+        require(W != NULL, "q8_hc_expand W alloc");
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float vals[32];
+            float amax = 0.0f;
+            for (uint32_t c = 0; c < in_dim; c++) {
+                vals[c] = 0.1f * sinf((float)(r * 13 + c) * 0.4f);
+                if (fabsf(vals[c]) > amax) amax = fabsf(vals[c]);
+            }
+            float sc = amax / 127.0f; if (sc == 0.0f) sc = 1.0f;
+            uint16_t hf = f32_to_f16(sc);
+            uint8_t *d = W + (uint64_t)r * row_bytes;
+            d[0] = (uint8_t)(hf & 0xff); d[1] = (uint8_t)(hf >> 8);
+            for (uint32_t c = 0; c < 32; c++) {
+                int q = (int)roundf(vals[c] / sc); if (q<-127)q=-127; if (q>127)q=127;
+                d[2 + c] = (uint8_t)(int8_t)q;
+            }
+        }
+        float xv[32];
+        for (uint32_t i = 0; i < in_dim; i++) xv[i] = 0.3f * cosf((float)(i + 1) * 0.7f);
+        float resid[4 * 8];
+        for (uint32_t i = 0; i < n_hc * n_embd; i++) resid[i] = 0.2f * sinf((float)(i + 1) * 0.5f);
+        float split_in[24];
+        for (uint32_t i = 0; i < mix_hc; i++) split_in[i] = 0.05f * (float)((int)i - 12);
+
+        ds4_metal_tensor *tx_h = ds4_metal_tensor_alloc(sizeof(xv));
+        ds4_metal_tensor *tres_h = ds4_metal_tensor_alloc(sizeof(resid));
+        ds4_metal_tensor *tsplit_h = ds4_metal_tensor_alloc(sizeof(split_in));
+        ds4_metal_tensor *tblock = ds4_metal_tensor_alloc((uint64_t)n_embd * sizeof(float));
+        ds4_metal_tensor *tout_h = ds4_metal_tensor_alloc(sizeof(resid));
+        require(tx_h && tres_h && tsplit_h && tblock && tout_h, "q8_hc alloc");
+        require(ds4_metal_tensor_write(tx_h, 0, xv, sizeof(xv)), "");
+        require(ds4_metal_tensor_write(tres_h, 0, resid, sizeof(resid)), "");
+        require(ds4_metal_tensor_write(tsplit_h, 0, split_in, sizeof(split_in)), "");
+        require(ds4_metal_matmul_q8_0_hc_expand_tensor(
+                    tout_h, tblock, W, weight_bytes, 0, in_dim, out_dim, tx_h,
+                    tres_h, tsplit_h, n_embd, n_hc),
+                "matmul_q8_0_hc_expand");
+        float gblock[8];
+        read_tensor(tblock, gblock, n_embd);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float ref = q8_0_row_dot(W, in_dim, r, xv);
+            require(nearf(gblock[r], ref, 1e-3f), "q8_hc block value");
+        }
+        float gout[4 * 8];
+        read_tensor(tout_h, gout, n_hc * n_embd);
+        const float *post = split_in + n_hc;
+        const float *comb = split_in + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < 4; dst_hc++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                float ref = gblock[d] * post[dst_hc];
+                for (uint32_t src_hc = 0; src_hc < 4; src_hc++)
+                    ref += comb[dst_hc * 4 + src_hc] * resid[src_hc * n_embd + d];
+                require(nearf(gout[dst_hc * n_embd + d], ref, 1e-3f), "q8_hc out value");
+            }
+        }
+        ds4_metal_tensor_free(tout_h);
+        ds4_metal_tensor_free(tblock);
+        ds4_metal_tensor_free(tsplit_h);
+        ds4_metal_tensor_free(tres_h);
+        ds4_metal_tensor_free(tx_h);
+        free(W);
+    }
+
+    STEP("shared_down_hc_expand_q8_0 (Q8 down + (routed+shared) expand)");
+    {
+        const uint64_t in_dim = 32;
+        const uint32_t n_embd = 8;
+        const uint64_t out_dim = n_embd;
+        const uint32_t n_hc = 4;
+        const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+        const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+        const uint64_t row_bytes = blocks_per_row * 34u;
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        uint8_t *W = (uint8_t *)calloc(1, (size_t)weight_bytes);
+        require(W != NULL, "shared_down W alloc");
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float vals[32];
+            float amax = 0.0f;
+            for (uint32_t c = 0; c < in_dim; c++) {
+                vals[c] = 0.08f * sinf((float)(r * 19 + c) * 0.55f);
+                if (fabsf(vals[c]) > amax) amax = fabsf(vals[c]);
+            }
+            float sc = amax / 127.0f; if (sc == 0.0f) sc = 1.0f;
+            uint16_t hf = f32_to_f16(sc);
+            uint8_t *d = W + (uint64_t)r * row_bytes;
+            d[0] = (uint8_t)(hf & 0xff); d[1] = (uint8_t)(hf >> 8);
+            for (uint32_t c = 0; c < 32; c++) {
+                int q = (int)roundf(vals[c] / sc); if (q<-127)q=-127; if (q>127)q=127;
+                d[2 + c] = (uint8_t)(int8_t)q;
+            }
+        }
+        float shared_mid[32];
+        for (uint32_t i = 0; i < in_dim; i++) shared_mid[i] = 0.4f * sinf((float)(i + 1) * 0.3f);
+        float routed_out[8];
+        for (uint32_t i = 0; i < n_embd; i++) routed_out[i] = 0.3f * cosf((float)(i + 1) * 0.6f);
+        float resid[4 * 8];
+        for (uint32_t i = 0; i < n_hc * n_embd; i++) resid[i] = 0.15f * cosf((float)(i + 1) * 0.45f);
+        float split_in[24];
+        for (uint32_t i = 0; i < mix_hc; i++) split_in[i] = 0.04f * (float)((int)i - 11);
+
+        ds4_metal_tensor *tmid_d = ds4_metal_tensor_alloc(sizeof(shared_mid));
+        ds4_metal_tensor *trouted = ds4_metal_tensor_alloc(sizeof(routed_out));
+        ds4_metal_tensor *tres_d = ds4_metal_tensor_alloc(sizeof(resid));
+        ds4_metal_tensor *tspl_d = ds4_metal_tensor_alloc(sizeof(split_in));
+        ds4_metal_tensor *tshared = ds4_metal_tensor_alloc((uint64_t)n_embd * sizeof(float));
+        ds4_metal_tensor *tout_d = ds4_metal_tensor_alloc(sizeof(resid));
+        require(tmid_d && trouted && tres_d && tspl_d && tshared && tout_d, "shared_down alloc");
+        require(ds4_metal_tensor_write(tmid_d, 0, shared_mid, sizeof(shared_mid)), "");
+        require(ds4_metal_tensor_write(trouted, 0, routed_out, sizeof(routed_out)), "");
+        require(ds4_metal_tensor_write(tres_d, 0, resid, sizeof(resid)), "");
+        require(ds4_metal_tensor_write(tspl_d, 0, split_in, sizeof(split_in)), "");
+        require(ds4_metal_shared_down_hc_expand_q8_0_tensor(
+                    tout_d, tshared, W, weight_bytes, 0, in_dim, out_dim,
+                    tmid_d, trouted, tres_d, tspl_d, n_embd, n_hc),
+                "shared_down_hc_expand_q8_0");
+        float gshared[8];
+        read_tensor(tshared, gshared, n_embd);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float ref = q8_0_row_dot(W, in_dim, r, shared_mid);
+            require(nearf(gshared[r], ref, 1e-3f), "shared_down shared_out value");
+        }
+        float gout[4 * 8];
+        read_tensor(tout_d, gout, n_hc * n_embd);
+        const float *post = split_in + n_hc;
+        const float *comb = split_in + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < 4; dst_hc++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                float bv = routed_out[d] + gshared[d];
+                float ref = bv * post[dst_hc];
+                for (uint32_t src_hc = 0; src_hc < 4; src_hc++)
+                    ref += comb[dst_hc * 4 + src_hc] * resid[src_hc * n_embd + d];
+                require(nearf(gout[dst_hc * n_embd + d], ref, 1e-3f), "shared_down out value");
+            }
+        }
+        ds4_metal_tensor_free(tout_d);
+        ds4_metal_tensor_free(tshared);
+        ds4_metal_tensor_free(tspl_d);
+        ds4_metal_tensor_free(tres_d);
+        ds4_metal_tensor_free(trouted);
+        ds4_metal_tensor_free(tmid_d);
+        free(W);
+    }
+
+    STEP("dsv4_qkv_rms_norm_rows (paired weighted RMS)");
+    {
+        const uint32_t qn = 8;
+        const uint32_t kvn = 12;
+        const uint32_t rows = 3;
+        float qv[3 * 8], kvv[3 * 12];
+        float qw[8], kvw[12];
+        for (uint32_t i = 0; i < rows * qn; i++) qv[i] = sinf((float)(i + 1) * 0.4f);
+        for (uint32_t i = 0; i < rows * kvn; i++) kvv[i] = cosf((float)(i + 1) * 0.5f);
+        for (uint32_t i = 0; i < qn; i++) qw[i] = 0.5f + 0.1f * (float)i;
+        for (uint32_t i = 0; i < kvn; i++) kvw[i] = -0.3f + 0.05f * (float)i;
+        uint8_t blob[sizeof(qw) + sizeof(kvw)];
+        memcpy(blob, qw, sizeof(qw));
+        memcpy(blob + sizeof(qw), kvw, sizeof(kvw));
+        ds4_metal_tensor *tq_n = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *tkv_n = ds4_metal_tensor_alloc(sizeof(kvv));
+        ds4_metal_tensor *tq_o = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *tkv_o = ds4_metal_tensor_alloc(sizeof(kvv));
+        require(tq_n && tkv_n && tq_o && tkv_o, "dsv4_qkv alloc");
+        require(ds4_metal_tensor_write(tq_n, 0, qv, sizeof(qv)), "");
+        require(ds4_metal_tensor_write(tkv_n, 0, kvv, sizeof(kvv)), "");
+        require(ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
+                    tq_o, tq_n, blob, sizeof(blob), 0, qn,
+                    tkv_o, tkv_n, sizeof(qw), kvn, rows, 1e-6f),
+                "dsv4_qkv_rms_norm_rows");
+        float gq[3 * 8], gkv[3 * 12];
+        read_tensor(tq_o, gq, rows * qn);
+        read_tensor(tkv_o, gkv, rows * kvn);
+        for (uint32_t r = 0; r < rows; r++) {
+            float ss = 0.0f;
+            for (uint32_t i = 0; i < qn; i++) ss += qv[r * qn + i] * qv[r * qn + i];
+            float sc = 1.0f / sqrtf(ss / (float)qn + 1e-6f);
+            for (uint32_t i = 0; i < qn; i++)
+                require(nearf(gq[r * qn + i], qv[r * qn + i] * sc * qw[i], 1e-5f), "dsv4_qkv q value");
+        }
+        for (uint32_t r = 0; r < rows; r++) {
+            float ss = 0.0f;
+            for (uint32_t i = 0; i < kvn; i++) ss += kvv[r * kvn + i] * kvv[r * kvn + i];
+            float sc = 1.0f / sqrtf(ss / (float)kvn + 1e-6f);
+            for (uint32_t i = 0; i < kvn; i++)
+                require(nearf(gkv[r * kvn + i], kvv[r * kvn + i] * sc * kvw[i], 1e-5f), "dsv4_qkv kv value");
+        }
+        ds4_metal_tensor_free(tkv_o);
+        ds4_metal_tensor_free(tq_o);
+        ds4_metal_tensor_free(tkv_n);
+        ds4_metal_tensor_free(tq_n);
+    }
+
+    STEP("head_rms_norm (per-head independent RMS)");
+    {
+        const uint32_t n_tok = 2;
+        const uint32_t n_head = 3;
+        const uint32_t head_dim = 8;
+        float xv[2 * 3 * 8];
+        for (uint32_t i = 0; i < n_tok * n_head * head_dim; i++)
+            xv[i] = 0.4f * sinf((float)(i + 1) * 0.3f);
+        float ref[2 * 3 * 8];
+        memcpy(ref, xv, sizeof(xv));
+        ds4_metal_tensor *thx = ds4_metal_tensor_alloc(sizeof(xv));
+        require(thx != NULL, "head_rms alloc");
+        require(ds4_metal_tensor_write(thx, 0, xv, sizeof(xv)), "head_rms x");
+        require(ds4_metal_head_rms_norm_tensor(thx, n_tok, n_head, head_dim, 1e-6f),
+                "head_rms_norm");
+        float got[2 * 3 * 8];
+        read_tensor(thx, got, n_tok * n_head * head_dim);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint32_t h = 0; h < n_head; h++) {
+                float ss = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    float v = ref[(t * n_head + h) * head_dim + d];
+                    ss += v * v;
+                }
+                float sc = 1.0f / sqrtf(ss / (float)head_dim + 1e-6f);
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    float v = ref[(t * n_head + h) * head_dim + d];
+                    require(nearf(got[(t * n_head + h) * head_dim + d], v * sc, 1e-5f),
+                            "head_rms value");
+                }
+            }
+        }
+        ds4_metal_tensor_free(thx);
+    }
+
+    STEP("store_raw_kv (FP16 round-trip per row)");
+    {
+        const uint32_t head_dim = 8;
+        const uint32_t raw_cap = 5;
+        float kv_in[8] = { 0.5f, -0.25f, 1.125f, -2.5f, 0.0f, 3.75f, -0.0625f, 100.5f };
+        ds4_metal_tensor *tkv = ds4_metal_tensor_alloc(sizeof(kv_in));
+        ds4_metal_tensor *traw = ds4_metal_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
+        require(tkv && traw, "store_raw_kv alloc");
+        float zeros[5 * 8] = {0};
+        require(ds4_metal_tensor_write(traw, 0, zeros, sizeof(zeros)), "store_raw_kv raw zero");
+        require(ds4_metal_tensor_write(tkv, 0, kv_in, sizeof(kv_in)), "store_raw_kv write");
+        const uint32_t target_row = 3;
+        require(ds4_metal_store_raw_kv_tensor(traw, tkv, raw_cap, target_row, head_dim),
+                "store_raw_kv");
+        float got[5 * 8];
+        read_tensor(traw, got, raw_cap * head_dim);
+        for (uint32_t i = 0; i < head_dim; i++) {
+            float ref = f16_to_f32(f32_to_f16(kv_in[i]));
+            require(nearf(got[target_row * head_dim + i], ref, 1e-6f), "store_raw_kv row value");
+        }
+        for (uint32_t r = 0; r < raw_cap; r++) {
+            if (r == target_row) continue;
+            for (uint32_t i = 0; i < head_dim; i++) {
+                require(nearf(got[r * head_dim + i], 0.0f, 1e-6f), "store_raw_kv other row untouched");
+            }
+        }
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tkv);
+    }
+
+    STEP("store_raw_kv_batch (consecutive rows starting at pos0)");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t raw_cap = 6;
+        const uint32_t pos0 = 2;
+        const uint32_t n_tokens = 3;
+        float kv_in[3 * 4];
+        for (uint32_t i = 0; i < n_tokens * head_dim; i++) kv_in[i] = 0.5f * (float)(i + 1) - 1.5f;
+        ds4_metal_tensor *tkv2 = ds4_metal_tensor_alloc(sizeof(kv_in));
+        ds4_metal_tensor *traw2 = ds4_metal_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
+        require(tkv2 && traw2, "store_raw_kv_batch alloc");
+        float zeros[6 * 4] = {0};
+        require(ds4_metal_tensor_write(traw2, 0, zeros, sizeof(zeros)), "");
+        require(ds4_metal_tensor_write(tkv2, 0, kv_in, sizeof(kv_in)), "");
+        require(ds4_metal_store_raw_kv_batch_tensor(traw2, tkv2, raw_cap, pos0, n_tokens, head_dim),
+                "store_raw_kv_batch");
+        float got[6 * 4];
+        read_tensor(traw2, got, raw_cap * head_dim);
+        for (uint32_t r = 0; r < raw_cap; r++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                if (r >= pos0 && r < pos0 + n_tokens) {
+                    float ref = f16_to_f32(f32_to_f16(kv_in[(r - pos0) * head_dim + i]));
+                    require(nearf(got[r * head_dim + i], ref, 1e-6f), "store_raw_kv_batch value");
+                } else {
+                    require(nearf(got[r * head_dim + i], 0.0f, 1e-6f), "store_raw_kv_batch outside");
+                }
+            }
+        }
+        ds4_metal_tensor_free(traw2);
+        ds4_metal_tensor_free(tkv2);
+    }
+
+    STEP("router_select_tensor (defaults n_expert=256, n_used=6, no bias, no hash)");
+    {
+        const uint32_t n_expert = 256;
+        const uint32_t n_used = 6;
+        float logits[256];
+        for (uint32_t i = 0; i < n_expert; i++)
+            logits[i] = 0.5f * sinf((float)(i + 1) * 0.1f) - 0.2f * (float)((i / 32) % 5);
+
+        ds4_metal_tensor *tlog = ds4_metal_tensor_alloc(sizeof(logits));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc((uint64_t)n_used * sizeof(int32_t));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc((uint64_t)n_used * sizeof(float));
+        ds4_metal_tensor *tprobs = ds4_metal_tensor_alloc(sizeof(logits));
+        require(tlog && tsel && twts && tprobs, "router_select alloc");
+        require(ds4_metal_tensor_write(tlog, 0, logits, sizeof(logits)), "");
+        /* model_map can be a small dummy buffer since has_bias=false, hash_mode=false. */
+        uint8_t dummy[16] = {0};
+        require(ds4_metal_router_select_tensor(tsel, twts, tprobs, dummy, sizeof(dummy),
+                                                0, 0, 0, 0,
+                                                /*n_expert_groups=*/ 0, /*n_group_used=*/ 0,
+                                                /*has_bias=*/ false, /*hash_mode=*/ false,
+                                                tlog),
+                "router_select default");
+
+        float ref_probs[256];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            float l = logits[i];
+            float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+            ref_probs[i] = sqrtf(sp > 0.0f ? sp : 0.0f);
+        }
+        float got_probs[256];
+        read_tensor(tprobs, got_probs, n_expert);
+        for (uint32_t i = 0; i < n_expert; i++)
+            require(nearf(got_probs[i], ref_probs[i], 1e-5f), "router_select probs");
+
+        /* Reference top-k by probs (no bias). */
+        int32_t ref_sel[6];
+        int taken[256] = {0};
+        for (uint32_t k = 0; k < n_used; k++) {
+            float best = -3.4028234663852886e38f; int32_t best_i = -1;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (taken[e]) continue;
+                if (ref_probs[e] > best) { best = ref_probs[e]; best_i = (int32_t)e; }
+            }
+            ref_sel[k] = best_i;
+            taken[best_i] = 1;
+        }
+        int32_t got_sel[6];
+        ds4_metal_tensor_read(tsel, 0, got_sel, sizeof(got_sel));
+        for (uint32_t k = 0; k < n_used; k++)
+            require(got_sel[k] == ref_sel[k], "router_select selected");
+
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < n_used; k++) sum += ref_probs[ref_sel[k]];
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        float ref_w[6];
+        for (uint32_t k = 0; k < n_used; k++) ref_w[k] = ref_probs[ref_sel[k]] / sum * 1.5f;
+        float got_w[6];
+        read_tensor(twts, got_w, n_used);
+        for (uint32_t k = 0; k < n_used; k++)
+            require(nearf(got_w[k], ref_w[k], 1e-5f), "router_select weight");
+
+        ds4_metal_tensor_free(tprobs);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tlog);
+    }
+
+    STEP("router_select_tensor with bias");
+    {
+        const uint32_t n_expert = 256;
+        const uint32_t n_used = 6;
+        float logits[256];
+        float bias[256];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            logits[i] = 0.3f * cosf((float)(i + 1) * 0.07f);
+            bias[i] = (i % 17 == 0) ? 5.0f : 0.0f; /* boost specific experts */
+        }
+        uint8_t blob[256 * sizeof(float)];
+        memcpy(blob, bias, sizeof(bias));
+
+        ds4_metal_tensor *tlog = ds4_metal_tensor_alloc(sizeof(logits));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc((uint64_t)n_used * sizeof(int32_t));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc((uint64_t)n_used * sizeof(float));
+        ds4_metal_tensor *tprobs = ds4_metal_tensor_alloc(sizeof(logits));
+        require(tlog && tsel && twts && tprobs, "router_select bias alloc");
+        require(ds4_metal_tensor_write(tlog, 0, logits, sizeof(logits)), "");
+        require(ds4_metal_router_select_tensor(tsel, twts, tprobs, blob, sizeof(blob),
+                                                0, 0, 0, 0, 0, 0, true, false, tlog),
+                "router_select bias");
+        float ref_probs[256];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            float l = logits[i];
+            float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+            ref_probs[i] = sqrtf(sp > 0.0f ? sp : 0.0f);
+        }
+        int32_t ref_sel[6];
+        int taken[256] = {0};
+        for (uint32_t k = 0; k < n_used; k++) {
+            float best = -3.4028234663852886e38f; int32_t best_i = -1;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (taken[e]) continue;
+                float v = ref_probs[e] + bias[e];
+                if (v > best) { best = v; best_i = (int32_t)e; }
+            }
+            ref_sel[k] = best_i;
+            taken[best_i] = 1;
+        }
+        int32_t got_sel[6];
+        ds4_metal_tensor_read(tsel, 0, got_sel, sizeof(got_sel));
+        for (uint32_t k = 0; k < n_used; k++)
+            require(got_sel[k] == ref_sel[k], "router_select bias selected");
+        /* The biased experts (every 17th) should appear among the picks. */
+        int found_biased = 0;
+        for (uint32_t k = 0; k < n_used; k++) if (got_sel[k] % 17 == 0) found_biased = 1;
+        require(found_biased, "router_select bias actually applied");
+
+        ds4_metal_tensor_free(tprobs);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tlog);
     }
 
     STEP("cleanup");

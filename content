@@ -1,0 +1,18 @@
+Vulkan Phase 2: smoke kernels + kernel test harness
+
+PARENT: tsk-44.
+STATUS: planned, not started. Depends on Phase 1.
+
+GOAL
+Prove the kernel pipeline (GLSL -> SPIR-V -> dispatch -> readback) end-to-end with three real kernels and a CPU-oracle test harness mirroring tests/ds4_rocm_kernel_test.c.
+
+DELIVERABLES
+- shaders/copy_f32.comp — straight memcpy via storage buffers.
+- shaders/rms_norm_f32.comp — single-block RMS norm over a row, wave32 subgroup reduction via subgroupAdd().
+- shaders/matmul_q8_0_dec.comp — single Q8_0 decode matmul kernel (the simplest of the family). One row per workgroup, 32 threads (subgroupSize=32 forced), shared-memory tail reduction matches the ROCm wave-per-row pattern (see ds4_rocm.c rocm_wave32_sum and the F16 decode notes in feedback_f16_decode_lds_x).
+- ds4_vulkan.c wrappers ds4_metal_copy_tensor, ds4_metal_rms_norm, and one Q8_0 matmul wrapper, each shipping the SPIR-V via embedded blob, descriptor set with the input/output VkBuffers, push-constants for shape, and vkCmdDispatch.
+- tests/ds4_vulkan_kernel_test.c mirroring the ROCm harness STEP-by-STEP for the three kernels above. Use the same CPU oracles already in tests/ds4_rocm_kernel_test.c — extract them into a shared header if convenient (tests/ds4_kernel_oracles.h).
+- Makefile target ds4_vulkan_kernel_test analogous to ds4_rocm_kernel_test.
+
+VALIDATION
+DS4_VULKAN=1 make ds4_vulkan_kernel_test && ./ds4_vulkan_kernel_test ends with OK. Numerics match the ROCm oracle to the same tolerance the ROCm tests use.

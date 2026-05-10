@@ -49,7 +49,7 @@ dense models, we can report that:
 3. The model features a context window of **1 million tokens**.
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
-6. The KV cache is incredibly compress, allowing long context inference on local computers and **on disk KV cache persistence**.
+6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
 7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM.
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
@@ -57,15 +57,15 @@ That said, a few important things about this project:
 
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
 * This software is developed with **strong assistance from large language models** and with humans leading the ideas, testing, and debugging. Upstream credits GPT-5.5; the ROCm work in this fork is driven primarily by Claude (Opus 4.x). We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
+* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
 * Upstream is **Metal-only** (Apple Silicon). This fork adds a working
   **ROCm backend** for AMD Strix Halo (gfx1151); CUDA support is still not on
   the roadmap. The CPU path is only for correctness check, but **warning:
   current macOS versions have a bug in the virtual memory implementation
   that will crash the kernel** if you try to run the CPU code. Remember?
-  Software sucks. I was not possible to fix the CPU inference to avoid
-  crashing, since each time there is to restart the computer, which is not
+  Software sucks. It was not possible to fix the CPU inference to avoid
+  crashing, since each time you have to restart the computer, which is not
   funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
@@ -410,6 +410,11 @@ The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
 
+Tool calls also keep a small exact-DSML replay map keyed by unguessable tool
+IDs, so client JSON history can be rendered back to the exact sampled text. Use
+`--disable-exact-dsml-tool-replay` to disable this and fall back to canonical
+JSON-to-DSML rendering.
+
 On disk, a cache file is:
 
 ```text
@@ -417,6 +422,7 @@ KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
 DS4 session payload, payload_bytes from the KVC header
+optional tool-id map section
 ```
 
 The fixed header is little-endian:
@@ -426,7 +432,8 @@ The fixed header is little-endian:
 3   u8     version = 1
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8[2]  reserved
+6   u8     extension flags, bit 0 = appended tool-id map
+7   u8     reserved
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
@@ -441,6 +448,14 @@ It is stored only for observability, so humans can inspect a cache directory
 without decoding token IDs. It is not used as the key and it is not trusted
 when loading; after load, the stored checkpoint tokens must still match the
 incoming request prefix.
+
+The optional tool-id map is present only when header extension bit 0 is set.
+Appended sections use fixed bit order, so future extension bits can add fields
+without ambiguity. The map stores unguessable API tool call IDs back to the
+exact DSML block the model sampled. Only mappings whose DSML block is present
+in the rendered cached text are stored. This lets restarted servers render
+later client history byte-for-byte like the original model output, even if the
+client reorders JSON arguments.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -573,3 +588,24 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+## Debugging Notes
+
+When a generation looks wrong, three small tools are usually enough to get a
+first answer:
+
+```sh
+./ds4 --dump-tokens -p "..."
+./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./ds4-server --trace /tmp/ds4-trace.txt ...
+```
+
+- `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
+  written, recognizes DS4 protocol specials, and then exits before inference
+  starts. For example, the DSML tool close marker starts as two tokens: `</`
+  and `｜DSML｜`.
+- `--dump-logprobs` stores a greedy continuation with the top local
+  alternatives at each step, which helps separate sampling choices from
+  logit/model issues.
+- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
+  text, and tool-parser events for a whole agent session.

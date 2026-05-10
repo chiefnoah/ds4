@@ -12231,21 +12231,42 @@ static int ds4_metal_encode_router_select(
                                              0.0f);
         if (!ok) return 0;
 
+        const bool use_token_buffer = single_token == NULL;
         ds4_metal_dsv4_router_select_one_args args = {
             .has_bias = has_bias ? 1u : 0u,
             .hash_mode = hash_mode ? 1u : 0u,
-            .use_token_buffer = single_token ? 0u : 1u,
+            .use_token_buffer = use_token_buffer ? 1u : 0u,
             .token = single_token ? (uint32_t)*single_token : 0u,
             .hash_rows = hash_rows,
         };
+
+        const float zero_f32 = 0.0f;
+        const int32_t zero_i32 = 0;
+        if ((has_bias && !biasbuf) ||
+            (hash_mode && !hashbuf) ||
+            (use_token_buffer && !tokensbuf)) {
+            return 0;
+        }
 
         id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
         [enc setComputePipelineState:router_finalize_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:probsbuf offset:probs_off atIndex:1];
-        [enc setBuffer:biasbuf offset:bias_off atIndex:2];
-        [enc setBuffer:hashbuf offset:hash_off atIndex:3];
-        [enc setBuffer:tokensbuf offset:tokens_off atIndex:4];
+        if (has_bias) {
+            [enc setBuffer:biasbuf offset:bias_off atIndex:2];
+        } else {
+            [enc setBytes:&zero_f32 length:sizeof(zero_f32) atIndex:2];
+        }
+        if (hash_mode) {
+            [enc setBuffer:hashbuf offset:hash_off atIndex:3];
+        } else {
+            [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:3];
+        }
+        if (use_token_buffer) {
+            [enc setBuffer:tokensbuf offset:tokens_off atIndex:4];
+        } else {
+            [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:4];
+        }
         [enc setBuffer:selectedbuf offset:selected_off atIndex:5];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)

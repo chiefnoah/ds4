@@ -61,8 +61,8 @@ ifeq ($(UNAME_S),Darwin)
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o rax.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(NATIVE_LDLIBS)
@@ -70,11 +70,11 @@ else
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(if $(filter 1,$(DS4_ROCM)),$(ROCMCC),$(CC)) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o $(CORE_OBJS)
+ds4-server: ds4_server.o rax.o $(CORE_OBJS)
 	$(if $(filter 1,$(DS4_ROCM)),$(ROCMCC),$(CC)) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(NATIVE_LDLIBS)
 endif
 
 ds4.o: ds4.c ds4.h ds4_metal.h ds4_rocm.h
@@ -83,11 +83,14 @@ ds4.o: ds4.c ds4.h ds4_metal.h ds4_rocm.h
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h
+ds4_server.o: ds4_server.c ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
+
+rax.o: rax.c rax.h rax_malloc.h
+	$(CC) $(CFLAGS) -c -o $@ rax.c
 
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
@@ -104,8 +107,8 @@ ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 ds4_rocm.o: ds4_rocm.c ds4_rocm.h ds4_metal.h
 	$(ROCMCC) $(ROCMCFLAGS) -x hip -c -o $@ ds4_rocm.c
 
-ds4_test: ds4_test.o $(CORE_OBJS)
-	$(if $(filter 1,$(DS4_ROCM)),$(ROCMCC),$(CC)) $(CFLAGS) -o $@ ds4_test.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4_test: ds4_test.o rax.o $(CORE_OBJS)
+	$(if $(filter 1,$(DS4_ROCM)),$(ROCMCC),$(CC)) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4_rocm_kernel_test: tests/ds4_rocm_kernel_test.c ds4_rocm.o ds4_metal.h
 	$(CC) $(CFLAGS) -c -o ds4_rocm_kernel_test.o tests/ds4_rocm_kernel_test.c

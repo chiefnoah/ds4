@@ -21,8 +21,8 @@ struct ds4_metal_args_set_rows {
 template<typename T, typename TI>
 kernel void kernel_set_rows_f(
         constant ds4_metal_args_set_rows & args,
-        device const  void * src0,
-        device const  void * src1,
+        device const char  * src0,
+        device const char  * src1,
         device       float * dst,
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
@@ -39,10 +39,10 @@ kernel void kernel_set_rows_f(
     }
 
     const int32_t i10 = i01;
-    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+    const TI      i1  = ((const device TI *) (src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
 
-          device T     * dst_row = (      device T     *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
-    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+          device T     * dst_row = (      device T     *) ((device char *) dst  + i1*args.nb1   + i02*args.nb2  + i03*args.nb3);
+    const device float * src_row = (const device float *) (                src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
     for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
         dst_row[ind] = (T) src_row[ind];

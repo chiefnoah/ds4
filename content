@@ -1,0 +1,17 @@
+ROCm decode: tsk-36 mlock experiment ruled it out
+
+Status: DONE — negative result, ruling out tsk-36.
+
+Experiment 2026-05-09: added DS4_MLOCK_MODEL=1 hook in ds4.c to mlock(map, size) immediately after the GGUF mmap, with fallback to MADV_WILLNEED on failure. Hook reverted after the test.
+
+Result: mlock fails on Strix Halo's BIOS partitioning. The 80 GiB GGUF doesn't fit in the OS-side RAM partition. Strix Halo total DRAM is 128 GiB but BIOS reserves 96 GiB for the iGPU UMA partition, leaving only ~32 GiB for the OS/host. Run with mlock enabled: RSS climbed to 29.6 GiB then the process was timeout-killed at 1:11 wall (had not finished pinning). madvise(MADV_WILLNEED) would proceed without pinning but only hints, doesn't change residency guarantees.
+
+Underlying premise was also wrong:
+- Decode-only minor page faults: 7000 (244442 with -n 200 minus 237446 with -n 1)
+- At ~30 us/fault that is ~210 ms total over a 13.47s decode = 1.5% theoretical max recoverable
+- Real decode-time sys CPU is dominated by ioctl (49.9% of sys CPU at 173 us/call x ~1.5 ioctls per kernel launch x 50k launches = ~13s). These are HIP runtime -> amdgpu kernel driver calls, not page faults.
+- And the ioctls run in parallel with GPU compute (user CPU 3.6s of 33s wall = mostly idle), so they don't extend wall time. Decode is GPU-bound.
+
+Conclusion: tsk-36 mlock-the-model approach is doubly ruled out (infeasible due to BIOS partitioning + premise wrong about page faults). Updating MEMORY note feedback_hip_graph_low_value.md to extend the host-side-overhead story with this finding.
+
+Real next lever for decode wall: GPU compute reduction. matmul_f16 audit task is the next move.

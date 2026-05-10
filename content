@@ -1,0 +1,19 @@
+Vulkan Phase 4: backend wiring + CLI integration
+
+PARENT: tsk-44.
+STATUS: planned, not started. Depends on Phase 3.
+
+GOAL
+Make the Vulkan backend selectable via --backend vulkan and exercised by the existing graph scheduler in ds4.c, with no behavior change for Metal or ROCm.
+
+DELIVERABLES
+- ds4.h: add DS4_BACKEND_VULKAN to the backend enum.
+- ds4.c: extend ds4_backend_is_graph() to include DS4_BACKEND_VULKAN if we want shared mapping (probably yes — UMA path applies). Update both model_open call sites if needed.
+- ds4_cli.c, ds4_server.c: parse --backend vulkan, route through to engine init.
+- Makefile: build ds4 with the Vulkan backend object linked in when DS4_VULKAN=1, alongside (or replacing? decide) the ROCm object. Initial impl: both can coexist behind runtime selection — just adds linkage of ds4_vulkan.o + libvulkan.
+- README.md: short note that --backend vulkan is now an option, performance characterization deferred to Phase 5.
+
+VALIDATION
+1. ./ds4_rocm_kernel_test still ends with OK (no ROCm regression).
+2. Canonical 200-tok decode under --backend rocm matches pre-merge baseline (39.9 / 15.7 t/s within noise).
+3. Canonical 200-tok decode under --backend vulkan completes and produces a coherent multi-paragraph thinking-mode reply. (Performance not yet tuned — Phase 5.)

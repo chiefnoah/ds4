@@ -1,8 +1,8 @@
-/* Microbench driver for ds4_metal_matmul_q8_0_tensor (and the wave-per-row
- * Q8_0 kernel it dispatches to on decode).  Skips the 80 GB GGUF load so the
- * kernel-iteration loop is just edit -> rebuild -> run (no 21-second model
- * upload).  Synthesizes a Q8_0 weight matrix on the host, registers it once
- * via ds4_metal_set_model_map, then loops the wrapper.
+/* Microbench driver for ds4_metal_matmul_q8_0_tensor and, with
+ * DS4_ROCM_MATMUL_BENCH_F16=1, ds4_metal_matmul_f16_tensor. Skips the 80 GB
+ * GGUF load so the kernel-iteration loop is just edit -> rebuild -> run (no
+ * 21-second model upload). Synthesizes a weight matrix on the host, registers
+ * it once via ds4_metal_set_model_map, then loops the wrapper.
  *
  * Usage:
  *   ./ds4_rocm_matmul_bench [in_dim] [out_dim] [iters] [n_tok]
@@ -65,11 +65,24 @@ static void build_q8_0_synth(uint8_t *dst, uint64_t in_dim, uint64_t out_dim) {
     }
 }
 
+static void build_f16_synth(uint16_t *dst, uint64_t in_dim, uint64_t out_dim) {
+    for (uint64_t r = 0; r < out_dim; r++) {
+        uint64_t state = (r + 1) * 0xD1B54A32D192ED03ull;
+        for (uint64_t i = 0; i < in_dim; i++) {
+            state = state * 2862933555777941757ull + 3037000493ull;
+            const float f = (float)((int)((state >> 32) & 255u) - 128) / 512.0f;
+            dst[r * in_dim + i] = f32_to_f16_bits(f);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     uint64_t in_dim  = (argc > 1) ? (uint64_t)strtoull(argv[1], NULL, 10) : 4096ull;
     uint64_t out_dim = (argc > 2) ? (uint64_t)strtoull(argv[2], NULL, 10) : 4096ull;
     int iters        = (argc > 3) ? atoi(argv[3]) : 2000;
     uint64_t n_tok   = (argc > 4) ? (uint64_t)strtoull(argv[4], NULL, 10) : 1ull;
+    const char *f16_env = getenv("DS4_ROCM_MATMUL_BENCH_F16");
+    const int bench_f16 = f16_env && f16_env[0] && f16_env[0] != '0';
     if (iters < 1) iters = 1;
     if (n_tok < 1) n_tok = 1;
 
@@ -79,7 +92,7 @@ int main(int argc, char **argv) {
     }
 
     const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
-    const uint64_t row_bytes      = blocks_per_row * 34u;
+    const uint64_t row_bytes      = bench_f16 ? in_dim * sizeof(uint16_t) : blocks_per_row * 34u;
     const uint64_t weight_bytes   = row_bytes * out_dim;
 
     /* Cache-busting working set: gfx1151 Infinity Cache (MALL) is ~32 MiB.
@@ -97,7 +110,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "alloc weight host failed\n"); return 1;
     }
     uint8_t *w_host = (uint8_t *)w_aligned;
-    build_q8_0_synth(w_host, in_dim, out_dim);
+    if (bench_f16) {
+        build_f16_synth((uint16_t *)w_host, in_dim, out_dim);
+    } else {
+        build_q8_0_synth(w_host, in_dim, out_dim);
+    }
     /* Replicate the synthetic block across the remaining copies; we only
      * care about cache pressure, not exact values. */
     for (uint64_t i = 1; i < n_copies; i++) {
@@ -122,8 +139,12 @@ int main(int argc, char **argv) {
     /* Warm up: hipMalloc-on-first-use, kernel module load, etc. */
     for (int i = 0; i < 5; i++) {
         const uint64_t off = (uint64_t)(i % (int)n_copies) * weight_bytes;
-        if (!ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
-                                           in_dim, out_dim, tx, n_tok)) {
+        const int ok = bench_f16
+            ? ds4_metal_matmul_f16_tensor(tout, w_host, total_bytes, off,
+                                          in_dim, out_dim, tx, n_tok)
+            : ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
+                                           in_dim, out_dim, tx, n_tok);
+        if (!ok) {
             fprintf(stderr, "warmup matmul failed\n"); return 1;
         }
     }
@@ -132,8 +153,12 @@ int main(int argc, char **argv) {
     double t0 = now_sec();
     for (int i = 0; i < iters; i++) {
         const uint64_t off = (uint64_t)(i % (int)n_copies) * weight_bytes;
-        if (!ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
-                                           in_dim, out_dim, tx, n_tok)) {
+        const int ok = bench_f16
+            ? ds4_metal_matmul_f16_tensor(tout, w_host, total_bytes, off,
+                                          in_dim, out_dim, tx, n_tok)
+            : ds4_metal_matmul_q8_0_tensor(tout, w_host, total_bytes, off,
+                                           in_dim, out_dim, tx, n_tok);
+        if (!ok) {
             fprintf(stderr, "matmul iter %d failed\n", i); return 1;
         }
     }
@@ -145,8 +170,9 @@ int main(int argc, char **argv) {
     const double gib_s  = ((double)weight_bytes / (1024.0 * 1024.0 * 1024.0))
                           / (dt / (double)iters);
     fprintf(stdout,
-            "matmul_q8_0 in=%llu out=%llu n_tok=%llu iters=%d  weight=%.2f MiB  copies=%llu  "
+            "matmul_%s in=%llu out=%llu n_tok=%llu iters=%d  weight=%.2f MiB  copies=%llu  "
             "%.4f ms/call  %.4f ms/token  %.2f GiB/s (weight only)\n",
+            bench_f16 ? "f16" : "q8_0",
             (unsigned long long)in_dim, (unsigned long long)out_dim,
             (unsigned long long)n_tok, iters,
             (double)weight_bytes / (1024.0 * 1024.0),

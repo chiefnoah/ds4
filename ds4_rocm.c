@@ -1182,6 +1182,56 @@ __global__ static void rocm_rope_tail_kernel(float *x,
     row[j1] = x0 * sin_theta + x1 * cos_theta;
 }
 
+/* Same as rocm_rope_tail_kernel but applies positions
+ * pos0, pos0+pos_stride, pos0+2*pos_stride, ...  Used by the batched
+ * compressor prefill: each emit row is at comp_pos = pos0 + e*ratio. */
+__global__ static void rocm_rope_tail_strided_kernel(float *x,
+                                                     uint32_t n_tok,
+                                                     uint32_t n_head,
+                                                     uint32_t head_dim,
+                                                     uint32_t n_rot,
+                                                     uint32_t pos0,
+                                                     uint32_t pos_stride,
+                                                     uint32_t n_ctx_orig,
+                                                     int inverse,
+                                                     float freq_base,
+                                                     float freq_scale,
+                                                     float ext_factor,
+                                                     float attn_factor,
+                                                     float beta_fast,
+                                                     float beta_slow) {
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_pairs = n_rot / 2u;
+    const uint64_t total = (uint64_t)n_tok * n_head * n_pairs;
+    if (pair >= total) return;
+
+    const uint32_t ic = (uint32_t)(pair % n_pairs);
+    const uint64_t head_index = pair / n_pairs;
+    const uint32_t head = (uint32_t)(head_index % n_head);
+    const uint32_t tok = (uint32_t)(head_index / n_head);
+    float *row = x + ((uint64_t)tok * n_head + head) * head_dim;
+
+    float corr_dims[2];
+    rocm_rope_yarn_corr_dims((int)n_rot, (int)n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+
+    const uint32_t r = ic * 2u;
+    const float theta_base = (float)(pos0 + tok * pos_stride);
+    const float theta = theta_base * powf(freq_base, (-1.0f / (float)n_rot) * (float)r);
+    float cos_theta;
+    float sin_theta;
+    rocm_rope_yarn(theta, freq_scale, corr_dims, (int)r, ext_factor, attn_factor,
+                   &cos_theta, &sin_theta);
+    if (inverse) sin_theta = -sin_theta;
+
+    const uint32_t j0 = n_nope + r;
+    const uint32_t j1 = j0 + 1u;
+    const float x0 = row[j0];
+    const float x1 = row[j1];
+    row[j0] = x0 * cos_theta - x1 * sin_theta;
+    row[j1] = x0 * sin_theta + x1 * cos_theta;
+}
+
 __global__ static void rocm_fp8_kv_quantize_kernel(float *x,
                                                    uint32_t n_tok,
                                                    uint32_t head_dim,
@@ -4974,6 +5024,155 @@ __global__ static void rocm_compressor_ratio4_shift_kernel(
     state_score[i] = state_score[n + i];
 }
 
+/* Batched compressor prefill pool with APE applied inline.
+ *
+ * Replaces the per-token serial sequence (store_batch + pool + shift) with
+ * a single launch that produces all n_emit comp rows directly from the input
+ * (kv, sc) batch.  The recurrent state is bypassed: at emit e, the pool
+ * reads window e (always) and window e-1 (when e>=1), with score = sc + ape
+ * computed on the fly.
+ *
+ * Layout assumptions (matching the per-token loop and Metal):
+ *   coff == 1: pool reads tokens [e*ratio .. e*ratio+ratio-1] at offset
+ *              [0 .. head_dim) of width = head_dim.
+ *   coff == 2: pool reads window e tokens at offset [head_dim .. 2*head_dim)
+ *              ("curr" half), and window e-1 tokens at offset [0 .. head_dim)
+ *              ("prev" half).  When e==0 the prev half is treated as -inf.
+ *
+ * Requires pos0 % ratio == 0 (the batched compressor_prefill caller checks). */
+__global__ static void rocm_compressor_pool_prefill_kernel(
+        float *out,
+        const float *kv,
+        const float *sc,
+        const float *ape_f32,
+        const __half *ape_f16,
+        uint32_t head_dim,
+        uint32_t ratio,
+        uint32_t coff,
+        uint32_t n_emit) {
+    const uint32_t e = blockIdx.x;
+    if (e >= n_emit) return;
+    const uint32_t j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= head_dim) return;
+    const uint32_t width = coff * head_dim;
+
+    /* First pass: stable-softmax max. */
+    float maxs = -1.0e30f;
+
+    if (coff == 2u) {
+        /* Window e curr-half (offset head_dim+j). */
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t t = e * ratio + r;
+            const uint32_t pos_mod = t % ratio;
+            const uint32_t ch = head_dim + j;
+            const uint64_t apo = (uint64_t)pos_mod * width + ch;
+            const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+            const float s = sc[(uint64_t)t * width + ch] + ape;
+            if (s > maxs) maxs = s;
+        }
+        if (e >= 1u) {
+            /* Window e-1 prev-half (offset j). */
+            for (uint32_t r = 0; r < ratio; r++) {
+                const uint32_t t = (e - 1u) * ratio + r;
+                const uint32_t pos_mod = t % ratio;
+                const uint32_t ch = j;
+                const uint64_t apo = (uint64_t)pos_mod * width + ch;
+                const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+                const float s = sc[(uint64_t)t * width + ch] + ape;
+                if (s > maxs) maxs = s;
+            }
+        }
+    } else {
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t t = e * ratio + r;
+            const uint32_t pos_mod = t % ratio;
+            const uint32_t ch = j;
+            const uint64_t apo = (uint64_t)pos_mod * width + ch;
+            const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+            const float s = sc[(uint64_t)t * width + ch] + ape;
+            if (s > maxs) maxs = s;
+        }
+    }
+
+    if (maxs <= -5.0e29f) {
+        out[(uint64_t)e * head_dim + j] = 0.0f;
+        return;
+    }
+
+    float denom = 0.0f;
+    float sum = 0.0f;
+
+    if (coff == 2u) {
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t t = e * ratio + r;
+            const uint32_t pos_mod = t % ratio;
+            const uint32_t ch = head_dim + j;
+            const uint64_t apo = (uint64_t)pos_mod * width + ch;
+            const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+            const float s = sc[(uint64_t)t * width + ch] + ape;
+            const float w = expf(s - maxs);
+            denom += w;
+            sum += w * kv[(uint64_t)t * width + ch];
+        }
+        if (e >= 1u) {
+            for (uint32_t r = 0; r < ratio; r++) {
+                const uint32_t t = (e - 1u) * ratio + r;
+                const uint32_t pos_mod = t % ratio;
+                const uint32_t ch = j;
+                const uint64_t apo = (uint64_t)pos_mod * width + ch;
+                const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+                const float s = sc[(uint64_t)t * width + ch] + ape;
+                const float w = expf(s - maxs);
+                denom += w;
+                sum += w * kv[(uint64_t)t * width + ch];
+            }
+        }
+    } else {
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t t = e * ratio + r;
+            const uint32_t pos_mod = t % ratio;
+            const uint32_t ch = j;
+            const uint64_t apo = (uint64_t)pos_mod * width + ch;
+            const float ape = ape_f16 ? __half2float(ape_f16[apo]) : ape_f32[apo];
+            const float s = sc[(uint64_t)t * width + ch] + ape;
+            const float w = expf(s - maxs);
+            denom += w;
+            sum += w * kv[(uint64_t)t * width + ch];
+        }
+    }
+
+    out[(uint64_t)e * head_dim + j] = denom > 0.0f ? sum / denom : 0.0f;
+}
+
+/* Writes n_tokens rows of (kv, sc + ape[pos_mod]) into state[dst_row_base..]
+ * where pos_mod = (src_pos0 + t) % ratio.  Used by the batched compressor
+ * prefill to materialize the post-loop state for the decode handoff. */
+__global__ static void rocm_compressor_write_state_rows_kernel(
+        float *state_kv,
+        float *state_score,
+        const float *kv,
+        const float *sc,
+        const float *ape_f32,
+        const __half *ape_f16,
+        uint32_t width,
+        uint32_t ratio,
+        uint32_t src_pos0,
+        uint32_t n_tokens,
+        uint32_t dst_row_base) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const uint32_t lane = blockIdx.y * blockDim.x + threadIdx.x;
+    if (lane >= width) return;
+    const uint32_t dst_row = dst_row_base + t;
+    const uint32_t pos_mod = (src_pos0 + t) % ratio;
+    const uint64_t in_off = (uint64_t)t * width + lane;
+    const uint64_t state_off = (uint64_t)dst_row * width + lane;
+    const uint64_t ape_off = (uint64_t)pos_mod * width + lane;
+    state_kv[state_off] = kv[in_off];
+    const float ape = ape_f16 ? __half2float(ape_f16[ape_off]) : ape_f32[ape_off];
+    state_score[state_off] = sc[in_off] + ape;
+}
+
 static int rocm_compressor_pool_dispatch(ds4_metal_tensor *out,
                                           const ds4_metal_tensor *state_kv,
                                           const ds4_metal_tensor *state_score,
@@ -5087,9 +5286,92 @@ static int rocm_fill_f32_dispatch(void *p, float v, uint64_t n) {
     return rocm_launch_done("fill f32 launch", "fill f32 completion");
 }
 
-/* Multi-token prefill compressor pass.  Resets state, then iterates tokens
- * via single-token compressor_update; each emit boundary writes one comp
- * row (optionally FP8-quantized) and, for ratio==4, shifts state. */
+/* Legacy per-token compressor prefill.  Kept as a fallback for callers with
+ * pos0 % ratio != 0; the batched path below handles the production path
+ * (always aligned) in O(1) launches per emit window instead of O(n_tokens). */
+static int rocm_compressor_prefill_legacy(
+        ds4_metal_tensor       *comp_cache,
+        ds4_metal_tensor       *state_kv,
+        ds4_metal_tensor       *state_score,
+        const ds4_metal_tensor *kv,
+        const ds4_metal_tensor *sc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                width,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    quantize_fp8,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps) {
+    uint32_t comp_row = 0;
+    int ok = 1;
+    for (uint32_t t = 0; t < n_tokens && ok; t++) {
+        ds4_metal_tensor *kv_v = ds4_metal_tensor_view(kv, (uint64_t)t * width * sizeof(float),
+                                                       (uint64_t)width * sizeof(float));
+        ds4_metal_tensor *sc_v = ds4_metal_tensor_view(sc, (uint64_t)t * width * sizeof(float),
+                                                       (uint64_t)width * sizeof(float));
+        if (!kv_v || !sc_v) { ok = 0; }
+        else {
+            ok = ds4_metal_compressor_update_tensor(kv_v, sc_v, state_kv, state_score, comp_cache,
+                                                    model_map, model_size, ape_offset, ape_type,
+                                                    norm_offset, norm_type, head_dim, ratio,
+                                                    pos0 + t, comp_row, n_rot, n_ctx_orig,
+                                                    freq_base, freq_scale, ext_factor, attn_factor,
+                                                    beta_fast, beta_slow, rms_eps);
+            if (ok && ((pos0 + t + 1u) % ratio) == 0u) {
+                if (quantize_fp8 && head_dim == 128u /* DS4_N_HEAD_DIM */) {
+                    ds4_metal_tensor *comp_v = ds4_metal_tensor_view(
+                            comp_cache,
+                            (uint64_t)comp_row * head_dim * sizeof(float),
+                            (uint64_t)head_dim * sizeof(float));
+                    if (!comp_v) ok = 0;
+                    else {
+                        ok = ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_v, 1, head_dim, n_rot) != 0;
+                        ds4_metal_tensor_free(comp_v);
+                    }
+                }
+                comp_row++;
+            }
+        }
+        ds4_metal_tensor_free(sc_v);
+        ds4_metal_tensor_free(kv_v);
+    }
+    return ok;
+}
+
+/* Multi-token prefill compressor pass.  Replaces the per-token serial loop
+ * (which on a 245-token prefill chunk fired ~485 small-grid launches per
+ * layer) with a constant-launch-count batched path:
+ *   1. fill_f32 state (2 launches, unchanged)
+ *   2. one pool kernel that produces all n_comp comp_cache rows directly
+ *      from the (kv, sc, ape) batch — bypasses the recurrent state entirely
+ *   3. one batched RMS norm over n_comp rows
+ *   4. one strided RoPE tail over n_comp rows
+ *   5. one optional FP8 quantize over n_comp rows
+ *   6. up to 2 launches to materialize the final state for the decode
+ *      handoff (skipped entirely when both halves are clean)
+ *
+ * Result: a layer's ~485 launches drop to ~5–8.  The recurrent state at
+ * the end matches Metal's semantics (last-window writes only); production
+ * callers (ratio==4) explicitly refresh it via
+ * metal_graph_refresh_ratio4_compressor_state, so the savings here are
+ * pure launch-overhead reduction rather than algorithmic.
+ *
+ * Falls back to the legacy per-token loop when pos0 % ratio != 0 (rare;
+ * production chunks are always aligned). */
 int ds4_metal_compressor_prefill_tensor(
         ds4_metal_tensor       *comp_cache,
         ds4_metal_tensor       *state_kv,
@@ -5131,48 +5413,129 @@ int ds4_metal_compressor_prefill_tensor(
     const uint64_t state_elts = (uint64_t)state_rows * width;
     const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint32_t n_comp = n_tokens / ratio;
+    const uint32_t cutoff = n_comp * ratio;
+    const uint32_t rem = n_tokens - cutoff;
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
     if (kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
         state_kv->bytes < state_elts * sizeof(float) ||
         state_score->bytes < state_elts * sizeof(float) ||
-        (n_comp != 0 && comp_cache->bytes < comp_bytes)) return 0;
+        (n_comp != 0 && comp_cache->bytes < comp_bytes) ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset) return 0;
 
     if (!rocm_fill_f32_dispatch(tensor_u8(state_kv), 0.0f, state_elts)) return 0;
     if (!rocm_fill_f32_dispatch(tensor_u8(state_score), -1.0e30f, state_elts)) return 0;
 
-    uint32_t comp_row = 0;
-    int ok = 1;
-    for (uint32_t t = 0; t < n_tokens && ok; t++) {
-        ds4_metal_tensor *kv_v = ds4_metal_tensor_view(kv, (uint64_t)t * width * sizeof(float),
-                                                       (uint64_t)width * sizeof(float));
-        ds4_metal_tensor *sc_v = ds4_metal_tensor_view(sc, (uint64_t)t * width * sizeof(float),
-                                                       (uint64_t)width * sizeof(float));
-        if (!kv_v || !sc_v) { ok = 0; }
-        else {
-            ok = ds4_metal_compressor_update_tensor(kv_v, sc_v, state_kv, state_score, comp_cache,
-                                                    model_map, model_size, ape_offset, ape_type,
-                                                    norm_offset, norm_type, head_dim, ratio,
-                                                    pos0 + t, comp_row, n_rot, n_ctx_orig,
-                                                    freq_base, freq_scale, ext_factor, attn_factor,
-                                                    beta_fast, beta_slow, rms_eps);
-            if (ok && ((pos0 + t + 1u) % ratio) == 0u) {
-                if (quantize_fp8 && head_dim == 128u /* DS4_N_HEAD_DIM */) {
-                    ds4_metal_tensor *comp_v = ds4_metal_tensor_view(
-                            comp_cache,
-                            (uint64_t)comp_row * head_dim * sizeof(float),
-                            (uint64_t)head_dim * sizeof(float));
-                    if (!comp_v) ok = 0;
-                    else {
-                        ok = ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_v, 1, head_dim, n_rot) != 0;
-                        ds4_metal_tensor_free(comp_v);
-                    }
-                }
-                comp_row++;
-            }
-        }
-        ds4_metal_tensor_free(sc_v);
-        ds4_metal_tensor_free(kv_v);
+    if ((pos0 % ratio) != 0u) {
+        return rocm_compressor_prefill_legacy(comp_cache, state_kv, state_score, kv, sc,
+                                              model_map, model_size, ape_offset, ape_type,
+                                              norm_offset, norm_type, head_dim, ratio, width,
+                                              pos0, n_tokens, n_rot, n_ctx_orig, quantize_fp8,
+                                              freq_base, freq_scale, ext_factor, attn_factor,
+                                              beta_fast, beta_slow, rms_eps);
     }
+
+    /* Upload APE table once for both pool + state-setup launches. */
+    void *ape_h = NULL, *ape_d = NULL;
+    if (!rocm_upload_mapped((const uint8_t *)model_map + ape_offset,
+                            ape_bytes, &ape_h, &ape_d, "compressor APE upload")) return 0;
+    const float  *ape_f32 = ape_type == 0u ? (const float  *)ape_d : (const float  *)NULL;
+    const __half *ape_f16 = ape_type == 1u ? (const __half *)ape_d : (const __half *)NULL;
+
+    int ok = 1;
+
+    /* Stage 1: batched pool over all n_comp emits. */
+    if (n_comp > 0u) {
+        const uint32_t threads = head_dim < 256u ? head_dim : 256u;
+        const uint32_t lane_blocks = (head_dim + threads - 1u) / threads;
+        dim3 grid(n_comp, lane_blocks, 1);
+        dim3 block(threads, 1, 1);
+        hipLaunchKernelGGL(rocm_compressor_pool_prefill_kernel, grid, block, 0, g_stream,
+                           (float *)tensor_u8(comp_cache),
+                           (const float *)tensor_u8_const(kv),
+                           (const float *)tensor_u8_const(sc),
+                           ape_f32, ape_f16,
+                           head_dim, ratio, coff, n_comp);
+        ok = rocm_launch_done("compressor pool prefill launch",
+                              "compressor pool prefill completion");
+    }
+
+    /* Stage 2: batched RMS norm over all n_comp comp rows. */
+    if (ok && n_comp > 0u) {
+        ok = ds4_metal_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
+                                                   model_map, model_size, norm_offset,
+                                                   head_dim, n_comp, rms_eps) != 0;
+    }
+
+    /* Stage 3: strided RoPE tail; emit e is at comp_pos = pos0 + e*ratio. */
+    if (ok && n_comp > 0u && n_rot != 0u) {
+        const uint64_t total = (uint64_t)n_comp * (n_rot / 2u);
+        const dim3 rblock(256);
+        const dim3 rgrid((unsigned)((total + rblock.x - 1u) / rblock.x));
+        hipLaunchKernelGGL(rocm_rope_tail_strided_kernel, rgrid, rblock, 0, g_stream,
+                           (float *)tensor_u8(comp_cache),
+                           n_comp, 1u, head_dim, n_rot,
+                           pos0, ratio, n_ctx_orig, /*inverse=*/0,
+                           freq_base, freq_scale, ext_factor, attn_factor,
+                           beta_fast, beta_slow);
+        ok = rocm_launch_done("compressor rope tail strided launch",
+                              "compressor rope tail strided completion");
+    }
+
+    /* Stage 4: optional FP8 KV quantize over all n_comp rows in one launch. */
+    if (ok && n_comp > 0u && quantize_fp8 && head_dim == 128u /* DS4_N_HEAD_DIM */) {
+        ok = ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot) != 0;
+    }
+
+    /* Stage 5: materialize final state for the decode handoff.  Mirrors
+     * Metal's semantics: state was reset to (0, -inf); now write the post-
+     * shift "last full window" into lower rows (ratio==4 only) and any
+     * remaining partial-window tokens into the leading state rows. */
+    if (ok && ratio == 4u && cutoff >= ratio) {
+        const uint32_t lwidth = width;
+        const uint32_t lthreads = lwidth < 256u ? lwidth : 256u;
+        const uint32_t lane_blocks = (lwidth + lthreads - 1u) / lthreads;
+        dim3 grid(ratio, lane_blocks, 1);
+        dim3 block(lthreads, 1, 1);
+        const uint8_t *kv_base = tensor_u8_const(kv);
+        const uint8_t *sc_base = tensor_u8_const(sc);
+        const uint64_t off = (uint64_t)(cutoff - ratio) * width * sizeof(float);
+        hipLaunchKernelGGL(rocm_compressor_write_state_rows_kernel, grid, block, 0, g_stream,
+                           (float *)tensor_u8(state_kv),
+                           (float *)tensor_u8(state_score),
+                           (const float *)(kv_base + off),
+                           (const float *)(sc_base + off),
+                           ape_f32, ape_f16,
+                           width, ratio,
+                           pos0 + (cutoff - ratio), ratio,
+                           /*dst_row_base=*/0u);
+        ok = rocm_launch_done("compressor state lower write launch",
+                              "compressor state lower write completion");
+    }
+    if (ok && rem > 0u) {
+        const uint32_t dst_row_base = (ratio == 4u) ? ratio : 0u;
+        const uint32_t lthreads = width < 256u ? width : 256u;
+        const uint32_t lane_blocks = (width + lthreads - 1u) / lthreads;
+        dim3 grid(rem, lane_blocks, 1);
+        dim3 block(lthreads, 1, 1);
+        const uint8_t *kv_base = tensor_u8_const(kv);
+        const uint8_t *sc_base = tensor_u8_const(sc);
+        const uint64_t off = (uint64_t)cutoff * width * sizeof(float);
+        hipLaunchKernelGGL(rocm_compressor_write_state_rows_kernel, grid, block, 0, g_stream,
+                           (float *)tensor_u8(state_kv),
+                           (float *)tensor_u8(state_score),
+                           (const float *)(kv_base + off),
+                           (const float *)(sc_base + off),
+                           ape_f32, ape_f16,
+                           width, ratio,
+                           pos0 + cutoff, rem,
+                           dst_row_base);
+        ok = rocm_launch_done("compressor state rem write launch",
+                              "compressor state rem write completion");
+    }
+
+    rocm_defer_free(ape_h);
     return ok;
 }
 

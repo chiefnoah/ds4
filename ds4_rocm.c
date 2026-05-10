@@ -3563,6 +3563,77 @@ __global__ static void rocm_attn_out_low_q8_wave_##NROWS##_kernel( \
 ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(8)
 ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(4)
 
+/* WMMA variant of attn_out_low_q8 for n_tokens >= 16.  Mirrors
+ * rocm_matmul_q8_0_wmma_kernel: 32-lane wave produces a 16x16 (rank, token)
+ * output tile per block via v_wmma_f32_16x16x16_f16, with the n_groups axis
+ * driving grid Z so all 8 groups dispatch in one launch.  Q8_0 K-block of
+ * 32 elements contributes two 16x16x16 WMMA ops sharing the same fp16
+ * scale.  out layout: [n_tokens, n_groups, rank]. */
+__global__ static void rocm_attn_out_low_q8_wmma_kernel(
+        float *low, const uint8_t *w, const float *heads,
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
+        uint64_t row_bytes, uint64_t group_w_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t t0   = blockIdx.y * 16u;
+    const uint32_t g    = blockIdx.z;
+    if (r0 >= rank || t0 >= n_tokens || g >= n_groups) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok     = t0 + col_in_tile;
+
+    const uint32_t safe_row = (out_row < rank)     ? out_row : (rank     - 1u);
+    const uint32_t safe_tok = (tok     < n_tokens) ? tok     : (n_tokens - 1u);
+    const uint8_t *wr = w + (uint64_t)g * group_w_bytes + (uint64_t)safe_row * row_bytes;
+    const float   *xt = heads + ((uint64_t)safe_tok * n_groups + g) * group_dim;
+    const uint32_t blocks = group_dim >> 5;
+
+    rocm_v8f32 c = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = wr + (uint64_t)b * 34u;
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const _Float16 scale = (_Float16)rocm_f16_to_f32(scale_bits);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+
+        rocm_v16f16 a;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a[kk] = (_Float16)((float)qs[kk]) * scale;
+        }
+        rocm_v16f16 bv;
+        const float *xb = xt + ((uint64_t)b << 5);
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv[kk] = (_Float16)xb[kk];
+        }
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, c);
+
+        rocm_v16f16 a2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk] = (_Float16)((float)qs[16 + kk]) * scale;
+        }
+        rocm_v16f16 bv2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv2[kk] = (_Float16)xb[16 + kk];
+        }
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bv2, c);
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t t = t0 + col_in_tile;
+        if (r < rank && t < n_tokens) {
+            low[((uint64_t)t * n_groups + g) * rank + r] = c[i];
+        }
+    }
+}
+
 static int rocm_attention_output_low_q8_dispatch(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -3592,33 +3663,62 @@ static int rocm_attention_output_low_q8_dispatch(
 
     int ok;
     if ((group_dim % 32u) == 0u) {
-        /* Wave-per-row dispatch: same gfx1151 win as ds4_metal_matmul_q8_0_tensor.
-         * For DSv4 attention output, group_dim = 4096 (DS4_N_HEAD_DIM * 8),
-         * rank = 1024, n_groups = 8. blockDim=256 here was wasting half the
-         * threads in the inner block loop. */
-        const uint32_t nrows = ((rank % 8u) == 0u && rank >= 256u) ? 8u : 4u;
-        dim3 grid((unsigned)((rank + nrows - 1u) / nrows),
-                  (unsigned)n_groups, (unsigned)n_tokens);
-        dim3 block(nrows * 32u, 1, 1);
-        if (nrows == 8u) {
-            hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_8_kernel,
-                               grid, block, 0, g_stream,
-                               (float *)tensor_u8(low),
-                               (const uint8_t *)w_dev,
-                               (const float *)tensor_u8_const(heads),
-                               (uint32_t)group_dim, (uint32_t)rank, n_groups,
-                               row_bytes, group_w_bytes);
-        } else {
-            hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_4_kernel,
-                               grid, block, 0, g_stream,
-                               (float *)tensor_u8(low),
-                               (const uint8_t *)w_dev,
-                               (const float *)tensor_u8_const(heads),
-                               (uint32_t)group_dim, (uint32_t)rank, n_groups,
-                               row_bytes, group_w_bytes);
+        /* Prefill (n_tokens >= 16): WMMA path mirrors the matmul_q8_0 WMMA
+         * kernel.  Each 32-lane block produces a 16x16 (rank, token) tile
+         * via v_wmma_f32_16x16x16_f16; grid Z drives n_groups so all 8
+         * groups dispatch in one launch.  Wave-per-row stays for n_tokens
+         * < 16 (decode and tiny prefill chunks). */
+        static int g_attn_out_wmma_cached = -1;
+        if (g_attn_out_wmma_cached < 0) {
+            const char *env = getenv("DS4_ROCM_WMMA");
+            g_attn_out_wmma_cached = (env && env[0] == '0') ? 0 : 1;
         }
-        ok = rocm_launch_done("attn out low Q8 wave launch",
-                              "attn out low Q8 wave completion");
+        const int wmma_ok = g_attn_out_wmma_cached
+                            && n_tokens >= 16u
+                            && rank     >= 16u;
+        if (wmma_ok) {
+            const dim3 wblock(32u);
+            const dim3 wgrid((unsigned)((rank     + 15u) / 16u),
+                             (unsigned)((n_tokens + 15u) / 16u),
+                             (unsigned)n_groups);
+            hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_kernel,
+                               wgrid, wblock, 0, g_stream,
+                               (float *)tensor_u8(low),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(heads),
+                               (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                               row_bytes, group_w_bytes);
+            ok = rocm_launch_done("attn out low Q8 wmma launch",
+                                  "attn out low Q8 wmma completion");
+        } else {
+            /* Wave-per-row dispatch: same gfx1151 win as ds4_metal_matmul_q8_0_tensor.
+             * For DSv4 attention output, group_dim = 4096 (DS4_N_HEAD_DIM * 8),
+             * rank = 1024, n_groups = 8.  blockDim=256 here was wasting half the
+             * threads in the inner block loop. */
+            const uint32_t nrows = ((rank % 8u) == 0u && rank >= 256u) ? 8u : 4u;
+            dim3 grid((unsigned)((rank + nrows - 1u) / nrows),
+                      (unsigned)n_groups, (unsigned)n_tokens);
+            dim3 block(nrows * 32u, 1, 1);
+            if (nrows == 8u) {
+                hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_8_kernel,
+                                   grid, block, 0, g_stream,
+                                   (float *)tensor_u8(low),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(heads),
+                                   (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                                   row_bytes, group_w_bytes);
+            } else {
+                hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_4_kernel,
+                                   grid, block, 0, g_stream,
+                                   (float *)tensor_u8(low),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(heads),
+                                   (uint32_t)group_dim, (uint32_t)rank, n_groups,
+                                   row_bytes, group_w_bytes);
+            }
+            ok = rocm_launch_done("attn out low Q8 wave launch",
+                                  "attn out low Q8 wave completion");
+        }
     } else {
         /* Fallback for non-32-divisible group_dim. */
         const uint32_t threads = 256u;

@@ -3,9 +3,13 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/ds4_rocm_kernel_test
+/ds4_rocm_matmul_bench
+/ds4_rocm_moe_bench
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/bench-results/
 *.o
 *.dSYM/
 /misc/

@@ -5607,6 +5607,7 @@ static void layer_ffn_batch(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il) {
+    if (n_tok == 0) return;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
     float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));

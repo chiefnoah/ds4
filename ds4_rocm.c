@@ -533,32 +533,6 @@ __global__ static void rocm_matmul_q8_0_kernel(float *out,
     if (tid == 0) out[tok * out_dim + row] = sh[0];
 }
 
-/* Strix Halo (RDNA 3.5) optimised Q8_0 matmul.
- *
- *   - blockDim.x = N_ROWS_PER_BLOCK * 32: one wavefront per output row.
- *   - Each block computes N_ROWS_PER_BLOCK rows of one token.
- *   - x[tok, :] is cooperatively loaded into LDS once per block, then
- *     every wave reuses it from LDS instead of re-reading from global.
- *   - In-wave reduction uses __shfl_down (no LDS, no syncthreads).
- *
- * Constraints: in_dim divisible by 32 (true for all DSv4 matmuls -- the
- * scheduler aligns dims to DS4_QK_K=256), in_dim*sizeof(float) <= LDS
- * budget (we pick a safe ceiling of 16 KiB = 4096 floats per token).
- * The dispatcher falls back to the legacy kernel when those don't hold.
- *
- * Three concrete instantiations: 8 / 4 / 1 rows per block.  Plain
- * functions (not C++ templates) because this TU is wrapped in extern "C". */
-
-static __device__ __forceinline__ float rocm_q8_0_block_dot(
-        const uint8_t *__restrict__ blk, const float *__restrict__ x_lds_block) {
-    const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
-    const int8_t *qs = (const int8_t *)(blk + 2);
-    float dot = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) dot += (float)qs[j] * x_lds_block[j];
-    return rocm_f16_to_f32(scale_bits) * dot;
-}
-
 static __device__ __forceinline__ float rocm_wave32_sum(float v) {
     v += __shfl_down(v, 16);
     v += __shfl_down(v,  8);
@@ -567,34 +541,6 @@ static __device__ __forceinline__ float rocm_wave32_sum(float v) {
     v += __shfl_down(v,  1);
     return v;
 }
-
-#define ROCM_DEFINE_MATMUL_Q8_0_LDS(NROWS) \
-__global__ static void rocm_matmul_q8_0_lds_##NROWS##_kernel( \
-        float *out, const uint8_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes) { \
-    extern __shared__ float x_lds[]; \
-    const uint32_t tid     = threadIdx.x; \
-    const uint32_t row_idx = tid >> 5; \
-    const uint32_t lane    = tid & 31u; \
-    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
-    const uint32_t tok     = blockIdx.y; \
-    const float *xr = x + (uint64_t)tok * in_dim; \
-    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = xr[i]; \
-    __syncthreads(); \
-    if (row >= out_dim) return; \
-    const uint32_t blocks = in_dim >> 5; \
-    const uint8_t *wr = w + (uint64_t)row * row_bytes; \
-    float sum = 0.0f; \
-    for (uint32_t b = lane; b < blocks; b += 32u) { \
-        sum += rocm_q8_0_block_dot(wr + (uint64_t)b * 34u, x_lds + (b << 5)); \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    if (lane == 0) out[(uint64_t)tok * out_dim + row] = sum; \
-}
-
-ROCM_DEFINE_MATMUL_Q8_0_LDS(8)
-ROCM_DEFINE_MATMUL_Q8_0_LDS(4)
-ROCM_DEFINE_MATMUL_Q8_0_LDS(1)
 
 /* Wave-per-row Q8_0 matvec, no-LDS variant.  Each wave32 computes one
  * output row; lane handles q8_0 block b = lane, lane+32, lane+64...
@@ -843,7 +789,7 @@ static uint64_t g_act_q8_scratch_bytes = 0;
 static int rocm_act_q8_scratch_ensure(uint64_t needed) {
     if (g_act_q8_scratch_bytes >= needed) return 1;
     if (g_act_q8_scratch) {
-        hipFree(g_act_q8_scratch);
+        (void)hipFree(g_act_q8_scratch);
         g_act_q8_scratch = NULL;
         g_act_q8_scratch_bytes = 0;
     }
@@ -979,114 +925,13 @@ __global__ static void rocm_matmul_f16_tile_##NROWS##x##NTOK##_kernel( \
 ROCM_DEFINE_MATMUL_F16_TILE(8, 8)
 ROCM_DEFINE_MATMUL_F16_TILE(4, 8)
 
-/* Wave-per-row F16 matmul for one-token decode (n_tok=1).
- * Mirror of rocm_matmul_q8_0_wave_##NROWS##_kernel for F16 weights.
- * Replaces the legacy single-block-per-row LDS-reduction kernel which was
- * running at 7-100 GB/s in production; wave-per-row should scale with the
- * available out_dim parallelism (one wavefront per output row, lane handles
- * weight stride 32, in-wave shuffle reduction, no LDS, no syncthreads). */
-#define ROCM_DEFINE_MATMUL_F16_WAVE(NROWS) \
-__global__ static void rocm_matmul_f16_wave_##NROWS##_kernel( \
-        float *out, const uint16_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim) { \
-    const uint32_t tid     = threadIdx.x; \
-    const uint32_t row_idx = tid >> 5; \
-    const uint32_t lane    = tid & 31u; \
-    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
-    if (row >= out_dim) return; \
-    const uint16_t *wr = w + (uint64_t)row * in_dim; \
-    float sum = 0.0f; \
-    for (uint32_t i = lane; i < in_dim; i += 32u) { \
-        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    if (lane == 0) out[row] = sum; \
-}
-
-ROCM_DEFINE_MATMUL_F16_WAVE(8)
-ROCM_DEFINE_MATMUL_F16_WAVE(4)
-
-/* Wave-per-row F16 matvec with N-element-per-lane inner unroll.  Each
- * iteration the wave processes 32*N consecutive elements: lane l handles
- * indices base + k*32 + l for k=0..N-1.  Adjacent lanes still hit adjacent
- * bytes (coalesced 32x2-byte F16 reads + 32x4-byte float reads), but the
- * compiler can pipeline N FMAs to hide memory latency and amortizes the
- * loop overhead by N.  The 1-elem WAVE variants above regressed because
- * loop-control ate the budget; this is the fix.  Tail handles in_dim
- * remainder with the original 1-elem stride. */
-#define ROCM_DEFINE_MATMUL_F16_WAVE_N(NROWS, N) \
-__global__ static void rocm_matmul_f16_wave_##NROWS##_n##N##_kernel( \
-        float *out, const uint16_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim) { \
-    const uint32_t tid     = threadIdx.x; \
-    const uint32_t row_idx = tid >> 5; \
-    const uint32_t lane    = tid & 31u; \
-    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
-    if (row >= out_dim) return; \
-    const uint16_t *wr = w + (uint64_t)row * in_dim; \
-    const uint32_t step = 32u * (uint32_t)(N); \
-    const uint32_t in_dim_pack = (in_dim / step) * step; \
-    float sum = 0.0f; \
-    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
-        _Pragma("unroll") \
-        for (uint32_t k = 0; k < (uint32_t)(N); k++) { \
-            const uint32_t i = base + k * 32u + lane; \
-            sum += rocm_f16_to_f32(wr[i]) * x[i]; \
-        } \
-    } \
-    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
-        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    if (lane == 0) out[row] = sum; \
-}
-
-ROCM_DEFINE_MATMUL_F16_WAVE_N(8, 8)
-ROCM_DEFINE_MATMUL_F16_WAVE_N(4, 8)
-
-/* Same as WAVE_N but cooperatively loads x into LDS once per block, so the
- * NROWS waves all share a single in_dim*sizeof(float) read. Weights are
- * still streamed from global with N-element unroll. Caller must guarantee
- * in_dim*sizeof(float) <= LDS budget (we use 16 KiB ceiling -> in_dim<=4096
- * for fp32 x), and in_dim a multiple of 32*N for the unrolled inner loop. */
-#define ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(NROWS, N) \
-__global__ static void rocm_matmul_f16_wave_lds_##NROWS##_n##N##_kernel( \
-        float *out, const uint16_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim) { \
-    extern __shared__ float x_lds[]; \
-    const uint32_t tid     = threadIdx.x; \
-    const uint32_t row_idx = tid >> 5; \
-    const uint32_t lane    = tid & 31u; \
-    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = x[i]; \
-    __syncthreads(); \
-    const uint32_t row = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
-    if (row >= out_dim) return; \
-    const uint16_t *wr = w + (uint64_t)row * in_dim; \
-    const uint32_t step = 32u * (uint32_t)(N); \
-    const uint32_t in_dim_pack = (in_dim / step) * step; \
-    float sum = 0.0f; \
-    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
-        _Pragma("unroll") \
-        for (uint32_t k = 0; k < (uint32_t)(N); k++) { \
-            const uint32_t i = base + k * 32u + lane; \
-            sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
-        } \
-    } \
-    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
-        sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    if (lane == 0) out[row] = sum; \
-}
-
-ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(8, 8)
-ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(4, 8)
-
-/* LDS-x wave-per-row F16 matvec with one 128-bit weight load per lane per
- * 256-wide K tile.  Lane l owns the contiguous elements base+l*8..base+l*8+7,
- * so the wave covers the same 256 inputs as WAVE_LDS_N(.,8), but weight
- * traffic is expressed as 32 aligned uint4 loads instead of 8 rounds of
- * scalar half loads. */
+/* LDS-x wave-per-row F16 matmul for one-token decode (n_tok=1).  Each block
+ * holds NROWS waves; one cooperative load fans x into LDS so all waves share
+ * it.  Lane l owns elements base+l*8..base+l*8+7, so the wave covers 256
+ * inputs per K tile and weight traffic is 32 aligned uint4 loads per tile.
+ * Caller must guarantee in_dim*sizeof(float) <= LDS budget (~16 KiB ->
+ * in_dim<=4096) and in_dim a multiple of 256.  Tail walks the remainder
+ * with a scalar lane stride. */
 #define ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(NROWS) \
 __global__ static void rocm_matmul_f16_wave_lds_##NROWS##_v8_kernel( \
         float *out, const uint16_t *w, const float *x, \
@@ -1128,53 +973,6 @@ __global__ static void rocm_matmul_f16_wave_lds_##NROWS##_v8_kernel( \
 
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(8)
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(4)
-
-/* K-split F16 matvec for shapes where out_dim is too small to fill 40 CUs
- * with one workgroup per row (e.g. 16384x24, 16384x4 — the indexer/compressor
- * paths). One workgroup handles one row across a K-tile of size SPLIT_K
- * elements; an atomicAdd accumulates partial sums into out[row].
- *
- * Caller must zero out[] before launching, and use enough K-tiles to cover
- * in_dim. NROWS=1 because small-out_dim shapes don't benefit from packing. */
-#define ROCM_DEFINE_MATMUL_F16_KSPLIT(SPLIT_K) \
-__global__ static void rocm_matmul_f16_ksplit_##SPLIT_K##_kernel( \
-        float *out, const uint16_t *w, const float *x, \
-        uint32_t in_dim, uint32_t out_dim) { \
-    const uint32_t tid  = threadIdx.x; \
-    const uint32_t lane = tid & 31u; \
-    const uint32_t wid  = tid >> 5; \
-    const uint32_t row  = blockIdx.x; \
-    const uint32_t kt   = blockIdx.y; \
-    if (row >= out_dim) return; \
-    const uint32_t k_start = kt * (uint32_t)(SPLIT_K); \
-    if (k_start >= in_dim) return; \
-    const uint32_t k_end = k_start + (uint32_t)(SPLIT_K) <= in_dim \
-                              ? k_start + (uint32_t)(SPLIT_K) : in_dim; \
-    const uint16_t *wr = w + (uint64_t)row * in_dim; \
-    float sum = 0.0f; \
-    for (uint32_t i = k_start + tid; i < k_end; i += blockDim.x) { \
-        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
-    } \
-    sum = rocm_wave32_sum(sum); \
-    /* per-wave partials -> shared -> wave 0 -> atomicAdd out[row]. */ \
-    __shared__ float wave_partial[8]; \
-    if (lane == 0) wave_partial[wid] = sum; \
-    __syncthreads(); \
-    if (wid == 0) { \
-        const uint32_t n_waves = blockDim.x >> 5; \
-        float v = lane < n_waves ? wave_partial[lane] : 0.0f; \
-        v = rocm_wave32_sum(v); \
-        if (lane == 0) atomicAdd(&out[row], v); \
-    } \
-}
-
-ROCM_DEFINE_MATMUL_F16_KSPLIT(1024)
-ROCM_DEFINE_MATMUL_F16_KSPLIT(2048)
-
-__global__ static void rocm_zero_floats_kernel(float *p, uint32_t n) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) p[i] = 0.0f;
-}
 
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,

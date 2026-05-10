@@ -92,6 +92,11 @@ static int rocm_trace(void) {
     return v && v[0] && v[0] != '0';
 }
 
+static int rocm_topk_trace_enabled(void) {
+    const char *v = getenv("DS4_ROCM_TOPK_TRACE");
+    return v && v[0] && v[0] != '0';
+}
+
 /* Per-kernel timing.  Enabled by setting DS4_ROCM_TIME=1.  Each wrapper
  * brackets its work with rocm_time_begin / rocm_time_end_named, which
  * accumulates wall-clock time per kernel name.  At exit, ds4_metal_cleanup
@@ -4204,7 +4209,14 @@ int ds4_metal_indexer_topk_tensor(
         /* Block-parallel iterative argmax + bitonic re-sort. Replaces the
          * single-thread O(n_comp * top_k) reference scan; production callers
          * (DS4_N_INDEXER_TOP_K==512 across the indexer / spec verifier paths)
-         * land here. */
+         * land here. Optional one-line stderr trace under DS4_ROCM_TOPK_TRACE=1
+         * lets integration tests confirm the parallel path actually fired
+         * without enabling the firehose DS4_ROCM_TRACE. */
+        if (rocm_topk_trace_enabled()) {
+            fprintf(stderr,
+                    "ds4: ROCm topk parallel n_tok=%u n_comp=%u top_k=%u\n",
+                    n_tokens, n_comp, top_k);
+        }
         const uint32_t mask_words = (n_comp + 31u) >> 5;
         uint32_t top_k_pow2 = 1u;
         while (top_k_pow2 < top_k) top_k_pow2 <<= 1;

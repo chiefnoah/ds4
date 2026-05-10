@@ -1082,6 +1082,53 @@ __global__ static void rocm_matmul_f16_wave_lds_##NROWS##_n##N##_kernel( \
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(8, 8)
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(4, 8)
 
+/* LDS-x wave-per-row F16 matvec with one 128-bit weight load per lane per
+ * 256-wide K tile.  Lane l owns the contiguous elements base+l*8..base+l*8+7,
+ * so the wave covers the same 256 inputs as WAVE_LDS_N(.,8), but weight
+ * traffic is expressed as 32 aligned uint4 loads instead of 8 rounds of
+ * scalar half loads. */
+#define ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(NROWS) \
+__global__ static void rocm_matmul_f16_wave_lds_##NROWS##_v8_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    extern __shared__ float x_lds[]; \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = x[i]; \
+    __syncthreads(); \
+    const uint32_t row = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const uint32_t step = 256u; \
+    const uint32_t in_dim_pack = (in_dim / step) * step; \
+    float sum = 0.0f; \
+    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
+        const uint32_t i = base + lane * 8u; \
+        const uint4 hv = *(const uint4 *)(const void *)(wr + i); \
+        const uint32_t h0 = hv.x; \
+        const uint32_t h1 = hv.y; \
+        const uint32_t h2 = hv.z; \
+        const uint32_t h3 = hv.w; \
+        sum += rocm_f16_to_f32((uint16_t)(h0        & 0xffffu)) * x_lds[i + 0u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h0 >> 16) & 0xffffu)) * x_lds[i + 1u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h1        & 0xffffu)) * x_lds[i + 2u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h1 >> 16) & 0xffffu)) * x_lds[i + 3u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h2        & 0xffffu)) * x_lds[i + 4u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h2 >> 16) & 0xffffu)) * x_lds[i + 5u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h3        & 0xffffu)) * x_lds[i + 6u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h3 >> 16) & 0xffffu)) * x_lds[i + 7u]; \
+    } \
+    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(8)
+ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(4)
+
 /* K-split F16 matvec for shapes where out_dim is too small to fill 40 CUs
  * with one workgroup per row (e.g. 16384x24, 16384x4 — the indexer/compressor
  * paths). One workgroup handles one row across a K-tile of size SPLIT_K
@@ -1121,6 +1168,7 @@ __global__ static void rocm_matmul_f16_ksplit_##SPLIT_K##_kernel( \
     } \
 }
 
+ROCM_DEFINE_MATMUL_F16_KSPLIT(1024)
 ROCM_DEFINE_MATMUL_F16_KSPLIT(2048)
 
 __global__ static void rocm_zero_floats_kernel(float *p, uint32_t n) {
@@ -2270,30 +2318,30 @@ int ds4_metal_matmul_f16_tensor(
          *
          * The earlier 1-elem-per-lane WAVE attempt regressed because loop
          * control dominated; the unrolled variant fixes that. */
-        const int wave_n_eligible    = (in_dim % 256u) == 0u;
         const int lds_x_fits         = (in_dim * sizeof(float)) <= 16384u;
-        if (wave_n_eligible && lds_x_fits && (out_dim % 8u) == 0u && out_dim >= 256u) {
+        const int wave_v8_eligible   = (in_dim % 256u) == 0u;
+        if (wave_v8_eligible && lds_x_fits && (out_dim % 8u) == 0u && out_dim >= 256u) {
             const dim3 block(8u * 32u);
             const dim3 grid((unsigned)((out_dim + 7u) / 8u));
-            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_8_n8_kernel,
+            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_8_v8_kernel,
                                grid, block, in_dim * sizeof(float), g_stream,
                                (float *)tensor_u8(out),
                                (const uint16_t *)w_dev,
                                (const float *)tensor_u8_const(x),
                                (uint32_t)in_dim, (uint32_t)out_dim);
-            ok = rocm_launch_done("F16 matmul wave_lds_8_n8 launch",
-                                  "F16 matmul wave_lds_8_n8 completion");
-        } else if (wave_n_eligible && lds_x_fits && (out_dim % 4u) == 0u) {
+            ok = rocm_launch_done("F16 matmul wave_lds_8_v8 launch",
+                                  "F16 matmul wave_lds_8_v8 completion");
+        } else if (wave_v8_eligible && lds_x_fits && (out_dim % 4u) == 0u) {
             const dim3 block(4u * 32u);
             const dim3 grid((unsigned)((out_dim + 3u) / 4u));
-            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_4_n8_kernel,
+            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_4_v8_kernel,
                                grid, block, in_dim * sizeof(float), g_stream,
                                (float *)tensor_u8(out),
                                (const uint16_t *)w_dev,
                                (const float *)tensor_u8_const(x),
                                (uint32_t)in_dim, (uint32_t)out_dim);
-            ok = rocm_launch_done("F16 matmul wave_lds_4_n8 launch",
-                                  "F16 matmul wave_lds_4_n8 completion");
+            ok = rocm_launch_done("F16 matmul wave_lds_4_v8 launch",
+                                  "F16 matmul wave_lds_4_v8 completion");
         } else {
             /* in_dim too large for LDS-x (>4096 floats) — measured: the
              * non-LDS wave_n8 variant regresses for in_dim=16384 because

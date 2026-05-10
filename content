@@ -1,0 +1,21 @@
+F16 v8 vectorized loads landed; k-split dispatch reverted
+
+Status: VALIDATED 2026-05-09 on Strix Halo. Codex implementation merged in 7f77703.
+
+What landed:
+- v8 kernel (uint4/128-bit fp16 weight loads): kept, +0.04 t/s end-to-end (15.64->15.68)
+- ksplit_1024 kernel definition: kept as scaffolding
+- ksplit dispatch for 16384x{4,24}: REVERTED — regressed 27 -> 41 us/call (+50%) due to zero+dispatch overhead exceeding compute savings on 24-row launches
+
+Per-shape decode numbers (DS4_ROCM_SYNC_EACH=1):
+  shape       n8(prev)  v8(now)  delta
+  4096x256    24.3 us   24.2 us  -0%
+  4096x512    41.2 us   39.4 us  -4%
+  4096x1024   77.7 us   74.6 us  -4%
+  16384x24    29.1 us   29.1 us  unchanged (LDS fallback)
+  16384x4     28.0 us   28.0 us  unchanged (LDS fallback)
+
+Follow-ups:
+- F16 4096-input shapes still at ~100 GiB/s vs 190 GiB/s ceiling. Codex did not attempt larger N (16/32) or fma-flavored intrinsics. Worth one more pass.
+- 16384x24 needs a different structural fix than k-split. Options: (a) batch all 24 calls into a single launch since they share x; (b) accept it as occupancy-bound and ignore; (c) try a wave-per-row variant that broadcasts x via LDS but processes 2-4 K-tiles per wave with no atomics.
+- Decode is now at 15.68 t/s. Target: 23 t/s. Still ~7 t/s gap.

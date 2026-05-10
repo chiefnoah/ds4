@@ -1,0 +1,27 @@
+Vulkan Phase 1: skeleton + build wiring
+
+PARENT: tsk-44.
+STATUS: planned, not started.
+
+GOAL
+Stand up the Vulkan TU and build system without touching kernels yet. End state: DS4_VULKAN=1 make ds4 produces a binary that initializes a Vulkan device, allocates a buffer, runs a no-op compute pipeline, and exits cleanly. ROCm and Metal paths unchanged.
+
+DELIVERABLES
+- ds4_vulkan.c, ds4_vulkan.h (mirror ds4_rocm.c structure; declare ds4_metal_*-shaped wrappers as stubs that abort()).
+- Vendored single-header: vk_mem_alloc.h (VMA, MIT licensed). Vendored single-header: volk.h or direct linkage to libvulkan.so — pick volk to avoid loader-version drift.
+- Makefile additions:
+  * DS4_VULKAN ?= 0
+  * GLSLC ?= glslc
+  * Conditional CFLAGS += -DDS4_USE_VULKAN under DS4_VULKAN=1.
+  * CORE_OBJS gains ds4_vulkan.o.
+  * METAL_LDLIBS gains -lvulkan when DS4_VULKAN=1.
+  * Pattern rule for shaders/*.comp -> shaders/*.comp.spv.h (xxd -i or custom embed script).
+- Smoke main inside ds4_vulkan.c (gated on DS4_VULKAN_SMOKE) that creates instance, picks gfx1151 physical device, creates compute queue, loads a 16-byte no-op SPIR-V, dispatches it, and prints "vulkan smoke OK".
+- shaders/ directory created with shaders/noop.comp as the smoke shader.
+- VK_EXT_subgroup_size_control + VK_KHR_shader_subgroup_extended_types enabled at device creation; assert subgroupSize=32 supported on the chosen queue family.
+
+NON-GOALS
+No real kernels. No backend integration into ds4.c. No --backend vulkan CLI flag yet (Phase 5).
+
+VALIDATION
+DS4_VULKAN=1 DS4_VULKAN_SMOKE=1 ./ds4 prints "vulkan smoke OK" and exits 0. Both DS4_ROCM=1 make ds4 and the existing ./ds4_rocm_kernel_test still pass — no regression to existing backends.

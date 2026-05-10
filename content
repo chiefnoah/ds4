@@ -1,0 +1,34 @@
+ROCm decode: HIP graph capture experiment ruled it out
+
+Status: DONE — negative result. Ran microbench tests/ds4_rocm_graph_capture_test.c on Strix Halo (gfx1151) post blocking-sync fix.
+
+Numbers (2026-05-09):
+- 250 captured kernels x 200 replays = 50000 launches
+- Direct (batched mode begin/end_commands): 129 ms = 2.58 us/kernel
+- Replay (graph captured once, replayed 200x): 106 ms = 2.12 us/kernel
+- Per-kernel overhead saved by graph capture: ~0.46 us
+- Extrapolated to ds4 decode (250 kernels/token x 200 tokens): 23 ms saved over 13s decode wall = 0.18%
+- Decode rate would notch from 15.35 t/s to ~15.38 t/s (lost in noise)
+
+Why the original tsk-34 estimate of 5-15% was wrong: blocking-sync fix already eliminated CPU spin. With launches already amortized across the stream-batch and sync only once per token, per-launch CPU dispatch is small. The 13.7s of system CPU during a 33s run is dominated by minor page faults from accessing the 80 GiB model map (244k faults x ~30us = ~7s) and HIP runtime memory management — not by launch syscalls.
+
+Audit findings that made full implementation infeasible anyway:
+- pos is used as a kernel arg in ~10 wrappers (rope_tail, kv_store via raw_row, compressor_update). Captured graph would bake stale pos.
+- Topology varies per token: ds4.c:8886 emit = ((pos+1u) % ratio == 0u) controls whether compressor matmul kernels are enqueued at all — would need 4 captured variants for ratio-4.
+- ds4.c:9030 has another host-side branch on layer_n_comp[il] > decode_top_k.
+- Mid-encode flush at ds4.c:10309 (split_after_layers) calls hipDeviceSynchronize, forbidden during capture.
+- Per-token allocation: comp_row_view at ds4.c:8949 — hipMalloc forbidden during capture.
+
+Infrastructure landed in branch (uncommitted): 
+- ds4_rocm.c: g_stream global plumbed through 63 hipLaunchKernelGGL sites + 1 hipMemsetAsync; ds4_metal_begin_capture/end_capture/replay_graph/destroy_capture API.
+- ds4_metal.h: capture API declared.
+- tests/ds4_rocm_graph_capture_test.c: smoke + microbench (passes).
+- ds4_rocm.c: rocm_launch_done now skips hipDeviceSynchronize when capture is active.
+
+Proposed real next levers:
+1. Reduce page-fault sys time: mlock or madvise(MADV_HUGEPAGE) on the 80 GiB model map. Could remove much of the 7s of fault sys time.
+2. Audit matmul_f16 GPU time (~17 ms/tok was the previous histogram estimate, never confirmed with DS4_ROCM_SYNC_EACH=1).
+3. Audit matmul_f16_pair GPU time — 12338 prefill+decode calls — never audited.
+4. Continue chasing kernels toward the ~190 GiB/s ceiling.
+
+See feedback_hip_graph_low_value.md for the persistent memory note.

@@ -1,0 +1,39 @@
+Wave32 specialization for all MoE quant formats
+
+## Status
+Proposed
+
+## Goal
+Extend the wave32 pattern from the IQ2_XXS MoE gate/up kernel to Q2_K and Q4_K formats, replacing the generic 64-thread block kernel (~72 GiB/s ceiling per AGENTS.md).
+
+## Context
+File: ds4_rocm.c:6410, `rocm_moe_gate_up_matvec_kernel` and IQ2_XXS variant at L6531.
+
+Current MoE gate/up matvec:
+- Generic kernel (L6410): 64+ thread blocks, each thread loads x into LDS then computes its row dot. Serial inner dot over quant blocks limits throughput.
+- IQ2_XXS wave variant (L6531): one 32-lane wave per output row, lanes split sub-blocks, shuffle reduction. Comment says ~2x faster.
+
+Q2_K and Q4_K quant types still fall through to the generic kernel. They are used by many production MoE models.
+
+## Key insight
+rocm_quant_dot_block() for Q2_K/Q4_K works block-at-a-time, called sequentially per block. A wave32 variant can parallelize each block across 32 lanes using __shfl_down, similar to IQ2_XXS but with the Q2_K/Q4_K block decode logic.
+
+## Files
+- ds4_rocm.c:6410 (generic moe_gate_up_matvec_kernel)
+- ds4_rocm.c:6531 (IQ2_XXS wave variant pattern)
+- ds4_rocm.c:6480 (moe_down_matvec_kernel - also needs the same treatment)
+- rocm_quant_dot_block() and related quantization helpers
+
+## Validation
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test - must end with OK
+3. End-to-end: ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+4. Compare tokens/sec with DS4_ROCM_TIME=1
+5. Numeric match: output diffs must be within quant noise of original
+
+## Next steps
+1. Identify rocm_quant_dot_block implementation for Q2_K and Q4_K
+2. Write ROCM_DEFINE_MOE_GATE_UP_Q2K_WAVE(NROWS) following IQ2_XXS pattern
+3. Write ROCM_DEFINE_MOE_GATE_UP_Q4K_WAVE(NROWS)
+4. Dispatch to new kernels based on gate_type/up_type in ds4_metal_routed_moe_one/batch wrappers
+5. Repeat for down projection kernel

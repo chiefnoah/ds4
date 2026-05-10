@@ -155,6 +155,23 @@ int ds4_metal_matmul_q8_0_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok);
 
+/* Fused decode matmul_q8_0 for two same-input matmuls (qr + kv_raw):
+ * a single dispatch projects the same x[in_dim] against two Q8_0 weight
+ * matrices, writing to out_a[out_dim_a] and out_b[out_dim_b].  Returns 0
+ * if the implementation doesn't support the shape — caller must fall back
+ * to two ds4_metal_matmul_q8_0_tensor calls. */
+int ds4_metal_matmul_q8_0_pair_tensor(
+        ds4_metal_tensor       *out_a,
+        ds4_metal_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset_a,
+        uint64_t                weight_offset_b,
+        uint64_t                in_dim,
+        uint64_t                out_dim_a,
+        uint64_t                out_dim_b,
+        const ds4_metal_tensor *x);
+
 int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         ds4_metal_tensor       *gate,
         ds4_metal_tensor       *up,

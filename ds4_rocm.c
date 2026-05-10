@@ -587,6 +587,56 @@ __global__ static void rocm_matmul_q8_0_wave_##NROWS##_kernel( \
 ROCM_DEFINE_MATMUL_Q8_0_WAVE(8)
 ROCM_DEFINE_MATMUL_Q8_0_WAVE(4)
 
+/* Fused decode matmul_q8_0 for two same-input matmuls (e.g. qr + kv_raw):
+ * one block computes NROWS rows of A and NROWS rows of B at the same row
+ * tile, both projecting the same x.  Block holds 2*NROWS waves, the first
+ * NROWS waves stream weight rows from w_a -> out_a, the second NROWS from
+ * w_b -> out_b.  Each wave reads x directly from global; L1/L2 absorbs
+ * the redundant reads across waves on the same CU (LDS-x staging was
+ * measured ~4x slower for Q8_0 wave matmuls — see the matmul_q8_0_tensor
+ * wrapper comment).  The win here is one launch instead of two AND
+ * sharing a single CU schedule between the two matrices' rows, which
+ * keeps the weight streams interleaved instead of serialized.
+ *
+ * Independent out_dim_a and out_dim_b are supported: grid.x is sized to
+ * max(out_dim_a, out_dim_b)/NROWS and each wave bounds-checks against its
+ * own out_dim. */
+#define ROCM_DEFINE_MATMUL_Q8_0_PAIR_WAVE(NROWS) \
+__global__ static void rocm_matmul_q8_0_pair_wave_##NROWS##_kernel( \
+        float *out_a, float *out_b, \
+        const uint8_t *w_a, const uint8_t *w_b, const float *x, \
+        uint32_t in_dim, uint32_t out_dim_a, uint32_t out_dim_b, \
+        uint64_t row_bytes) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t wave    = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const int      is_b   = wave >= (uint32_t)(NROWS); \
+    const uint32_t local  = is_b ? wave - (uint32_t)(NROWS) : wave; \
+    const uint32_t row    = blockIdx.x * (uint32_t)(NROWS) + local; \
+    const uint32_t maxout = is_b ? out_dim_b : out_dim_a; \
+    if (row >= maxout) return; \
+    const uint8_t *w   = is_b ? w_b   : w_a; \
+    float         *out = is_b ? out_b : out_a; \
+    const uint8_t *wr = w + (uint64_t)row * row_bytes; \
+    const uint32_t blocks = in_dim >> 5; \
+    float sum = 0.0f; \
+    for (uint32_t b = lane; b < blocks; b += 32u) { \
+        const uint8_t *blk = wr + (uint64_t)b * 34u; \
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8); \
+        const int8_t *qs = (const int8_t *)(blk + 2); \
+        const float *xb = x + ((uint64_t)b << 5); \
+        float dot = 0.0f; \
+        _Pragma("unroll") \
+        for (int j = 0; j < 32; j++) dot += (float)qs[j] * xb[j]; \
+        sum += rocm_f16_to_f32(scale_bits) * dot; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0u) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_Q8_0_PAIR_WAVE(8)
+ROCM_DEFINE_MATMUL_Q8_0_PAIR_WAVE(4)
+
 /* Tiled Q8_0 wave matmul for prefill (n_tok > 1).  Each lane reads each
  * Q8_0 weight block exactly ONCE per row pass and accumulates NTOK
  * partial sums against NTOK x slices, eliminating the per-token weight
@@ -2843,6 +2893,96 @@ int ds4_metal_matmul_q8_0_tensor(
                 (unsigned long long)aw_bytes, (unsigned long long)ax_bytes,
                 (unsigned long long)ao_bytes, (unsigned long long)bytes);
     }
+    return ok;
+}
+
+/* Fused decode matmul_q8_0 for two same-input matmuls.  Used for
+ * qr + kv_raw at decode (both project attn_norm[7168] -> Q8_0 weights).
+ * Saves one launch and one cooperative LDS-x load that two separate
+ * dispatches would each repeat.  Falls through to caller for shapes
+ * that don't fit the wave-per-row decode pattern (non-32-aligned
+ * in_dim, n_tok != 1, etc.) — caller should issue two separate
+ * matmul_q8_0_tensor calls on a return of 0. */
+int ds4_metal_matmul_q8_0_pair_tensor(
+        ds4_metal_tensor       *out_a,
+        ds4_metal_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset_a,
+        uint64_t                weight_offset_b,
+        uint64_t                in_dim,
+        uint64_t                out_dim_a,
+        uint64_t                out_dim_b,
+        const ds4_metal_tensor *x) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_pair_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_matmul_q8_0_pair_tensor");
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!out_a || !out_b || !model_map || !x) return 0;
+    if (in_dim == 0 || out_dim_a == 0 || out_dim_b == 0) return 0;
+    if ((in_dim % 32u) != 0u) return 0;
+
+    /* Pick NROWS to match both out_dims (need wave-aligned per output).
+     * NROWS=8 demands both out_dim_a/b divisible by 8 AND >= 256 so the
+     * launched grid still saturates 40 CUs after pairing. */
+    uint32_t nrows;
+    if ((out_dim_a % 8u) == 0u && (out_dim_b % 8u) == 0u &&
+        out_dim_a >= 256u && out_dim_b >= 256u) {
+        nrows = 8u;
+    } else if ((out_dim_a % 4u) == 0u && (out_dim_b % 4u) == 0u) {
+        nrows = 4u;
+    } else {
+        return 0;
+    }
+
+    const uint64_t row_bytes      = ((in_dim + 31u) / 32u) * 34u;
+    const uint64_t weight_bytes_a = row_bytes * out_dim_a;
+    const uint64_t weight_bytes_b = row_bytes * out_dim_b;
+    const uint64_t x_bytes        = in_dim * sizeof(float);
+    if (x->bytes < x_bytes) return 0;
+    if (out_a->bytes < out_dim_a * sizeof(float)) return 0;
+    if (out_b->bytes < out_dim_b * sizeof(float)) return 0;
+    if (weight_offset_a > model_size || weight_bytes_a > model_size - weight_offset_a) return 0;
+    if (weight_offset_b > model_size || weight_bytes_b > model_size - weight_offset_b) return 0;
+
+    void *wa_host = NULL, *wa_dev = NULL;
+    void *wb_host = NULL, *wb_dev = NULL;
+    const void *src_a = (const uint8_t *)model_map + weight_offset_a;
+    const void *src_b = (const uint8_t *)model_map + weight_offset_b;
+    if (!rocm_upload_mapped(src_a, weight_bytes_a, &wa_host, &wa_dev, "Q8_0 pair weight A upload")) return 0;
+    if (!rocm_upload_mapped(src_b, weight_bytes_b, &wb_host, &wb_dev, "Q8_0 pair weight B upload")) {
+        rocm_defer_free(wa_host);
+        return 0;
+    }
+
+    const uint64_t max_out  = (out_dim_a > out_dim_b) ? out_dim_a : out_dim_b;
+    const dim3 block(nrows * 32u * 2u);
+    const dim3 grid((unsigned)((max_out + nrows - 1u) / nrows));
+    if (nrows == 8u) {
+        hipLaunchKernelGGL(rocm_matmul_q8_0_pair_wave_8_kernel,
+                           grid, block, 0, g_stream,
+                           (float *)tensor_u8(out_a),
+                           (float *)tensor_u8(out_b),
+                           (const uint8_t *)wa_dev,
+                           (const uint8_t *)wb_dev,
+                           (const float *)tensor_u8_const(x),
+                           (uint32_t)in_dim,
+                           (uint32_t)out_dim_a, (uint32_t)out_dim_b,
+                           row_bytes);
+    } else {
+        hipLaunchKernelGGL(rocm_matmul_q8_0_pair_wave_4_kernel,
+                           grid, block, 0, g_stream,
+                           (float *)tensor_u8(out_a),
+                           (float *)tensor_u8(out_b),
+                           (const uint8_t *)wa_dev,
+                           (const uint8_t *)wb_dev,
+                           (const float *)tensor_u8_const(x),
+                           (uint32_t)in_dim,
+                           (uint32_t)out_dim_a, (uint32_t)out_dim_b,
+                           row_bytes);
+    }
+    int ok = rocm_launch_done("Q8_0 pair matmul launch", "Q8_0 pair matmul completion");
+    rocm_defer_free(wa_host);
+    rocm_defer_free(wb_host);
     return ok;
 }
 

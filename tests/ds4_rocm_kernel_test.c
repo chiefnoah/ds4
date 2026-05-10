@@ -2741,6 +2741,181 @@ int main(void) {
         free(xv); free(Wb); free(Wa);
     }
 
+    /* Q8_0 pair-matmul (qr + kv_raw shape).  In=256 lets us use the
+     * wave-per-row kernel without WMMA gating; out_dim_a=256 + out_dim_b=8
+     * exercises the asymmetric out_dim path (need NROWS=8 since both >= 256
+     * not required for NROWS=4, but small out_dim_b=8 still hits 4-wave). */
+    STEP("matmul_q8_0_pair (asymmetric out_dim, NROWS=4)");
+    {
+        const uint32_t IN = 256, OUT_A = 64, OUT_B = 12;
+        const uint64_t row_bytes = ((uint64_t)IN / 32u) * 34u;
+        uint8_t *Wa = (uint8_t *)malloc((size_t)row_bytes * OUT_A);
+        uint8_t *Wb = (uint8_t *)malloc((size_t)row_bytes * OUT_B);
+        float   *xv   = (float *)malloc((size_t)IN * sizeof(float));
+        float   *refa = (float *)malloc((size_t)OUT_A * sizeof(float));
+        float   *refb = (float *)malloc((size_t)OUT_B * sizeof(float));
+        float   *gota = (float *)malloc((size_t)OUT_A * sizeof(float));
+        float   *gotb = (float *)malloc((size_t)OUT_B * sizeof(float));
+        require(Wa && Wb && xv && refa && refb && gota && gotb, "q8_0 pair alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 17) - 8) * 0.125f;
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            uint16_t one = f32_to_f16(0.125f);
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                uint8_t *blk = Wa + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                blk[0] = (uint8_t)(one & 0xffu); blk[1] = (uint8_t)(one >> 8);
+                for (uint32_t i = 0; i < 32; i++) {
+                    blk[2 + i] = (uint8_t)(int8_t)(((int)((r * 3 + b * 32 + i) % 23) - 11));
+                }
+            }
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            uint16_t one = f32_to_f16(0.25f);
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                uint8_t *blk = Wb + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                blk[0] = (uint8_t)(one & 0xffu); blk[1] = (uint8_t)(one >> 8);
+                for (uint32_t i = 0; i < 32; i++) {
+                    blk[2 + i] = (uint8_t)(int8_t)(((int)((r * 7 + b * 32 + i) % 19) - 9));
+                }
+            }
+        }
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            float s = 0.0f;
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                const uint8_t *blk = Wa + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+                for (uint32_t i = 0; i < 32; i++) s += d * (float)(int8_t)blk[2 + i] * xv[b * 32 + i];
+            }
+            refa[r] = s;
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            float s = 0.0f;
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                const uint8_t *blk = Wb + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+                for (uint32_t i = 0; i < 32; i++) s += d * (float)(int8_t)blk[2 + i] * xv[b * 32 + i];
+            }
+            refb[r] = s;
+        }
+        const size_t wsize_a = (size_t)row_bytes * OUT_A;
+        const size_t wsize_b = (size_t)row_bytes * OUT_B;
+        uint8_t *blob = (uint8_t *)malloc(wsize_a + wsize_b);
+        require(blob != NULL, "q8_0 pair blob alloc");
+        memcpy(blob,           Wa, wsize_a);
+        memcpy(blob + wsize_a, Wb, wsize_b);
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *toa = ds4_metal_tensor_alloc(OUT_A * sizeof(float));
+        ds4_metal_tensor *tob = ds4_metal_tensor_alloc(OUT_B * sizeof(float));
+        require(txw && toa && tob, "q8_0 pair tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)),
+                "q8_0 pair x write");
+        require(ds4_metal_matmul_q8_0_pair_tensor(toa, tob, blob, wsize_a + wsize_b,
+                                                  0, wsize_a, IN, OUT_A, OUT_B, txw),
+                "matmul_q8_0_pair");
+        require(ds4_metal_tensor_read(toa, 0, gota, OUT_A * sizeof(float)),
+                "q8_0 pair a read");
+        require(ds4_metal_tensor_read(tob, 0, gotb, OUT_B * sizeof(float)),
+                "q8_0 pair b read");
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            require(nearf(gota[r], refa[r], 1e-2f), "q8_0 pair a value");
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            require(nearf(gotb[r], refb[r], 1e-2f), "q8_0 pair b value");
+        }
+        ds4_metal_tensor_free(tob);
+        ds4_metal_tensor_free(toa);
+        ds4_metal_tensor_free(txw);
+        free(blob);
+        free(gotb); free(gota); free(refb); free(refa);
+        free(xv); free(Wb); free(Wa);
+    }
+
+    /* Q8_0 pair-matmul at production qr+kv_raw scale: in=7168, out=1536 + 576.
+     * out_dim_a=1536 satisfies NROWS=8 (both >=256, multiple of 8); the
+     * out_b=576 path bounds-checks correctly when grid runs past it. */
+    STEP("matmul_q8_0_pair (production qr+kv_raw shape, NROWS=8)");
+    {
+        const uint32_t IN = 7168, OUT_A = 1536, OUT_B = 576;
+        const uint64_t row_bytes = ((uint64_t)IN / 32u) * 34u;
+        uint8_t *Wa = (uint8_t *)malloc((size_t)row_bytes * OUT_A);
+        uint8_t *Wb = (uint8_t *)malloc((size_t)row_bytes * OUT_B);
+        float   *xv   = (float *)malloc((size_t)IN * sizeof(float));
+        float   *refa = (float *)malloc((size_t)OUT_A * sizeof(float));
+        float   *refb = (float *)malloc((size_t)OUT_B * sizeof(float));
+        float   *gota = (float *)malloc((size_t)OUT_A * sizeof(float));
+        float   *gotb = (float *)malloc((size_t)OUT_B * sizeof(float));
+        require(Wa && Wb && xv && refa && refb && gota && gotb, "q8_0 pair prod alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 31) - 15) * 0.0625f;
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            uint16_t one = f32_to_f16(0.0625f);
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                uint8_t *blk = Wa + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                blk[0] = (uint8_t)(one & 0xffu); blk[1] = (uint8_t)(one >> 8);
+                for (uint32_t i = 0; i < 32; i++) {
+                    blk[2 + i] = (uint8_t)(int8_t)(((int)((r + b * 5 + i) % 11) - 5));
+                }
+            }
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            uint16_t one = f32_to_f16(0.125f);
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                uint8_t *blk = Wb + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                blk[0] = (uint8_t)(one & 0xffu); blk[1] = (uint8_t)(one >> 8);
+                for (uint32_t i = 0; i < 32; i++) {
+                    blk[2 + i] = (uint8_t)(int8_t)(((int)((r * 2 + b + i) % 13) - 6));
+                }
+            }
+        }
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            float s = 0.0f;
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                const uint8_t *blk = Wa + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+                for (uint32_t i = 0; i < 32; i++) s += d * (float)(int8_t)blk[2 + i] * xv[b * 32 + i];
+            }
+            refa[r] = s;
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            float s = 0.0f;
+            for (uint32_t b = 0; b < IN / 32u; b++) {
+                const uint8_t *blk = Wb + (uint64_t)r * row_bytes + (uint64_t)b * 34u;
+                float d = f16_to_f32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+                for (uint32_t i = 0; i < 32; i++) s += d * (float)(int8_t)blk[2 + i] * xv[b * 32 + i];
+            }
+            refb[r] = s;
+        }
+        const size_t wsize_a = (size_t)row_bytes * OUT_A;
+        const size_t wsize_b = (size_t)row_bytes * OUT_B;
+        uint8_t *blob = (uint8_t *)malloc(wsize_a + wsize_b);
+        require(blob != NULL, "q8_0 pair prod blob alloc");
+        memcpy(blob,           Wa, wsize_a);
+        memcpy(blob + wsize_a, Wb, wsize_b);
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *toa = ds4_metal_tensor_alloc(OUT_A * sizeof(float));
+        ds4_metal_tensor *tob = ds4_metal_tensor_alloc(OUT_B * sizeof(float));
+        require(txw && toa && tob, "q8_0 pair prod tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)),
+                "q8_0 pair prod x write");
+        require(ds4_metal_matmul_q8_0_pair_tensor(toa, tob, blob, wsize_a + wsize_b,
+                                                  0, wsize_a, IN, OUT_A, OUT_B, txw),
+                "matmul_q8_0_pair prod");
+        require(ds4_metal_tensor_read(toa, 0, gota, OUT_A * sizeof(float)),
+                "q8_0 pair prod a read");
+        require(ds4_metal_tensor_read(tob, 0, gotb, OUT_B * sizeof(float)),
+                "q8_0 pair prod b read");
+        for (uint32_t r = 0; r < OUT_A; r++) {
+            require(nearf(gota[r], refa[r], 5e-2f), "q8_0 pair prod a value");
+        }
+        for (uint32_t r = 0; r < OUT_B; r++) {
+            require(nearf(gotb[r], refb[r], 5e-2f), "q8_0 pair prod b value");
+        }
+        ds4_metal_tensor_free(tob);
+        ds4_metal_tensor_free(toa);
+        ds4_metal_tensor_free(txw);
+        free(blob);
+        free(gotb); free(gota); free(refb); free(refa);
+        free(xv); free(Wb); free(Wa);
+    }
+
     STEP("kv_fp8_store_raw (FP8 nope + identity rot, ring offset)");
     {
         const uint32_t head_dim = 16;

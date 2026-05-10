@@ -4883,6 +4883,27 @@ int ds4_metal_dsv4_topk_mask_tensor(
     return 1;
 }
 
+/* Metal fallback for the Q8_0 pair matmul.  Always returns 0 so the
+ * caller falls back to two separate matmul_q8_0 calls.  ROCm has a fused
+ * implementation that wins on its launch-overhead profile; Metal's
+ * command-buffer dispatch is comparatively free so two encodes is fine. */
+int ds4_metal_matmul_q8_0_pair_tensor(
+        ds4_metal_tensor       *out_a,
+        ds4_metal_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset_a,
+        uint64_t                weight_offset_b,
+        uint64_t                in_dim,
+        uint64_t                out_dim_a,
+        uint64_t                out_dim_b,
+        const ds4_metal_tensor *x) {
+    (void)out_a; (void)out_b; (void)model_map; (void)model_size;
+    (void)weight_offset_a; (void)weight_offset_b;
+    (void)in_dim; (void)out_dim_a; (void)out_dim_b; (void)x;
+    return 0;
+}
+
 int ds4_metal_matmul_q8_0_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,

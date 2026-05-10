@@ -748,6 +748,95 @@ __global__ static void rocm_matmul_q8_0_wmma_kernel(
     }
 }
 
+/* Wide-token-tile WMMA Q8_0 matmul.  Same 16-row tile as the standard
+ * WMMA kernel but each block now spans 32 tokens (two adjacent 16x16
+ * tile-columns) sharing a single weight load.  Effect: per row tile,
+ * the same 139 KB weight slab feeds 32 token columns from 1 block
+ * instead of 16-token columns from 2 blocks, halving the lane-level
+ * weight load count for the (8192, 4096) shape whose 35 MB weight
+ * footprint sits just over the 32 MB Infinity Cache.
+ *
+ * Kept under DS4_ROCM_WMMA_WIDE (default off pending wins) and dispatched
+ * only for in_dim >= 6144 to target the cache-edge shapes.  For n_tok
+ * that isn't 32-aligned, the trailing block has wasted lanes — efficiency
+ * cliff at small n_tok. */
+__global__ static void rocm_matmul_q8_0_wmma_wide_kernel(
+        float *out, const uint8_t *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t t0   = blockIdx.x * 32u;
+    const uint32_t r0   = blockIdx.y * 16u;
+    if (r0 >= out_dim || t0 >= n_tok) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok_a   = t0 + col_in_tile;
+    const uint32_t tok_b   = t0 + 16u + col_in_tile;
+
+    const uint32_t safe_row = (out_row < out_dim) ? out_row : (out_dim - 1u);
+    const uint32_t safe_tok_a = (tok_a < n_tok) ? tok_a : (n_tok - 1u);
+    const uint32_t safe_tok_b = (tok_b < n_tok) ? tok_b : (n_tok - 1u);
+    const uint8_t *wr  = w + (uint64_t)safe_row * row_bytes;
+    const float   *xta = x + (uint64_t)safe_tok_a * in_dim;
+    const float   *xtb = x + (uint64_t)safe_tok_b * in_dim;
+    const uint32_t blocks = in_dim >> 5;
+
+    rocm_v8f32 ca = {0,0,0,0,0,0,0,0};
+    rocm_v8f32 cb = {0,0,0,0,0,0,0,0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = wr + (uint64_t)b * 34u;
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const _Float16 scale = (_Float16)rocm_f16_to_f32(scale_bits);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+        const float *xba = xta + ((uint64_t)b << 5);
+        const float *xbb = xtb + ((uint64_t)b << 5);
+
+        /* First WMMA-K (kk 0..15): load weight half, feed both columns. */
+        rocm_v16f16 a1;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a1[kk] = (_Float16)((float)qs[kk]) * scale;
+        }
+        rocm_v16f16 bv1a, bv1b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv1a[kk] = (_Float16)xba[kk];
+            bv1b[kk] = (_Float16)xbb[kk];
+        }
+        ca = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, bv1a, ca);
+        cb = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, bv1b, cb);
+
+        /* Second WMMA-K (kk 16..31). */
+        rocm_v16f16 a2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk] = (_Float16)((float)qs[16 + kk]) * scale;
+        }
+        rocm_v16f16 bv2a, bv2b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv2a[kk] = (_Float16)xba[16 + kk];
+            bv2b[kk] = (_Float16)xbb[16 + kk];
+        }
+        ca = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bv2a, ca);
+        cb = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bv2b, cb);
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t ta = t0 + col_in_tile;
+        const uint32_t tb = t0 + 16u + col_in_tile;
+        if (r < out_dim) {
+            if (ta < n_tok) out[(uint64_t)ta * out_dim + r] = ca[i];
+            if (tb < n_tok) out[(uint64_t)tb * out_dim + r] = cb[i];
+        }
+    }
+}
+
 /* Activation microquant: f32[n_tok][in_dim] -> Q8_0-shaped int8 + per-32-block
  * fp16 scale.  Output layout matches the Q8_0 weight format (2-byte scale
  * followed by 32 int8) so the WMMA_I8 matmul kernel can read activations
@@ -2653,21 +2742,56 @@ int ds4_metal_matmul_q8_0_tensor(
                 /* fall through to WMMA_F16 if scratch alloc failed */
             }
             if (!dispatched_wmma_i8 && wmma_ok) {
+                /* Wide-token-tile variant for cache-edge weight shapes
+                 * (~35 MB weights just over the 32 MB Infinity Cache):
+                 * each block produces 16 rows x 32 tokens so one weight
+                 * tile load feeds 2x the output columns, halving the
+                 * lane-level weight load count.  Measured +6.2% on the
+                 * 245-token prompt.  Default on; disable via
+                 * DS4_ROCM_WMMA_WIDE=0.  Shape gate below avoids the
+                 * trailing-block waste regression on short prompts. */
+                static int g_wmma_wide_cached = -1;
+                if (g_wmma_wide_cached < 0) {
+                    const char *env = getenv("DS4_ROCM_WMMA_WIDE");
+                    g_wmma_wide_cached = (env && env[0] == '0') ? 0 : 1;
+                }
+                /* Wide tile pays off on cache-edge weight shapes when n_tok
+                 * is large enough that the trailing-partial-block waste is
+                 * dominated by the body savings.  n_tok=34 measured 1%
+                 * worse (47% waste in 2nd tile), n_tok=245 measured 6%
+                 * better.  64-token floor keeps us on the winning side. */
+                const int wide_ok = g_wmma_wide_cached
+                                    && in_dim >= 6144u
+                                    && n_tok  >= 64u;
                 const dim3 wblock(32u);
-                /* X=token, Y=row tile: HIP launches X-major, so all 16
-                 * token tiles for one row tile run before moving to the
-                 * next row — keeps the row-tile weight slab hot in the
-                 * 32 MB Infinity Cache. */
-                const dim3 wgrid((unsigned)((n_tok   + 15u) / 16u),
-                                 (unsigned)((out_dim + 15u) / 16u));
-                hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_kernel,
-                                   wgrid, wblock, 0, g_stream,
-                                   (float *)tensor_u8(out),
-                                   (const uint8_t *)w_dev,
-                                   (const float *)tensor_u8_const(x),
-                                   (uint32_t)in_dim, (uint32_t)out_dim,
-                                   (uint32_t)n_tok, row_bytes);
-                ok = rocm_launch_done("Q8_0 matmul wmma launch", "Q8_0 matmul wmma completion");
+                if (wide_ok) {
+                    const dim3 wgrid((unsigned)((n_tok   + 31u) / 32u),
+                                     (unsigned)((out_dim + 15u) / 16u));
+                    hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_wide_kernel,
+                                       wgrid, wblock, 0, g_stream,
+                                       (float *)tensor_u8(out),
+                                       (const uint8_t *)w_dev,
+                                       (const float *)tensor_u8_const(x),
+                                       (uint32_t)in_dim, (uint32_t)out_dim,
+                                       (uint32_t)n_tok, row_bytes);
+                    ok = rocm_launch_done("Q8_0 matmul wmma_wide launch",
+                                          "Q8_0 matmul wmma_wide completion");
+                } else {
+                    /* X=token, Y=row tile: HIP launches X-major, so all 16
+                     * token tiles for one row tile run before moving to the
+                     * next row — keeps the row-tile weight slab hot in the
+                     * 32 MB Infinity Cache. */
+                    const dim3 wgrid((unsigned)((n_tok   + 15u) / 16u),
+                                     (unsigned)((out_dim + 15u) / 16u));
+                    hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_kernel,
+                                       wgrid, wblock, 0, g_stream,
+                                       (float *)tensor_u8(out),
+                                       (const uint8_t *)w_dev,
+                                       (const float *)tensor_u8_const(x),
+                                       (uint32_t)in_dim, (uint32_t)out_dim,
+                                       (uint32_t)n_tok, row_bytes);
+                    ok = rocm_launch_done("Q8_0 matmul wmma launch", "Q8_0 matmul wmma completion");
+                }
             } else if (!dispatched_wmma_i8) {
             const uint32_t ntok = 8u;
             const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),

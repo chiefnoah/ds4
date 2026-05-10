@@ -1,0 +1,19 @@
+ROCm decode: audit matmul_f16 GPU time (~17 ms/tok unconfirmed)
+
+Status: PROPOSED. From the decode hotspot analysis matmul_f16 was estimated at ~17 ms/tok in the ROCM_TIME_SCOPE histogram (DS4_ROCM_TIME=1) but never confirmed with DS4_ROCM_SYNC_EACH=1, which is needed to convert enqueue time into real GPU+sync time per call (see feedback_real_gpu_time.md). The histogram is also inclusive of nested wrappers (feedback_inclusive_histogram.md), so the 17 ms could be inflated.
+
+Goal: measure real per-call GPU time for ds4_metal_matmul_f16_tensor in production decode, then decide if it warrants kernel work.
+
+Approach:
+1. Run DS4_ROCM_TIME=1 DS4_ROCM_SYNC_EACH=1 ./ds4 --backend rocm -p '...' -n 200 --temp 0 --seed 42. Sync_each forces hipDeviceSynchronize per call so ROCM_TIME_SCOPE measures actual GPU time.
+2. Inspect histogram for matmul_f16. Compute ms/call x calls/decode-token x bytes/call = effective GiB/s. Compare to the ~190 GiB/s ceiling (project_strix_halo_bw_ceiling.md).
+3. List the unique (in_dim, out_dim) shapes seen via DS4_ROCM_AUDIT_F16=1 (already wired in this branch). Cluster the ms/call vs shape.
+4. If a shape is far below ceiling, the matmul_f16 kernel needs the same wave-per-row + N-element-per-lane treatment that worked for Q8_0. The naive port already exists in ds4_rocm.c as dead code (rocm_matmul_f16_wave_4/8_kernel, rocm_matmul_f16_ksplit_2048_kernel) but regressed because the lane processed only 1 element per loop iteration vs 32 in Q8_0. Redo with N-element unroll.
+5. tests/ds4_rocm_matmul_bench can be extended with f16 shapes for fast iteration without the 21s model load (see feedback_microbench.md).
+
+Validation:
+- ./ds4_rocm_kernel_test 40/40
+- Coherent decode at -n 200
+- Decode rate at or above current 15.35 t/s
+
+Why this matters: matmul_f16 is the largest never-audited bucket. If even half the 17 ms/tok is recoverable via wave-per-row, that is +8 ms/tok = +2 t/s decode.

@@ -2543,6 +2543,125 @@ int main(void) {
         ds4_metal_tensor_free(tx_p);
     }
 
+    /* Decode-shape fused matmul_f16_pair: in_dim multiple of 256, out_dim
+     * multiple of 8 + >=256 hits the NROWS=8 fused path that computes both
+     * out_a and out_b from one shared LDS-x load. */
+    STEP("matmul_f16_pair fused decode (in=256, out=256, n_tok=1)");
+    {
+        const uint32_t IN = 256, OUT = 256;
+        uint16_t *Wa = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        uint16_t *Wb = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        float    *xv  = (float    *)malloc((size_t)IN * sizeof(float));
+        float    *refa = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *refb = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *gota = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *gotb = (float    *)malloc((size_t)OUT * sizeof(float));
+        require(Wa && Wb && xv && refa && refb && gota && gotb, "f16_pair fused alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 17) - 8) * 0.125f;
+        for (uint32_t r = 0; r < OUT; r++) {
+            for (uint32_t i = 0; i < IN; i++) {
+                Wa[r * IN + i] = f32_to_f16((float)((int)((r + i) % 23) - 11) * 0.0625f);
+                Wb[r * IN + i] = f32_to_f16((float)((int)((r * 5 + i) % 19) - 9) * 0.0625f);
+            }
+        }
+        for (uint32_t r = 0; r < OUT; r++) {
+            float sa = 0.0f, sb = 0.0f;
+            for (uint32_t i = 0; i < IN; i++) {
+                sa += f16_to_f32(Wa[r * IN + i]) * xv[i];
+                sb += f16_to_f32(Wb[r * IN + i]) * xv[i];
+            }
+            refa[r] = sa;
+            refb[r] = sb;
+        }
+        const size_t wsize = (size_t)IN * OUT * sizeof(uint16_t);
+        uint8_t *blob = (uint8_t *)malloc(2 * wsize);
+        require(blob != NULL, "f16_pair fused blob alloc");
+        memcpy(blob,         Wa, wsize);
+        memcpy(blob + wsize, Wb, wsize);
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *toa = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        ds4_metal_tensor *tob = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        require(txw && toa && tob, "f16_pair fused tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)),
+                "f16_pair fused x write");
+        require(ds4_metal_matmul_f16_pair_tensor(toa, tob, blob, 2 * wsize,
+                                                  0, wsize, IN, OUT, txw, 1),
+                "matmul_f16_pair fused 8x");
+        require(ds4_metal_tensor_read(toa, 0, gota, OUT * sizeof(float)),
+                "f16_pair fused a read");
+        require(ds4_metal_tensor_read(tob, 0, gotb, OUT * sizeof(float)),
+                "f16_pair fused b read");
+        for (uint32_t r = 0; r < OUT; r++) {
+            require(nearf(gota[r], refa[r], 1e-2f), "f16_pair fused a value");
+            require(nearf(gotb[r], refb[r], 1e-2f), "f16_pair fused b value");
+        }
+        ds4_metal_tensor_free(tob);
+        ds4_metal_tensor_free(toa);
+        ds4_metal_tensor_free(txw);
+        free(blob);
+        free(gotb); free(gota); free(refb); free(refa);
+        free(xv); free(Wb); free(Wa);
+    }
+
+    /* Same fused path but out_dim=20 (multiple of 4, not 8) -> NROWS=4. */
+    STEP("matmul_f16_pair fused decode (in=256, out=20, n_tok=1)");
+    {
+        const uint32_t IN = 256, OUT = 20;
+        uint16_t *Wa = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        uint16_t *Wb = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        float    *xv  = (float    *)malloc((size_t)IN * sizeof(float));
+        float    *refa = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *refb = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *gota = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *gotb = (float    *)malloc((size_t)OUT * sizeof(float));
+        require(Wa && Wb && xv && refa && refb && gota && gotb,
+                "f16_pair fused 4x alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 13) - 6) * 0.125f;
+        for (uint32_t r = 0; r < OUT; r++) {
+            for (uint32_t i = 0; i < IN; i++) {
+                Wa[r * IN + i] = f32_to_f16((float)((int)((r * 3 + i) % 19) - 9) * 0.0625f);
+                Wb[r * IN + i] = f32_to_f16((float)((int)((r * 7 + i) % 17) - 8) * 0.0625f);
+            }
+        }
+        for (uint32_t r = 0; r < OUT; r++) {
+            float sa = 0.0f, sb = 0.0f;
+            for (uint32_t i = 0; i < IN; i++) {
+                sa += f16_to_f32(Wa[r * IN + i]) * xv[i];
+                sb += f16_to_f32(Wb[r * IN + i]) * xv[i];
+            }
+            refa[r] = sa;
+            refb[r] = sb;
+        }
+        const size_t wsize = (size_t)IN * OUT * sizeof(uint16_t);
+        uint8_t *blob = (uint8_t *)malloc(2 * wsize);
+        require(blob != NULL, "f16_pair fused 4x blob alloc");
+        memcpy(blob,         Wa, wsize);
+        memcpy(blob + wsize, Wb, wsize);
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *toa = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        ds4_metal_tensor *tob = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        require(txw && toa && tob, "f16_pair fused 4x tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)),
+                "f16_pair fused 4x x write");
+        require(ds4_metal_matmul_f16_pair_tensor(toa, tob, blob, 2 * wsize,
+                                                  0, wsize, IN, OUT, txw, 1),
+                "matmul_f16_pair fused 4x");
+        require(ds4_metal_tensor_read(toa, 0, gota, OUT * sizeof(float)),
+                "f16_pair fused 4x a read");
+        require(ds4_metal_tensor_read(tob, 0, gotb, OUT * sizeof(float)),
+                "f16_pair fused 4x b read");
+        for (uint32_t r = 0; r < OUT; r++) {
+            require(nearf(gota[r], refa[r], 1e-2f), "f16_pair fused 4x a value");
+            require(nearf(gotb[r], refb[r], 1e-2f), "f16_pair fused 4x b value");
+        }
+        ds4_metal_tensor_free(tob);
+        ds4_metal_tensor_free(toa);
+        ds4_metal_tensor_free(txw);
+        free(blob);
+        free(gotb); free(gota); free(refb); free(refa);
+        free(xv); free(Wb); free(Wa);
+    }
+
     STEP("kv_fp8_store_raw (FP8 nope + identity rot, ring offset)");
     {
         const uint32_t head_dim = 16;

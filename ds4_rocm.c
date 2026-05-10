@@ -974,6 +974,60 @@ __global__ static void rocm_matmul_f16_wave_lds_##NROWS##_v8_kernel( \
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(8)
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(4)
 
+/* Fused decode matmul for the matmul_f16_pair call sites: a single block
+ * computes NROWS rows of out_a and NROWS rows of out_b at the same row
+ * tile, both projecting the same x.  Block holds 2*NROWS waves: the first
+ * NROWS waves stream weight rows from w_a -> out_a, the second NROWS from
+ * w_b -> out_b.  All waves share a single cooperative LDS-x load, so the
+ * second matmul's x reads come from LDS instead of repeating the global
+ * traffic the unfused dispatch would issue. */
+#define ROCM_DEFINE_MATMUL_F16_PAIR_WAVE_LDS_V8(NROWS) \
+__global__ static void rocm_matmul_f16_pair_wave_lds_##NROWS##_v8_kernel( \
+        float *out_a, float *out_b, \
+        const uint16_t *w_a, const uint16_t *w_b, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    extern __shared__ float x_lds[]; \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t wave_id = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = x[i]; \
+    __syncthreads(); \
+    const int             is_b    = wave_id >= (uint32_t)(NROWS); \
+    const uint32_t        row_idx = is_b ? wave_id - (uint32_t)(NROWS) : wave_id; \
+    const uint32_t        row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    const uint16_t *w   = is_b ? w_b   : w_a; \
+    float          *out = is_b ? out_b : out_a; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const uint32_t step = 256u; \
+    const uint32_t in_dim_pack = (in_dim / step) * step; \
+    float sum = 0.0f; \
+    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
+        const uint32_t i = base + lane * 8u; \
+        const uint4 hv = *(const uint4 *)(const void *)(wr + i); \
+        const uint32_t h0 = hv.x; \
+        const uint32_t h1 = hv.y; \
+        const uint32_t h2 = hv.z; \
+        const uint32_t h3 = hv.w; \
+        sum += rocm_f16_to_f32((uint16_t)(h0        & 0xffffu)) * x_lds[i + 0u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h0 >> 16) & 0xffffu)) * x_lds[i + 1u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h1        & 0xffffu)) * x_lds[i + 2u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h1 >> 16) & 0xffffu)) * x_lds[i + 3u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h2        & 0xffffu)) * x_lds[i + 4u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h2 >> 16) & 0xffffu)) * x_lds[i + 5u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h3        & 0xffffu)) * x_lds[i + 6u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h3 >> 16) & 0xffffu)) * x_lds[i + 7u]; \
+    } \
+    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_PAIR_WAVE_LDS_V8(8)
+ROCM_DEFINE_MATMUL_F16_PAIR_WAVE_LDS_V8(4)
+
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,
                                                               float *split,
@@ -2196,6 +2250,73 @@ int ds4_metal_matmul_f16_pair_tensor(
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_pair_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_matmul_f16_pair_tensor");
+
+    /* Fast path: n_tok==1 decode, both projections from the same x.
+     * One fused kernel computes both — saves one launch and one global
+     * x re-read per pair call vs. two sequential matmul_f16_tensor calls. */
+    if (n_tok == 1u && out_a && out_b && model_map && x &&
+        in_dim > 0u && out_dim > 0u &&
+        (in_dim * sizeof(float)) <= 16384u &&
+        (in_dim % 256u) == 0u &&
+        (out_dim % 4u) == 0u) {
+        if (!g_initialized && !ds4_metal_init()) return 0;
+        const uint64_t x_bytes      = in_dim * sizeof(float);
+        const uint64_t out_bytes    = out_dim * sizeof(float);
+        const uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+        if (x->bytes < x_bytes || out_a->bytes < out_bytes || out_b->bytes < out_bytes ||
+            weight_a_offset > model_size || weight_bytes > model_size - weight_a_offset ||
+            weight_b_offset > model_size || weight_bytes > model_size - weight_b_offset) {
+            return 0;
+        }
+        void *wa_host = NULL, *wa_dev = NULL;
+        void *wb_host = NULL, *wb_dev = NULL;
+        const void *src_a = (const uint8_t *)model_map + weight_a_offset;
+        const void *src_b = (const uint8_t *)model_map + weight_b_offset;
+        if (!rocm_upload_mapped(src_a, weight_bytes, &wa_host, &wa_dev,
+                                "F16 pair weight A upload")) {
+            return 0;
+        }
+        if (!rocm_upload_mapped(src_b, weight_bytes, &wb_host, &wb_dev,
+                                "F16 pair weight B upload")) {
+            rocm_defer_free(wa_host);
+            return 0;
+        }
+        const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
+        const dim3 block(2u * nrows * 32u);
+        const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows));
+        const size_t lds_bytes = (size_t)in_dim * sizeof(float);
+        int ok;
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_matmul_f16_pair_wave_lds_8_v8_kernel,
+                               grid, block, lds_bytes, g_stream,
+                               (float *)tensor_u8(out_a),
+                               (float *)tensor_u8(out_b),
+                               (const uint16_t *)wa_dev,
+                               (const uint16_t *)wb_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim);
+            ok = rocm_launch_done("F16 matmul pair wave_lds_8_v8 launch",
+                                  "F16 matmul pair wave_lds_8_v8 completion");
+        } else {
+            hipLaunchKernelGGL(rocm_matmul_f16_pair_wave_lds_4_v8_kernel,
+                               grid, block, lds_bytes, g_stream,
+                               (float *)tensor_u8(out_a),
+                               (float *)tensor_u8(out_b),
+                               (const uint16_t *)wa_dev,
+                               (const uint16_t *)wb_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim);
+            ok = rocm_launch_done("F16 matmul pair wave_lds_4_v8 launch",
+                                  "F16 matmul pair wave_lds_4_v8 completion");
+        }
+        rocm_defer_free(wa_host);
+        rocm_defer_free(wb_host);
+        return ok;
+    }
+
+    /* Fallback: prefill (n_tok>1) and shapes outside the fused dispatch
+     * envelope go through two independent matmul_f16 calls (which already
+     * pick the appropriate tile or wave_lds kernel). */
     return ds4_metal_matmul_f16_tensor(out_a, model_map, model_size,
                                        weight_a_offset, in_dim, out_dim, x, n_tok) &&
            ds4_metal_matmul_f16_tensor(out_b, model_map, model_size,

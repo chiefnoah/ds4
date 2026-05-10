@@ -3143,6 +3143,43 @@ int main(void) {
         ds4_metal_tensor_free(tkv2);
     }
 
+    /* SWA cache is a ring; chunked-prefill chunks beyond the first have
+     * pos0 + n_tokens > raw_cap, which must wrap modulo raw_cap. The
+     * single-chunk test above only covered the non-wrapping case; this
+     * one drives a span that wraps and validates each physical row. */
+    STEP("store_raw_kv_batch (wraps around the SWA ring)");
+    {
+        const uint32_t head_dim = 4;
+        const uint32_t raw_cap  = 6;
+        const uint32_t pos0     = 4;     /* starts near the end of the ring */
+        const uint32_t n_tokens = 5;     /* writes physical rows 4,5,0,1,2 */
+        float kv_in[5 * 4];
+        for (uint32_t i = 0; i < n_tokens * head_dim; i++) kv_in[i] = 0.25f * (float)(i + 3) - 0.7f;
+        ds4_metal_tensor *tkv3  = ds4_metal_tensor_alloc(sizeof(kv_in));
+        ds4_metal_tensor *traw3 = ds4_metal_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
+        require(tkv3 && traw3, "store_raw_kv_batch wrap alloc");
+        float zeros[6 * 4] = {0};
+        require(ds4_metal_tensor_write(traw3, 0, zeros, sizeof(zeros)), "store_raw_kv_batch wrap zero");
+        require(ds4_metal_tensor_write(tkv3, 0, kv_in, sizeof(kv_in)), "store_raw_kv_batch wrap write");
+        require(ds4_metal_store_raw_kv_batch_tensor(traw3, tkv3, raw_cap, pos0, n_tokens, head_dim),
+                "store_raw_kv_batch wrap");
+        float got[6 * 4];
+        read_tensor(traw3, got, raw_cap * head_dim);
+        /* Build the expected ring image: row (pos0+t) % raw_cap holds kv_in[t]. */
+        float expect[6 * 4] = {0};
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t r = (pos0 + t) % raw_cap;
+            for (uint32_t i = 0; i < head_dim; i++) {
+                expect[r * head_dim + i] = f16_to_f32(f32_to_f16(kv_in[t * head_dim + i]));
+            }
+        }
+        for (uint32_t i = 0; i < raw_cap * head_dim; i++) {
+            require(nearf(got[i], expect[i], 1e-6f), "store_raw_kv_batch wrap value");
+        }
+        ds4_metal_tensor_free(traw3);
+        ds4_metal_tensor_free(tkv3);
+    }
+
     STEP("router_select_tensor (defaults n_expert=256, n_used=6, no bias, no hash)");
     {
         const uint32_t n_expert = 256;

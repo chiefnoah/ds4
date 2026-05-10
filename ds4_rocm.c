@@ -3282,11 +3282,16 @@ __global__ static void rocm_store_raw_kv_batch_kernel(float *raw_base,
                                                       const float *kv,
                                                       uint32_t head_dim,
                                                       uint32_t pos0,
-                                                      uint32_t n_tokens) {
+                                                      uint32_t n_tokens,
+                                                      uint32_t raw_cap) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (i >= head_dim || t >= n_tokens) return;
-    const uint64_t row = (uint64_t)(pos0 + t);
+    /* SWA cache is a ring of raw_cap rows. Chunked prefill in non-zero
+     * chunks passes absolute positions (e.g., pos0=2048, n_tokens=987 with
+     * raw_cap=2304); wrap so writes overflow back to the start of the ring
+     * the same way reads do (see metal_graph_raw_start_for_span in ds4.c). */
+    const uint64_t row = (uint64_t)((pos0 + t) % raw_cap);
     raw_base[row * head_dim + i] = (float)((__half)kv[(uint64_t)t * head_dim + i]);
 }
 
@@ -3320,16 +3325,18 @@ int ds4_metal_store_raw_kv_batch_tensor(
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_store_raw_kv_batch_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_store_raw_kv_batch_tensor");
     if (!g_initialized && !ds4_metal_init()) return 0;
-    if (!raw_cache || !kv || head_dim == 0 || n_tokens == 0) return 0;
-    if ((uint64_t)pos0 + n_tokens > raw_cap) return 0;
+    if (!raw_cache || !kv || head_dim == 0 || n_tokens == 0 || raw_cap == 0) return 0;
+    /* The kernel wraps writes modulo raw_cap; cap n_tokens to raw_cap so a
+     * single launch can't overwrite its own earlier writes. */
+    if (n_tokens > raw_cap) return 0;
     if (kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
-    if (raw_cache->bytes < ((uint64_t)pos0 + n_tokens) * head_dim * sizeof(float)) return 0;
+    if (raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) return 0;
     const dim3 block(256);
     const dim3 grid((head_dim + block.x - 1u) / block.x, n_tokens);
     hipLaunchKernelGGL(rocm_store_raw_kv_batch_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(raw_cache),
                        (const float *)tensor_u8_const(kv),
-                       head_dim, pos0, n_tokens);
+                       head_dim, pos0, n_tokens, raw_cap);
     return rocm_launch_done("store raw kv batch launch", "store raw kv batch completion");
 }
 

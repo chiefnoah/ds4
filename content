@@ -1,0 +1,50 @@
+perf(rocm): diagnose and close 75 GiB/s → 256 GB/s bandwidth gap
+
+Status: not started
+
+Goal: Profile and improve effective memory bandwidth utilization from the current ~75 GiB/s (~31% of 256 GB/s theoretical) toward the ~200+ GiB/s range.
+
+Root causes identified (in priority order):
+
+1. Dequantization compute interlocks (IQ2XXS requires ~60-80 instructions per 32-byte weight read)
+   - The ALU is the bottleneck during decode, not the memory bus
+   - Investigate: can we pre-dequantize expert weight tiles into LDS? Can we use WMMA for decode IQ2XXS?
+   - Files: ds4_rocm.c:6576-6603 (IQ2XXS dequant), 6531-6641 (wave_n8 kernel)
+
+2. Scalar loads wasting bus width
+   - Only F16 wave_lds_v8 uses uint4; Q8_0 and IQ2XXS use scalar loads
+   - Q8_0 vectorization: see sibling task
+   - IQ2XXS vectorization: the 66-byte block format (2B scale + 64B qs) could use uint4 for qs
+   - Files: ds4_rocm.c:577-580 (Q8_0 scalar), 6596-6601 (IQ2XXS scalar), 958 (F16 uint4 reference)
+
+3. Multi-wave x re-reads
+   - In wave-per-row kernels each wave independently reads x from global
+   - Mitigated by L1/L2 caching after first wave, but first wave is cold miss
+   - Could add __builtin_prefetch hints or explicit LDS staging for first wave
+   - Files: ds4_rocm.c:571, 2431-2435
+
+4. Ring buffer modulo in KV access breaking prefetch
+   - (raw_start + r) % raw_cap introduces non-unit-stride access
+   - Could unroll raw-cap region into a double-buffered contiguous view
+   - Files: ds4_rocm.c:5333
+
+5. Expert access scatter in MoE
+   - 6 experts at ~2.06 MB stride — L2 cache cannot hold all active expert data
+   - EM path would fix this but is currently slower at n_tokens=21
+   - Files: ds4_rocm.c:6399-6408
+
+Approach:
+- Start with measurement: use rocprof to capture L1/L2 hit rates, VALU busy %, and memory bus utilization
+- Profile per-kernel: which kernels are most bound by which bottleneck?
+- Tackle item 2 first (scalar loads) since it has clear implementation path
+- Items 3-5 are architectural and may need kernel redesign
+
+Validation:
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test — must end with OK
+3. time ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+4. DS4_ROCM_TIME=1 for per-kernel bandwidth breakdown
+5. rocprof --stats for cache hit rates and VALU utilization
+
+Hardware: gfx1151, wave32, LPDDR5X-8000 256-bit ≈ 256 GB/s peak
+Related: tsk-? (Q8_0 vectorization task)

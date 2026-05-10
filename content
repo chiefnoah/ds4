@@ -1,0 +1,41 @@
+Online-softmax fusion for attention decode kernel
+
+## Status
+Proposed
+
+## Goal
+Fuse score computation + weighted sum in rocm_attn_decode_heads_kernel into a single KV cache read using online safe-softmax, eliminating the second KV read that currently doubles bandwidth.
+
+## Context
+File: ds4_rocm.c:5305, `rocm_attn_decode_heads_kernel`
+
+Current kernel reads KV cache twice per decode step per head:
+- Step 1 (L5332-5345): dot product q-kv for each KV slot -> scores
+- Step 5 (L5383-5393): weighted sum re-reads all KV slots x head_dim
+
+For ~8K+ KV slots x 128 head_dim this doubles ~all attention bandwidth.
+
+Online safe-softmax algorithm sketch:
+- Single pass over KV: compute score, track running max + exp-difference-weighted sum
+- Store partial accumulators per dimension in registers
+- Finalize after the loop
+
+Hardware: gfx1151, 40 CUs, wave32, LDS <=16 KiB, head_dim=128, n_head=32
+
+## Affected functions
+- rocm_attn_decode_heads_kernel (kernel)
+- ds4_metal_attention_decode_heads_tensor (wrapper, L5396)
+- Possibly the batch variants at L5971, L6000, L6036
+
+## Validation
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test - must end with OK
+3. End-to-end decode: time ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+4. Compare token throughput before/after with DS4_ROCM_TIME=1
+5. Numerics must match: raw score diff < 1e-5 fudge from safe-softmax reordering
+
+## Next steps
+1. Prototype fused kernel variant alongside existing one
+2. Gate behind env var (DS4_ROCM_ATTN_FUSED=1)
+3. Benchmark: same q/kv, compare output diffs and throughput
+4. If quality passes, replace old kernel

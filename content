@@ -1,0 +1,29 @@
+perf(rocm): vectorize Q8_0 weight loads (uint2/uint4)
+
+Status: not started
+
+Goal: Replace scalar int8_t loads in Q8_0 decode matmul kernels with vectorized loads (uint2 or uint4) to improve memory bus utilization beyond the current ~31% of 256 GB/s theoretical peak.
+
+Context:
+- Only the F16 wave_lds_v8 kernels use uint4 vectorized loads (ds4_rocm.c:958, 1012)
+- Q8_0 kernels load scalar int8_t one byte at a time (ds4_rocm.c:577-580, 620-631)
+- On a 256-bit bus, scalar loads use only 12.5% of bus width
+- Q8_0 block format: 2-byte fp16 scale + 32 int8 values = 34 bytes per block (unaligned)
+- The 34-byte block is not naturally aligned for uint4 (16 bytes), but two blocks = 68 bytes — uint2 (8 bytes) per 8 int8 values is the natural unit
+
+Approach:
+- Load Q8_0 weight blocks as uint2 (8 bytes = 8×int8 per load, 4 loads per 32-element block)
+- Load the fp16 scale separately (2 bytes, scalar half load)
+- May need __builtin_assume_aligned hints on weight pointers
+- Target kernels: rocm_matmul_q8_0_wave_8_kernel and rocm_matmul_q8_0_wave_4_kernel (lines 559-585)
+- Also consider the wmma and tile kernel variants
+
+Validation:
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test — must end with OK
+3. time ./ds4 --backend rocm -p "Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip." -n 200 --temp 0 --seed 42 — output must stay coherent
+4. DS4_ROCM_TIME=1 to compare matmul_q8_0 bandwidth before/after
+5. Baseline bandwidth: capture DS4_ROCM_TIME=1 histogram with current code for matmul_q8_0_wave kernel rows
+
+Related: tsk-? (bandwidth gap analysis task)
+Hardware: gfx1151, wave32, LDS ≤ 16 KiB/block

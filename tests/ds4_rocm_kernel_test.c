@@ -557,6 +557,87 @@ int main(void) {
         }
     }
 
+    /* Decode-shape F16 matmul: in_dim=256 (multiple of 32*8), out_dim=256
+     * (multiple of 8). Hits the new wave_8_n8 dispatch path. The shape was
+     * picked small enough to verify on CPU but large enough to exercise the
+     * unrolled inner loop and wave32 reduction. */
+    STEP("matmul_f16 wave_8_n8 decode shape (in=256, out=256, n_tok=1)");
+    {
+        const uint32_t IN = 256, OUT = 256;
+        uint16_t *wmf = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        float    *xv  = (float    *)malloc((size_t)IN * sizeof(float));
+        float    *ref = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *got = (float    *)malloc((size_t)OUT * sizeof(float));
+        require(wmf && xv && ref && got, "wave_8_n8 alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 17) - 8) * 0.125f;
+        for (uint32_t r = 0; r < OUT; r++) {
+            for (uint32_t i = 0; i < IN; i++) {
+                wmf[r * IN + i] = f32_to_f16((float)((int)((r + i) % 23) - 11) * 0.0625f);
+            }
+        }
+        for (uint32_t r = 0; r < OUT; r++) {
+            float s = 0.0f;
+            for (uint32_t i = 0; i < IN; i++) {
+                s += f16_to_f32(wmf[r * IN + i]) * xv[i];
+            }
+            ref[r] = s;
+        }
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *tow = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        require(txw && tow, "wave_8_n8 tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)), "wave_8_n8 x write");
+        require(ds4_metal_matmul_f16_tensor(tow, wmf,
+                    (uint64_t)IN * OUT * sizeof(uint16_t), 0,
+                    IN, OUT, txw, 1), "matmul_f16 wave_8_n8");
+        require(ds4_metal_tensor_read(tow, 0, got, OUT * sizeof(float)),
+                "wave_8_n8 read");
+        for (uint32_t r = 0; r < OUT; r++) {
+            require(nearf(got[r], ref[r], 1e-2f), "wave_8_n8 value");
+        }
+        ds4_metal_tensor_free(tow);
+        ds4_metal_tensor_free(txw);
+        free(got); free(ref); free(xv); free(wmf);
+    }
+
+    /* Same for wave_4_n8 path: out_dim divisible by 4 but not by 8. */
+    STEP("matmul_f16 wave_4_n8 decode shape (in=256, out=20, n_tok=1)");
+    {
+        const uint32_t IN = 256, OUT = 20;
+        uint16_t *wmf = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        float    *xv  = (float    *)malloc((size_t)IN * sizeof(float));
+        float    *ref = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *got = (float    *)malloc((size_t)OUT * sizeof(float));
+        require(wmf && xv && ref && got, "wave_4_n8 alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 13) - 6) * 0.125f;
+        for (uint32_t r = 0; r < OUT; r++) {
+            for (uint32_t i = 0; i < IN; i++) {
+                wmf[r * IN + i] = f32_to_f16((float)((int)((r * 3 + i) % 19) - 9) * 0.0625f);
+            }
+        }
+        for (uint32_t r = 0; r < OUT; r++) {
+            float s = 0.0f;
+            for (uint32_t i = 0; i < IN; i++) {
+                s += f16_to_f32(wmf[r * IN + i]) * xv[i];
+            }
+            ref[r] = s;
+        }
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *tow = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        require(txw && tow, "wave_4_n8 tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)), "wave_4_n8 x write");
+        require(ds4_metal_matmul_f16_tensor(tow, wmf,
+                    (uint64_t)IN * OUT * sizeof(uint16_t), 0,
+                    IN, OUT, txw, 1), "matmul_f16 wave_4_n8");
+        require(ds4_metal_tensor_read(tow, 0, got, OUT * sizeof(float)),
+                "wave_4_n8 read");
+        for (uint32_t r = 0; r < OUT; r++) {
+            require(nearf(got[r], ref[r], 1e-2f), "wave_4_n8 value");
+        }
+        ds4_metal_tensor_free(tow);
+        ds4_metal_tensor_free(txw);
+        free(got); free(ref); free(xv); free(wmf);
+    }
+
     STEP("matmul f32");
     float wf32[2 * 4] = {
         1, 0, 2, 0,

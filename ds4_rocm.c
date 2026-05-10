@@ -1006,6 +1006,82 @@ __global__ static void rocm_matmul_f16_wave_##NROWS##_kernel( \
 ROCM_DEFINE_MATMUL_F16_WAVE(8)
 ROCM_DEFINE_MATMUL_F16_WAVE(4)
 
+/* Wave-per-row F16 matvec with N-element-per-lane inner unroll.  Each
+ * iteration the wave processes 32*N consecutive elements: lane l handles
+ * indices base + k*32 + l for k=0..N-1.  Adjacent lanes still hit adjacent
+ * bytes (coalesced 32x2-byte F16 reads + 32x4-byte float reads), but the
+ * compiler can pipeline N FMAs to hide memory latency and amortizes the
+ * loop overhead by N.  The 1-elem WAVE variants above regressed because
+ * loop-control ate the budget; this is the fix.  Tail handles in_dim
+ * remainder with the original 1-elem stride. */
+#define ROCM_DEFINE_MATMUL_F16_WAVE_N(NROWS, N) \
+__global__ static void rocm_matmul_f16_wave_##NROWS##_n##N##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const uint32_t step = 32u * (uint32_t)(N); \
+    const uint32_t in_dim_pack = (in_dim / step) * step; \
+    float sum = 0.0f; \
+    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
+        _Pragma("unroll") \
+        for (uint32_t k = 0; k < (uint32_t)(N); k++) { \
+            const uint32_t i = base + k * 32u + lane; \
+            sum += rocm_f16_to_f32(wr[i]) * x[i]; \
+        } \
+    } \
+    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_WAVE_N(8, 8)
+ROCM_DEFINE_MATMUL_F16_WAVE_N(4, 8)
+
+/* Same as WAVE_N but cooperatively loads x into LDS once per block, so the
+ * NROWS waves all share a single in_dim*sizeof(float) read. Weights are
+ * still streamed from global with N-element unroll. Caller must guarantee
+ * in_dim*sizeof(float) <= LDS budget (we use 16 KiB ceiling -> in_dim<=4096
+ * for fp32 x), and in_dim a multiple of 32*N for the unrolled inner loop. */
+#define ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(NROWS, N) \
+__global__ static void rocm_matmul_f16_wave_lds_##NROWS##_n##N##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    extern __shared__ float x_lds[]; \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) x_lds[i] = x[i]; \
+    __syncthreads(); \
+    const uint32_t row = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const uint32_t step = 32u * (uint32_t)(N); \
+    const uint32_t in_dim_pack = (in_dim / step) * step; \
+    float sum = 0.0f; \
+    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
+        _Pragma("unroll") \
+        for (uint32_t k = 0; k < (uint32_t)(N); k++) { \
+            const uint32_t i = base + k * 32u + lane; \
+            sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
+        } \
+    } \
+    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x_lds[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(8, 8)
+ROCM_DEFINE_MATMUL_F16_WAVE_LDS_N(4, 8)
+
 /* K-split F16 matvec for shapes where out_dim is too small to fill 40 CUs
  * with one workgroup per row (e.g. 16384x24, 16384x4 — the indexer/compressor
  * paths). One workgroup handles one row across a K-tile of size SPLIT_K
@@ -2182,28 +2258,65 @@ int ds4_metal_matmul_f16_tensor(
         }
         ok = rocm_launch_done("F16 matmul tile launch", "F16 matmul tile completion");
     } else {
-        /* n_tok==1 decode path. The wave-per-row F16 attempt (2026-05-09) was
-         * a regression because each lane only processed 1 element/iteration —
-         * loop overhead dominated. The LDS kernel below uses 256 threads/row
-         * so each thread only does in_dim/256 iterations, amortizing overhead.
-         * Returning to it; needs replacement with a wave-per-row+unroll-by-N
-         * kernel that loads N consecutive F16 elements per lane per iteration
-         * to match the Q8_0 arithmetic intensity. See tsk-33 follow-up. */
-        unsigned threads = 256;
-        while (threads > 1 && threads / 2 >= in_dim) threads >>= 1;
-        const dim3 block(threads);
-        const dim3 grid((unsigned)out_dim, 1u);
-        hipLaunchKernelGGL(rocm_matmul_f16_kernel,
-                           grid,
-                           block,
-                           threads * sizeof(float),
-                           g_stream,
-                           (float *)tensor_u8(out),
-                           (const uint16_t *)w_dev,
-                           (const float *)tensor_u8_const(x),
-                           in_dim,
-                           out_dim);
-        ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
+        /* n_tok==1 decode path.
+         *
+         * For shapes where in_dim is a multiple of 256 (= 32 lanes * 8 unroll)
+         * and out_dim is a multiple of NROWS, use the wave-per-row + N=8
+         * unroll kernel. Each wave produces one row, and within each lane the
+         * inner loop is unrolled 8x so the compiler can pipeline FMAs and
+         * amortize loop overhead. NROWS=8 packs 8 rows per block (256
+         * threads); NROWS=4 (128 threads) for smaller out_dims that need
+         * more blocks to fill 40 CUs.
+         *
+         * The earlier 1-elem-per-lane WAVE attempt regressed because loop
+         * control dominated; the unrolled variant fixes that. */
+        const int wave_n_eligible    = (in_dim % 256u) == 0u;
+        const int lds_x_fits         = (in_dim * sizeof(float)) <= 16384u;
+        if (wave_n_eligible && lds_x_fits && (out_dim % 8u) == 0u && out_dim >= 256u) {
+            const dim3 block(8u * 32u);
+            const dim3 grid((unsigned)((out_dim + 7u) / 8u));
+            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_8_n8_kernel,
+                               grid, block, in_dim * sizeof(float), g_stream,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim);
+            ok = rocm_launch_done("F16 matmul wave_lds_8_n8 launch",
+                                  "F16 matmul wave_lds_8_n8 completion");
+        } else if (wave_n_eligible && lds_x_fits && (out_dim % 4u) == 0u) {
+            const dim3 block(4u * 32u);
+            const dim3 grid((unsigned)((out_dim + 3u) / 4u));
+            hipLaunchKernelGGL(rocm_matmul_f16_wave_lds_4_n8_kernel,
+                               grid, block, in_dim * sizeof(float), g_stream,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim);
+            ok = rocm_launch_done("F16 matmul wave_lds_4_n8 launch",
+                                  "F16 matmul wave_lds_4_n8 completion");
+        } else {
+            /* in_dim too large for LDS-x (>4096 floats) — measured: the
+             * non-LDS wave_n8 variant regresses for in_dim=16384 because
+             * each of NROWS waves re-reads the full x from global. The LDS
+             * reduction kernel below has 256 threads/row with finer-grained
+             * scheduling and wins. K-split is the right structural answer
+             * for the 16384*small_out_dim shapes; see tsk follow-up. */
+            unsigned threads = 256;
+            while (threads > 1 && threads / 2 >= in_dim) threads >>= 1;
+            const dim3 block(threads);
+            const dim3 grid((unsigned)out_dim, 1u);
+            hipLaunchKernelGGL(rocm_matmul_f16_kernel,
+                               grid,
+                               block,
+                               threads * sizeof(float),
+                               g_stream,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               in_dim,
+                               out_dim);
+            ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
+        }
     }
     rocm_defer_free(w_host);
     if (audit) {

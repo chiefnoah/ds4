@@ -1,0 +1,26 @@
+Vulkan Phase 5: performance tuning + perf parity vs ROCm
+
+PARENT: tsk-44.
+STATUS: planned, not started. Depends on Phase 4.
+
+GOAL
+Land Vulkan-specific perf wins so end-to-end t/s meets or beats the ROCm baseline. Stretch target: +15% generation t/s.
+
+LEVERS
+1. Pre-recorded per-token command buffers. The decode path repeats the same kernel sequence every token; record once per (batch shape, layer count) tuple, replay with vkQueueSubmit. Should erase most of the per-launch overhead that ROCM_TIME_SCOPE measures (see feedback_real_gpu_time, feedback_blocking_sync_fix). Note that HIP graph capture only bought 0.2% on the ROCm side (feedback_hip_graph_low_value) — Vulkan command buffers may do much better because there is no equivalent of HIP's busy-spin sync to fight.
+2. Push constants vs uniform buffers — push constants for shape; UBOs only when params exceed the 128B limit. Avoid descriptor set thrash by making sets long-lived.
+3. Subgroup tuning — VK_EXT_subgroup_size_control to lock subgroupSize=32 on every pipeline; verify with VkPhysicalDeviceSubgroupSizeControlProperties.
+4. UMA zero-copy — for the big GGUF mapping, allocate VkBuffer via VK_EXT_external_memory_host on the existing mmap. Should reproduce the production-decode 75 GiB/s effective rate the ROCm path hits without a second device-resident copy (CLAUDE.md notes hipHostRegister fails on the full file).
+5. Kernel fusion opportunities the ROCm side could not do — e.g., RMS norm + matmul fused, RoPE fused into the attention QKV matmul. Per feedback_fusion_neutral_in_batched_mode, only fusions that actually cut serial GPU compute will move the wall time; pick targets accordingly.
+6. Workgroup size sweep — RDNA 3.5 prefers 256 threads/block (8 waves) for matmul; verify with the matmul microbench.
+
+METHODOLOGY
+- Build a tests/ds4_vulkan_matmul_bench.c mirroring ds4_rocm_matmul_bench (per CLAUDE.md feedback_microbench).
+- Capture baselines under DS4_VULKAN_TIME=1 + DS4_VULKAN_SYNC_EACH=1 for real GPU time.
+- Run canonical decode at every checkpoint; commit only at clean perf+correctness checkpoints.
+
+VALIDATION
+1. ./ds4_vulkan_kernel_test still ends with OK.
+2. Canonical 200-tok decode --backend vulkan produces coherent output.
+3. Reported t/s: prefill >= 39.9, generation >= 15.7 (parity). Stretch: generation >= 18.0 (+15%).
+4. Microbench shows DRAM bandwidth utilization within 5% of ~188 GiB/s ceiling on the routed-MoE matmul.

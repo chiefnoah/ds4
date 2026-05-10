@@ -1322,6 +1322,85 @@ int main(void) {
         ds4_metal_tensor_free(tq);
     }
 
+    STEP("attention decode_heads (head_dim=64, mixed + masked)");
+    {
+        /* Production-shaped head_dim (multiple of wave32) — the existing
+         * head_dim=4 STEPs above don't exercise the wave-aligned reduction
+         * path the kernel takes for real models. */
+        const uint32_t n_head = 3;
+        const uint32_t head_dim = 64;
+        const uint32_t raw_cap = 5;
+        const uint32_t n_raw = 4;
+        const uint32_t raw_start = 3;            /* wraps: rows 3,4,0,1 */
+        const uint32_t n_comp = 6;
+        float qv[3 * 64];
+        float raw[5 * 64];
+        float comp[6 * 64];
+        float mask[6] = { 0.0f, -1.0e30f, 0.0f, -1.0e30f, 0.0f, 0.0f };
+        float sinks[3] = { -0.25f, 0.5f, 1.5f };
+        for (uint32_t i = 0; i < 3 * 64; i++) qv[i]  = sinf((float)(i + 1) * 0.05f);
+        for (uint32_t i = 0; i < 5 * 64; i++) raw[i] = cosf((float)(i + 1) * 0.07f);
+        for (uint32_t i = 0; i < 6 * 64; i++) comp[i] = sinf((float)(i + 7) * 0.03f) * 0.5f;
+        ds4_metal_tensor *tq    = ds4_metal_tensor_alloc(sizeof(qv));
+        ds4_metal_tensor *traw  = ds4_metal_tensor_alloc(sizeof(raw));
+        ds4_metal_tensor *tcomp = ds4_metal_tensor_alloc(sizeof(comp));
+        ds4_metal_tensor *tmask = ds4_metal_tensor_alloc(sizeof(mask));
+        ds4_metal_tensor *tout  = ds4_metal_tensor_alloc(sizeof(qv));
+        require(tq && traw && tcomp && tmask && tout, "attn fused alloc");
+        require(ds4_metal_tensor_write(tq, 0, qv, sizeof(qv)),       "attn fused q write");
+        require(ds4_metal_tensor_write(traw, 0, raw, sizeof(raw)),    "attn fused raw write");
+        require(ds4_metal_tensor_write(tcomp, 0, comp, sizeof(comp)), "attn fused comp write");
+        require(ds4_metal_tensor_write(tmask, 0, mask, sizeof(mask)), "attn fused mask write");
+        require(ds4_metal_attention_decode_heads_tensor(tout, sinks, sizeof(sinks), 0,
+                                                        tq, traw, n_raw, raw_cap, raw_start,
+                                                        tcomp, n_comp, tmask, 1, n_head, head_dim),
+                "attn fused dispatch");
+        float got[3 * 64];
+        read_tensor(tout, got, 3 * 64);
+        const float kq = 1.0f / sqrtf((float)head_dim);
+        for (uint32_t h = 0; h < n_head; h++) {
+            float scores_raw[4], scores_comp[6];
+            float maxs = sinks[h];
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t actual = (raw_start + r) % raw_cap;
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) s += qv[h * head_dim + d] * raw[actual * head_dim + d];
+                scores_raw[r] = s * kq;
+                if (scores_raw[r] > maxs) maxs = scores_raw[r];
+            }
+            for (uint32_t r = 0; r < n_comp; r++) {
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) s += qv[h * head_dim + d] * comp[r * head_dim + d];
+                scores_comp[r] = s * kq + mask[r];
+                if (scores_comp[r] > maxs) maxs = scores_comp[r];
+            }
+            float denom = expf(sinks[h] - maxs);
+            float out[64] = {0};
+            for (uint32_t r = 0; r < n_raw; r++) {
+                float w = expf(scores_raw[r] - maxs);
+                denom += w;
+                const uint32_t actual = (raw_start + r) % raw_cap;
+                for (uint32_t d = 0; d < head_dim; d++) out[d] += w * raw[actual * head_dim + d];
+            }
+            for (uint32_t r = 0; r < n_comp; r++) {
+                /* Mask -inf collapses to weight 0; matches what the kernel does. */
+                if (scores_comp[r] <= -5.0e29f) continue;
+                float w = expf(scores_comp[r] - maxs);
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) out[d] += w * comp[r * head_dim + d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) {
+                require(nearf(got[h * head_dim + d], out[d] / denom, 1e-4f),
+                        "attn fused value");
+            }
+        }
+        ds4_metal_tensor_free(tout);
+        ds4_metal_tensor_free(tmask);
+        ds4_metal_tensor_free(tcomp);
+        ds4_metal_tensor_free(traw);
+        ds4_metal_tensor_free(tq);
+    }
+
     STEP("attention prefill_raw_heads sliding window");
     {
         const uint32_t n_tokens = 4;

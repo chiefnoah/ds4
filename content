@@ -1,0 +1,34 @@
+ROCm decode: matmul_f16 audit results — 10 ms/tok, ~6 ms recoverable
+
+Status: AUDITED 2026-05-09 (was tsk-37 audit). Real per-shape GPU+sync time captured via DS4_ROCM_SYNC_EACH=1 DS4_ROCM_AUDIT_F16=1 ./ds4 -n 50.
+
+Per-shape breakdown (decode only, n_tok=1):
+  shape       calls/tok   us/call   GiB/s_eff   ms/tok   % of 190 GiB/s ceiling
+  4096x1024       41         82       95          3.36     50%
+  4096x512        39         48       82          1.87     43%
+  4096x256        83         32       62          2.62     33%
+  16384x24        84         27       29          2.29     15%
+  16384x4          1         26        7          0.03     4%
+
+Total F16 decode GPU time: ~10.2 ms/tok. Histogram had this at ~17 ms/tok (inclusive nesting inflated it ~70%).
+
+Recoverable headroom toward 190 GiB/s ceiling: ~6.4 ms/tok = ~10% of decode wall = +1.5 t/s if perfect, realistically +1 t/s.
+
+Concrete kernel targets (ranked by recoverable wall):
+
+1. 4096x1024 wave-per-row + N-element unroll. Currently single-block-per-row LDS kernel (256 threads/row, in_dim/256=16 elements per thread) at 95 GiB/s. Port the Q8_0 wave-per-row pattern (1 wavefront per row, __shfl_down reduction) but each lane processes N consecutive F16 elements per loop iteration to amortize loop overhead — the naive 1-elem-per-lane port already exists as dead code (rocm_matmul_f16_wave_4_kernel, rocm_matmul_f16_wave_8_kernel) but regressed at 1 elem/iter. Try N=8 or N=16.
+
+2. 16384x24 k-split. n_rows=24 means 24 wavefronts at <1/CU occupancy. Split in_dim=16384 into K chunks (e.g. K=8, chunk=2048), launch 24*K=192 wavefronts that atomicAdd partial sums to a zero'd output. ROCM_DEFINE_MATMUL_F16_KSPLIT(2048) already exists as dead code from prior session — wire it for this shape.
+
+3. 4096x256 wave-per-row + N-element unroll. 83 calls/tok x 32us = 2.62 ms/tok. Same approach as #1.
+
+4. 4096x512 same approach. 1.87 ms/tok at 82 GiB/s.
+
+All shapes are below ceiling but moderately so — these are not 'serial-on-1-thread' wins like router_select was. Expect +1.5 t/s as a soft ceiling for the bundle.
+
+Validation:
+- ./ds4_rocm_kernel_test — must add F16 matmul shape tests for the new dispatched paths if they go through different kernels.
+- Coherent decode at -n 200 --temp 0 --seed 42.
+- Decode rate vs current 15.35 t/s baseline.
+
+Also: matmul_f16_pair_tensor is just two matmul_f16 calls; could be fused (single weight read for both projections share the same x). Worth measuring after the per-call kernel improvements land — pair calls are at 4096x256 mostly, 60 calls/tok = 1.9 ms/tok in the bundle. Saving the 2x x-read is small (x is in cache for the second call) but saving the launch is part of what graph capture would have done. Probably 0.5 ms/tok upside if fused properly.

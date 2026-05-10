@@ -1,10 +1,40 @@
+# ds4.c — AMD Strix Halo / ROCm fork
+
+> **This is a fork of [antirez/ds4](https://github.com/antirez/ds4)** that
+> targets the **AMD Strix Halo APU (RDNA 3.5, gfx1151)** via a ROCm/HIP graph
+> backend. Upstream is Apple-Metal-first and runs on M-series Macs. This fork
+> keeps the Metal path intact but adds a working ROCm backend, the kernels
+> needed to run DeepSeek V4 Flash end-to-end on Strix Halo's UMA-shared 96 GiB
+> iGPU memory, and the integration tests around it. The original framing,
+> license, and acknowledgements are preserved verbatim from upstream — read
+> the upstream README for the project's broader vision and tradeoffs.
+>
+> **What this fork adds on top of upstream:**
+>
+> - Full ROCm backend (`make DS4_ROCM=1`, `--backend rocm`) covering load,
+>   prefill, decode, attention, MoE, compressor, indexer, and output paths.
+> - Strix Halo-specific kernels: wave32 + LDS-x F16 decode matmul, fused
+>   `matmul_f16_pair`, WMMA Q8_0 / I8 prefill matmuls, FlashAttention-style
+>   streaming softmax, expert-major MoE prefill, block-parallel indexer top-K,
+>   and an SWA ring-cache that wraps modulo `raw_cap` for chunked prefill.
+> - Build, profile, and benchmark scaffolding aimed at gfx1151 (`bench_rocm.sh`,
+>   `tests/ds4_rocm_kernel_test`, `tests/ds4_rocm_matmul_bench`,
+>   `tests/test_indexer_topk_parallel.sh`).
+> - Repo-level workflow rules in `CLAUDE.md` for the AI-assisted development
+>   pattern this fork uses (`tsk` task tracker, profiling envs, validation
+>   gates).
+>
+> CUDA support is still **not** on the roadmap.
+
+---
+
 # ds4.c
 
 `ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
 Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
-server API glue.
+server API glue. This fork mirrors the same path on AMD Strix Halo via ROCm.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -26,10 +56,17 @@ dense models, we can report that:
 That said, a few important things about this project:
 
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
-* This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+* This software is developed with **strong assistance from large language models** and with humans leading the ideas, testing, and debugging. Upstream credits GPT-5.5; the ROCm work in this fork is driven primarily by Claude (Opus 4.x). We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
+* Upstream is **Metal-only** (Apple Silicon). This fork adds a working
+  **ROCm backend** for AMD Strix Halo (gfx1151); CUDA support is still not on
+  the roadmap. The CPU path is only for correctness check, but **warning:
+  current macOS versions have a bug in the virtual memory implementation
+  that will crash the kernel** if you try to run the CPU code. Remember?
+  Software sucks. I was not possible to fix the CPU inference to avoid
+  crashing, since each time there is to restart the computer, which is not
+  funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -102,6 +139,13 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+| Strix Halo (gfx1151), 128 GB UMA | q2 | short | 39.92 t/s | 15.71 t/s |
+| Strix Halo (gfx1151), 128 GB UMA | q2 | 3035 tokens | 25.08 t/s | 10.73 t/s |
+
+The Strix Halo numbers are from the ROCm backend (`--backend rocm`) on a
+single 96 GiB iGPU carve-out. Decode is bandwidth-bound at ~75 GiB/s
+effective against a measured ~188 GiB/s HIP DRAM ceiling, so optimization
+work is ongoing — see commit history for the optimization pass.
 
 ## CLI
 
@@ -138,14 +182,16 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
+The server runs on the same backends as the CLI — `--backend metal` (default
+on macOS), `--backend rocm` (Strix Halo / ROCm builds), or `--backend cpu` for
+the reference path. It keeps one mutable graph/KV checkpoint in memory, so
+stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+serialized through one backend worker. The current server does not batch
+multiple independent requests together; concurrent requests wait their turn
+on the single live graph/session.
 
 Supported endpoints:
 
@@ -486,14 +532,30 @@ change in the future.
 On non-Metal builds, including typical Linux AMD hosts, the CLI defaults to the
 CPU reference path so the binaries remain usable for loading, inspection, and
 debugging. Build with `make DS4_ROCM=1` and run with `--backend rocm` or
-`--amd` to select the experimental ROCm graph backend. The HIP runtime/tensor
-layer is present; the HC, KV, indexer, router, output, compressor, sink
-attention, and routed-MoE (IQ2_XXS gate/up + Q2_K down with FP32 activations)
-kernel families are ported and validated against CPU oracles by
-`make ds4_rocm_kernel_test`. End-to-end inference is not yet wired up — the
-host-side MoE wrapper packs the selected experts per call, which is correct
-but uploads weight bytes redundantly; running a real decode at speed will need
-a one-shot model-map registration pass.
+`--amd` to select the ROCm graph backend.
+
+The ROCm backend on Strix Halo (gfx1151, ROCm 7.x) runs DeepSeek V4 Flash
+end-to-end: load, prefill (single-batch and chunked), decode, FlashAttention,
+MoE (IQ2_XXS gate/up + Q2_K down + Q8_0 shared), F16 projections, indexer
+score + parallel top-K, and the disk KV cache. The model is uploaded once
+into a device-resident copy at startup (UMA carve-out — Strix Halo allots
+~96 GiB of 128 GiB system DRAM to the iGPU), so per-call wrappers point at
+the existing device pointer rather than re-uploading. Correctness is gated
+by `make ds4_rocm_kernel_test` (40+ kernel-level oracle tests). End-to-end
+coherence is gated by the canonical 200-token prompt at seed 42 / temp 0.
+
+Useful environment knobs for the ROCm backend:
+
+- `DS4_ROCM_TIME=1` — print a per-wrapper timing histogram at exit.
+- `DS4_ROCM_TRACE=1` — log every wrapper entry (very verbose).
+- `DS4_ROCM_TOPK_TRACE=1` — log only parallel-topk dispatches.
+- `DS4_ROCM_SYNC_EACH=1` — sync after every kernel for true GPU-time
+  measurements (default mode batches launches and masks per-kernel cost).
+- `DS4_ROCM_AUDIT_F16=1` — emit per-call F16 matmul shape/timing lines.
+- `DS4_METAL_PREFILL_CHUNK=N` — override the default 2048-token chunk size.
+
+See `bench_rocm.sh` for a reproducible benchmarking harness and `CLAUDE.md`
+for the development workflow this fork follows.
 
 ## Test Vectors
 

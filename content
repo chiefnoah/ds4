@@ -1,0 +1,18 @@
+ROCm decode: try mlock/MADV_HUGEPAGE on 80 GiB model map to cut page-fault sys time
+
+Status: PROPOSED. Discovered via the HIP graph capture experiment (now-retired tsk-34): a 200-token decode run shows 13.7s system CPU and 244k minor page faults. At ~30us per minor fault that is ~7s of sys time, which roughly matches the launch-overhead-eliminated theoretical residual.
+
+Hypothesis: the sys time is driven by demand-faulting pages of the model map (or HIP runtime allocations) into the working set. If we mlock the model map up-front, or madvise it with MADV_HUGEPAGE, we should see minor faults drop sharply and sys CPU shrink with it. Whether wall improves depends on whether faulting was on the critical path or amortized into background sys time.
+
+Approach:
+1. Find where the model map is created in ds4.c / ds4_rocm.c (set_model_map / set_model_map_range path).
+2. Add mlock(map, size) call after map is fully populated. Likely needs  or CAP_IPC_LOCK; fall back to madvise(MADV_WILLNEED | MADV_HUGEPAGE) if mlock fails.
+3. Measure /usr/bin/time -v before/after: minor faults, sys, wall.
+4. If model map cannot be safely mlocked (size limits), try madvise alone.
+
+Validation:
+- ./ds4_rocm_kernel_test (40 tests) still OK.
+- Coherent decode on the standard prompt (-n 200 --temp 0 --seed 42).
+- Compare wall, sys CPU, decode t/s vs current baseline (15.35 t/s, sys 13.7s, wall 33.4s, 244k minor faults).
+
+Why this is promising: the sys-CPU number puts an upper bound on what *any* host-side optimization can recover. After page faults drop, the next dominant sys-CPU consumer becomes visible.

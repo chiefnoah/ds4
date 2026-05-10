@@ -930,6 +930,62 @@ __global__ static void rocm_matmul_f16_tile_##NROWS##x##NTOK##_kernel( \
 ROCM_DEFINE_MATMUL_F16_TILE(8, 8)
 ROCM_DEFINE_MATMUL_F16_TILE(4, 8)
 
+/* WMMA F16 prefill matmul.  Mirrors rocm_matmul_q8_0_wmma_kernel but the
+ * A operand is dense F16 weights — no Q8 unpacking, no per-block scale.
+ * One 32-lane wave produces a 16-row x 16-token output tile via
+ * v_wmma_f32_16x16x16_f16 (one WMMA per 16 K-elements).  Constraints:
+ * in_dim multiple of 16; out_dim and n_tok need not be (kernel masks at
+ * store).  Used when n_tok >= 16; smaller token counts stay on the
+ * scalar tile kernel where launching 8x fewer 16-token tiles wastes
+ * more lanes than the WMMA reuse saves. */
+__global__ static void rocm_matmul_f16_wmma_kernel(
+        float *out, const uint16_t *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t t0   = blockIdx.y * 16u;
+    if (r0 >= out_dim || t0 >= n_tok) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok     = t0 + col_in_tile;
+
+    /* Clamp source pointers so out-of-range lanes (partial output tiles)
+     * still read valid memory.  Their results are filtered at store. */
+    const uint32_t safe_row = (out_row < out_dim) ? out_row : (out_dim - 1u);
+    const uint32_t safe_tok = (tok     < n_tok)   ? tok     : (n_tok   - 1u);
+    const uint16_t *wr = w + (uint64_t)safe_row * in_dim;
+    const float    *xt = x + (uint64_t)safe_tok * in_dim;
+
+    rocm_v8f32 c = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (uint32_t k = 0; k < in_dim; k += 16u) {
+        rocm_v16f16 a;
+        const uint16_t *wb = wr + k;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a[kk] = *(const _Float16 *)(wb + kk);
+        }
+        rocm_v16f16 bv;
+        const float *xb = xt + k;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv[kk] = (_Float16)xb[kk];
+        }
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, c);
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t t = t0 + col_in_tile;
+        if (r < out_dim && t < n_tok) {
+            out[(uint64_t)t * out_dim + r] = c[i];
+        }
+    }
+}
+
 /* LDS-x wave-per-row F16 matmul for one-token decode (n_tok=1).  Each block
  * holds NROWS waves; one cooperative load fans x into LDS so all waves share
  * it.  Lane l owns elements base+l*8..base+l*8+7, so the wave covers 256
@@ -2189,29 +2245,58 @@ int ds4_metal_matmul_f16_tensor(
 
     int ok;
     if (n_tok > 1u) {
-        /* Prefill path: tile NTOK=8 tokens per row pass to amortize the
-         * weight read.  See ROCM_DEFINE_MATMUL_F16_TILE. */
-        const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
-        const uint32_t ntok  = 8u;
-        const dim3 block(nrows * 32u);
-        const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),
-                        (unsigned)((n_tok + ntok - 1u) / ntok));
-        if (nrows == 8u) {
-            hipLaunchKernelGGL(rocm_matmul_f16_tile_8x8_kernel,
-                               grid, block, 0, g_stream,
-                               (float *)tensor_u8(out),
-                               (const uint16_t *)w_dev,
-                               (const float *)tensor_u8_const(x),
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
-        } else {
-            hipLaunchKernelGGL(rocm_matmul_f16_tile_4x8_kernel,
-                               grid, block, 0, g_stream,
-                               (float *)tensor_u8(out),
-                               (const uint16_t *)w_dev,
-                               (const float *)tensor_u8_const(x),
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        /* Prefill path.  n_tok>=16 uses WMMA (v_wmma_f32_16x16x16_f16 on
+         * gfx1151 wave32) which beats the scalar tile kernel by reusing
+         * each loaded weight across 16 tokens via the matrix-fma op
+         * instead of 8 explicit lane FMAs; smaller token counts stay on
+         * the tile kernel because a single 16-token WMMA tile would
+         * waste >50% of its lanes when n_tok < 8.  in_dim must be a
+         * multiple of 16 for WMMA (K-stride). */
+        static int g_f16_wmma_cached = -1;
+        if (g_f16_wmma_cached < 0) {
+            const char *env = getenv("DS4_ROCM_WMMA");
+            g_f16_wmma_cached = (env && env[0] == '0') ? 0 : 1;
         }
-        ok = rocm_launch_done("F16 matmul tile launch", "F16 matmul tile completion");
+        const int wmma_ok = g_f16_wmma_cached
+                            && (in_dim % 16u) == 0u
+                            && out_dim >= 16u
+                            && n_tok   >= 16u;
+        if (wmma_ok) {
+            const dim3 wblock(32u);
+            const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
+                             (unsigned)((n_tok   + 15u) / 16u));
+            hipLaunchKernelGGL(rocm_matmul_f16_wmma_kernel,
+                               wgrid, wblock, 0, g_stream,
+                               (float *)tensor_u8(out),
+                               (const uint16_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+            ok = rocm_launch_done("F16 matmul wmma launch", "F16 matmul wmma completion");
+        } else {
+            /* Tile fallback: NTOK=8 tokens per row pass to amortize the weight
+             * read.  See ROCM_DEFINE_MATMUL_F16_TILE. */
+            const uint32_t nrows = ((out_dim % 8u) == 0u && out_dim >= 256u) ? 8u : 4u;
+            const uint32_t ntok  = 8u;
+            const dim3 block(nrows * 32u);
+            const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows),
+                            (unsigned)((n_tok + ntok - 1u) / ntok));
+            if (nrows == 8u) {
+                hipLaunchKernelGGL(rocm_matmul_f16_tile_8x8_kernel,
+                                   grid, block, 0, g_stream,
+                                   (float *)tensor_u8(out),
+                                   (const uint16_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+            } else {
+                hipLaunchKernelGGL(rocm_matmul_f16_tile_4x8_kernel,
+                                   grid, block, 0, g_stream,
+                                   (float *)tensor_u8(out),
+                                   (const uint16_t *)w_dev,
+                                   (const float *)tensor_u8_const(x),
+                                   (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+            }
+            ok = rocm_launch_done("F16 matmul tile launch", "F16 matmul tile completion");
+        }
     } else {
         /* n_tok==1 decode path.
          *

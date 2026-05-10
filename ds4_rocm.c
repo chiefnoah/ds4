@@ -3860,6 +3860,88 @@ __global__ static void rocm_attn_out_low_q8_wmma_kernel(
     }
 }
 
+/* Wide-token-tile variant of rocm_attn_out_low_q8_wmma_kernel.  Each
+ * block now spans 32 tokens so one weight tile load feeds both halves.
+ * Same trick as rocm_matmul_q8_0_wmma_wide_kernel, applied to stage 1
+ * of the attention output projection.  Per-group weight footprint is
+ * group_dim x rank Q8 = 4.4 MB (for group_dim=4096, rank=1024); across
+ * 8 groups that's 35 MB total, sitting on the Infinity Cache edge. */
+__global__ static void rocm_attn_out_low_q8_wmma_wide_kernel(
+        float *low, const uint8_t *w, const float *heads,
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
+        uint64_t row_bytes, uint64_t group_w_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t t0   = blockIdx.x * 32u;
+    const uint32_t r0   = blockIdx.y * 16u;
+    const uint32_t g    = blockIdx.z;
+    if (r0 >= rank || t0 >= n_tokens || g >= n_groups) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok_a   = t0 + col_in_tile;
+    const uint32_t tok_b   = t0 + 16u + col_in_tile;
+
+    const uint32_t safe_row = (out_row < rank)     ? out_row : (rank     - 1u);
+    const uint32_t safe_tok_a = (tok_a < n_tokens) ? tok_a : (n_tokens - 1u);
+    const uint32_t safe_tok_b = (tok_b < n_tokens) ? tok_b : (n_tokens - 1u);
+    const uint8_t *wr  = w + (uint64_t)g * group_w_bytes + (uint64_t)safe_row * row_bytes;
+    const float   *xta = heads + ((uint64_t)safe_tok_a * n_groups + g) * group_dim;
+    const float   *xtb = heads + ((uint64_t)safe_tok_b * n_groups + g) * group_dim;
+    const uint32_t blocks = group_dim >> 5;
+
+    rocm_v8f32 ca = {0, 0, 0, 0, 0, 0, 0, 0};
+    rocm_v8f32 cb = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = wr + (uint64_t)b * 34u;
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        const _Float16 scale = (_Float16)rocm_f16_to_f32(scale_bits);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+        const float *xba = xta + ((uint64_t)b << 5);
+        const float *xbb = xtb + ((uint64_t)b << 5);
+
+        rocm_v16f16 a1;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a1[kk] = (_Float16)((float)qs[kk]) * scale;
+        }
+        rocm_v16f16 bv1a, bv1b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv1a[kk] = (_Float16)xba[kk];
+            bv1b[kk] = (_Float16)xbb[kk];
+        }
+        ca = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, bv1a, ca);
+        cb = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, bv1b, cb);
+
+        rocm_v16f16 a2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk] = (_Float16)((float)qs[16 + kk]) * scale;
+        }
+        rocm_v16f16 bv2a, bv2b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            bv2a[kk] = (_Float16)xba[16 + kk];
+            bv2b[kk] = (_Float16)xbb[16 + kk];
+        }
+        ca = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bv2a, ca);
+        cb = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bv2b, cb);
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r  = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t ta = t0 + col_in_tile;
+        const uint32_t tb = t0 + 16u + col_in_tile;
+        if (r < rank) {
+            if (ta < n_tokens) low[((uint64_t)ta * n_groups + g) * rank + r] = ca[i];
+            if (tb < n_tokens) low[((uint64_t)tb * n_groups + g) * rank + r] = cb[i];
+        }
+    }
+}
+
 static int rocm_attention_output_low_q8_dispatch(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -3903,20 +3985,47 @@ static int rocm_attention_output_low_q8_dispatch(
                             && n_tokens >= 16u
                             && rank     >= 16u;
         if (wmma_ok) {
+            /* Wide-token-tile variant pays off when n_tokens >= 64 and
+             * the per-group weight footprint hits the Infinity Cache
+             * edge.  See rocm_matmul_q8_0_wmma_wide_kernel for the
+             * full rationale. */
+            static int g_attn_low_wide_cached = -1;
+            if (g_attn_low_wide_cached < 0) {
+                const char *env = getenv("DS4_ROCM_WMMA_WIDE");
+                g_attn_low_wide_cached = (env && env[0] == '0') ? 0 : 1;
+            }
+            const int wide_ok = g_attn_low_wide_cached
+                                && group_dim >= 4096u
+                                && n_tokens  >= 64u;
             const dim3 wblock(32u);
-            /* X=token, Y=rank tile, Z=group — see kernel comment. */
-            const dim3 wgrid((unsigned)((n_tokens + 15u) / 16u),
-                             (unsigned)((rank     + 15u) / 16u),
-                             (unsigned)n_groups);
-            hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_kernel,
-                               wgrid, wblock, 0, g_stream,
-                               (float *)tensor_u8(low),
-                               (const uint8_t *)w_dev,
-                               (const float *)tensor_u8_const(heads),
-                               (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
-                               row_bytes, group_w_bytes);
-            ok = rocm_launch_done("attn out low Q8 wmma launch",
-                                  "attn out low Q8 wmma completion");
+            if (wide_ok) {
+                const dim3 wgrid((unsigned)((n_tokens + 31u) / 32u),
+                                 (unsigned)((rank     + 15u) / 16u),
+                                 (unsigned)n_groups);
+                hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_wide_kernel,
+                                   wgrid, wblock, 0, g_stream,
+                                   (float *)tensor_u8(low),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(heads),
+                                   (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                                   row_bytes, group_w_bytes);
+                ok = rocm_launch_done("attn out low Q8 wmma_wide launch",
+                                      "attn out low Q8 wmma_wide completion");
+            } else {
+                /* X=token, Y=rank tile, Z=group — see kernel comment. */
+                const dim3 wgrid((unsigned)((n_tokens + 15u) / 16u),
+                                 (unsigned)((rank     + 15u) / 16u),
+                                 (unsigned)n_groups);
+                hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_kernel,
+                                   wgrid, wblock, 0, g_stream,
+                                   (float *)tensor_u8(low),
+                                   (const uint8_t *)w_dev,
+                                   (const float *)tensor_u8_const(heads),
+                                   (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                                   row_bytes, group_w_bytes);
+                ok = rocm_launch_done("attn out low Q8 wmma launch",
+                                      "attn out low Q8 wmma completion");
+            }
         } else {
             /* Wave-per-row dispatch: same gfx1151 win as ds4_metal_matmul_q8_0_tensor.
              * For DSv4 attention output, group_dim = 4096 (DS4_N_HEAD_DIM * 8),

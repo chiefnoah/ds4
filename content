@@ -1,0 +1,66 @@
+Fuse matmul_f16_pair: shared LDS-x load + 1 launch saved per pair
+
+Status: Open. Next up after the cleanup commit (0fcd50c).
+
+# Goal
+Fold ds4_metal_matmul_f16_pair_tensor into a single fused kernel that
+shares the LDS-x load across both row sets (out_a from weight_a_offset,
+out_b from weight_b_offset). Today the wrapper is a sequential dispatch
+of two ds4_metal_matmul_f16_tensor calls; both calls take the same
+activation x with the same in_dim and out_dim.
+
+# Why
+Per-token call audit (DS4_ROCM_SYNC_EACH=1 DS4_ROCM_AUDIT_F16=1):
+- in=4096, out=256, n_tok=1: 4165 calls/50tok x 24.3 us
+- in=4096, out=512, n_tok=1: 1960 calls/50tok x 41.2 us
+- in=4096, out=1024, n_tok=1: 2058 calls/50tok x 77.7 us
+Many of these go through matmul_f16_pair_tensor. Fusing eliminates one
+launch per pair (~30/tok at 60+ pair calls/tok) and one global x re-read
+per pair. Estimated ~0.5 ms/tok (~3% of decode wall at 70 ms/tok).
+
+# Call sites (already located)
+- ds4.c ~8895: comp_kv_cur + comp_sc_cur from g->attn_norm, in_dim=DS4_N_EMBD, out_dim=comp_width
+- ds4.c ~8983: alternate compressor branch with same shape pattern
+Both pass identical x, in_dim, out_dim — perfect fusion candidate.
+
+# Design
+ROCM_DEFINE_MATMUL_F16_PAIR_WAVE_LDS_V8(NROWS) macro:
+- Block holds 2*NROWS waves (NROWS for A, NROWS for B); blockDim.x = 2*NROWS*32.
+- Cooperative LDS load of x once per block (in_dim*sizeof(float) <= ~16 KiB).
+- Wave routing: row_block = tid >> 5; if row_block < NROWS, write to out_a row
+  block.x*NROWS + row_block; else write to out_b row block.x*NROWS + (row_block - NROWS).
+  Each wave does the same 256-wide K-tile / uint4-load / wave32-shuffle pattern
+  as the existing WAVE_LDS_V8 kernel.
+- LDS budget check: at NROWS=8 -> 16 waves -> 512 threads (within RDNA 3.5 block cap),
+  LDS = in_dim*4 = 16 KiB at in_dim=4096; OK. NROWS=4 fallback for out_dim%8 != 0.
+
+# Steps
+1. Add the macro + NROWS=8 and NROWS=4 instantiations near the existing
+   ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8 in ds4_rocm.c (lines ~930-1010).
+2. Replace the body of ds4_metal_matmul_f16_pair_tensor (ds4_rocm.c:2334)
+   to dispatch the fused kernel when:
+     n_tok == 1 && in_dim % 256 == 0 && in_dim*4 <= LDS_BUDGET (16 KiB)
+     && out_dim % 4 == 0
+   Falls back to two ds4_metal_matmul_f16_tensor calls otherwise.
+3. Add tests/ds4_rocm_kernel_test.c case: matmul_f16_pair correctness
+   (in=4096, out=256 + alternate out_dim covering NROWS=8 and NROWS=4 paths).
+4. Validate:
+   - DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+   - ./ds4_rocm_kernel_test -> OK (must include the new STEP)
+   - time ./ds4 --backend rocm -p "Briefly explain what makes the AMD Strix Halo APU well-suited for running large language models on a single chip." -n 200 --temp 0 --seed 42
+     Coherent multi-paragraph thinking-mode output, decode t/s captured.
+5. Per-call audit before/after:
+   DS4_ROCM_SYNC_EACH=1 DS4_ROCM_AUDIT_F16=1 ./ds4 ... -n 50 ...
+   Compare us/call and total ms/tok for the pair call shapes.
+
+# Acceptance
+- Kernel test ends OK with new STEP.
+- Coherent end-to-end output unchanged at seed 42 / temp 0.
+- Decode t/s improves OR audit shows the expected reduction in launches
+  with no regression. If neutral, document and revert dispatch (keep the
+  fused kernel as scaffolding) per the F16 round-2 lesson.
+
+# Related
+- ds4_metal_matmul_f16_pair_tensor: ds4_rocm.c:2334 (current wrapper)
+- WAVE_LDS_V8 kernel: ds4_rocm.c around line 940 (post-cleanup)
+- Memory: feedback_f16_decode_lds_x.md, feedback_fusion_neutral_in_batched_mode.md

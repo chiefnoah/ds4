@@ -12,7 +12,7 @@
 #include "../ds4_metal.h"
 
 #define IN_DIM 4096u
-#define MID_DIM 1024u
+#define MID_DIM 2048u
 #define OUT_DIM 4096u
 #define N_USED 6u
 #define N_TOTAL 256u

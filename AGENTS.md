@@ -1,14 +1,20 @@
 # Agent Development Approach
 
-Notes on how Claude works in this repo. `AGENT.md` covers project-level rules
-(API surface, no-C++, etc.); this file is about *workflow* — what tools to
-reach for, how to validate changes, and the cadence the user has asked for.
+This file is about *workflow* — what tools to reach for, how to validate
+changes, and the cadence the user has asked for. Project-level rules
+(API surface, no-C++, etc.) live in this same file in later sections.
 
 ## Required tools
 
 - **`tsk`** — Git-backed task tracker. The user wants outstanding work tracked
   here so future sessions can pick up cold. Use `tsk` for non-trivial findings,
-  follow-up experiments, regressions, and performance notes.
+  follow-up experiments, regressions, and performance notes. Keep the queue
+  tight: prune completed/landed work and ruled-out experiments with `tsk drop`
+  rather than letting the list grow.
+
+  Storage: tsk persists everything in git refs under `refs/tsk/*` (visible
+  via `git for-each-ref refs/tsk/`). The on-disk `.tsk/` directory only
+  contains working-copy snapshots — deleting it does **not** remove tasks.
 
   Basic commands:
   - `tsk list -c 20` shows the active queue, top-of-stack first.
@@ -17,6 +23,8 @@ reach for, how to validate changes, and the cadence the user has asked for.
     the active queue.
   - `tsk push -t "Title" -b $'Body...'` creates a new task at the top when it
     should be next.
+  - `tsk drop -T tsk-N` removes a task from the queue (history retained on
+    the underlying ref). Use this to close completed or irrelevant tasks.
   - `tsk prop ...` can tag or query tasks when properties are useful.
   - `tsk help <command>` is authoritative for exact flags.
 
@@ -27,15 +35,16 @@ reach for, how to validate changes, and the cadence the user has asked for.
   alongside other active work.
 
   Do **not** use `tsk edit` from a non-interactive shell. It spawns `$EDITOR`
-  and can hang indefinitely. To change an existing task, either use a normal
-  interactive editor yourself or, when a plain file exists under `.tsk/tasks/`,
-  edit that file directly. If in doubt, append a new corrective task instead
-  of risking a hung `tsk edit`.
+  and can hang indefinitely. To revise an existing task, use `tsk edit`
+  yourself in an interactive terminal, or `tsk drop` it and `tsk append` a
+  replacement. The on-disk files under `.tsk/tasks/` are snapshots, not the
+  source of truth — editing them in-place won't update the git ref.
 
   The command writes Git-backed task state under the repo, so sandboxed agents
   may need approval. Keep privileged task commands homogeneous so the user can
-  blanket-approve them; prefer the exact shape
-  `tsk append -t "..." -b $'...'` for task creation.
+  blanket-approve them; prefer the exact shapes
+  `tsk append -t "..." -b $'...'` for creation and `tsk drop -T tsk-N` for
+  closure.
 
   The Claude-side `TaskCreate`/`TaskUpdate` is fine for scratchpad tracking
   *during* a session, but the canonical record for future sessions is `tsk`.

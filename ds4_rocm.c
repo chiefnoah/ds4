@@ -4026,11 +4026,121 @@ __global__ static void rocm_argmax_kernel(int32_t *selected,
     if (tid == 0) selected[tok] = s_idx[0];
 }
 
-__global__ static void rocm_indexer_topk_kernel(int32_t *selected,
-                                                const float *scores,
-                                                uint32_t n_comp,
-                                                uint32_t top_k) {
-    /* one threadgroup per token, top-K via repeated argmax (top_k <= 512). */
+/* Block-parallel top-K via iterative argmax + LDS visited bitmask. One block
+ * per token. For each k in [0, top_k), threads cooperatively scan scores
+ * (skipping the -inf sentinel and previously-picked indices), reduce to the
+ * winning (val, idx), mark the winner visited, and append idx to the pick
+ * buffer. After top_k iterations a parallel bitonic sort over the next
+ * power-of-two slots reorders the picks by index ascending, with the -1
+ * sentinels (for slots where no valid candidate remained) pushed to the end.
+ *
+ * LDS layout (extern):
+ *   visited[ceil(n_comp/32)]  uint32   per-element selected mask
+ *   s_val[BLOCK]              float    argmax reduction values
+ *   s_idx[BLOCK]              int32    argmax reduction indices
+ *   tmp_idx[top_k_pow2]       int32    pick buffer (padded to next pow2 with -1)
+ *
+ * Caller envelope (enforced in the wrapper): top_k <= ROCM_INDEXER_TOPK_MAX_K
+ * (1024) and n_comp <= ROCM_INDEXER_TOPK_MAX_NCOMP (16384). Outside that
+ * envelope, dispatch falls back to rocm_indexer_topk_serial_kernel. */
+#define ROCM_INDEXER_TOPK_BLOCK     256u
+#define ROCM_INDEXER_TOPK_MAX_K     1024u
+#define ROCM_INDEXER_TOPK_MAX_NCOMP 16384u
+
+__global__ static void rocm_indexer_topk_parallel_kernel(int32_t *selected,
+                                                          const float *scores,
+                                                          uint32_t n_comp,
+                                                          uint32_t top_k) {
+    extern __shared__ unsigned char rocm_topk_smem[];
+    const uint32_t mask_words = (n_comp + 31u) >> 5;
+    uint32_t top_k_pow2 = 1u;
+    while (top_k_pow2 < top_k) top_k_pow2 <<= 1;
+
+    uint32_t *visited = (uint32_t *)rocm_topk_smem;
+    float    *s_val   = (float    *)(visited + mask_words);
+    int32_t  *s_idx   = (int32_t  *)(s_val + ROCM_INDEXER_TOPK_BLOCK);
+    int32_t  *tmp_idx = (int32_t  *)(s_idx + ROCM_INDEXER_TOPK_BLOCK);
+
+    const uint32_t tok = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const float *src = scores + (uint64_t)tok * n_comp;
+    int32_t *dst = selected + (uint64_t)tok * top_k;
+
+    for (uint32_t i = tid; i < mask_words; i += ROCM_INDEXER_TOPK_BLOCK) visited[i] = 0u;
+    for (uint32_t i = tid; i < top_k_pow2; i += ROCM_INDEXER_TOPK_BLOCK) tmp_idx[i] = -1;
+    __syncthreads();
+
+    for (uint32_t k = 0; k < top_k; k++) {
+        float   best_v = -3.4028234663852886e38f;
+        int32_t best_i = -1;
+        for (uint32_t c = tid; c < n_comp; c += ROCM_INDEXER_TOPK_BLOCK) {
+            const uint32_t mw = c >> 5;
+            const uint32_t mb = 1u << (c & 31u);
+            if (visited[mw] & mb) continue;
+            const float v = src[c];
+            if (v == -3.4028234663852886e38f) continue;
+            if (v > best_v) { best_v = v; best_i = (int32_t)c; }
+        }
+        s_val[tid] = best_v;
+        s_idx[tid] = best_i;
+        __syncthreads();
+        for (uint32_t s = ROCM_INDEXER_TOPK_BLOCK >> 1; s > 0u; s >>= 1) {
+            if (tid < s) {
+                const float vo = s_val[tid + s];
+                if (vo > s_val[tid]) {
+                    s_val[tid] = vo;
+                    s_idx[tid] = s_idx[tid + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const int32_t pick = s_idx[0];
+            tmp_idx[k] = pick;
+            if (pick >= 0) {
+                visited[pick >> 5] |= 1u << (pick & 31u);
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Bitonic sort tmp_idx[0..top_k_pow2) ascending, with -1 sentinels going
+     * to the end (sentinel acts as "+inf" in the comparator). */
+    for (uint32_t kk = 2u; kk <= top_k_pow2; kk <<= 1) {
+        for (uint32_t j = kk >> 1; j > 0u; j >>= 1) {
+            for (uint32_t i = tid; i < top_k_pow2; i += ROCM_INDEXER_TOPK_BLOCK) {
+                const uint32_t ixj = i ^ j;
+                if (ixj > i) {
+                    const int asc_block = ((i & kk) == 0u) ? 1 : 0;
+                    const int32_t ai = tmp_idx[i];
+                    const int32_t bi = tmp_idx[ixj];
+                    int i_gt;
+                    if (ai < 0 && bi < 0) i_gt = 0;
+                    else if (ai < 0)      i_gt = 1;
+                    else if (bi < 0)      i_gt = 0;
+                    else                  i_gt = (ai > bi);
+                    const int swap = asc_block ? i_gt : !i_gt;
+                    if (swap) {
+                        tmp_idx[i]   = bi;
+                        tmp_idx[ixj] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (uint32_t i = tid; i < top_k; i += ROCM_INDEXER_TOPK_BLOCK) {
+        dst[i] = tmp_idx[i];
+    }
+}
+
+__global__ static void rocm_indexer_topk_serial_kernel(int32_t *selected,
+                                                        const float *scores,
+                                                        uint32_t n_comp,
+                                                        uint32_t top_k) {
+    /* Reference single-thread implementation; dispatch keeps it as the
+     * envelope fallback. Same semantics as rocm_indexer_topk_parallel_kernel. */
     const uint32_t tok = blockIdx.x;
     const float *src = scores + (uint64_t)tok * n_comp;
     int32_t *dst = selected + (uint64_t)tok * top_k;
@@ -4080,9 +4190,8 @@ int ds4_metal_indexer_topk_tensor(
 
     if (top_k == 1u) {
         /* Specialized parallel argmax: 256-thread block per token,
-         * LDS tree reduction.  Bypasses the O(n_comp * top_k) serial
-         * scan below and is essential for greedy decode where n_comp
-         * == DS4_N_VOCAB == 129280. */
+         * LDS tree reduction. Essential for greedy decode where
+         * n_comp == DS4_N_VOCAB. */
         hipLaunchKernelGGL(rocm_argmax_kernel, dim3(n_tokens),
                            dim3(ROCM_ARGMAX_BLOCK), 0, g_stream,
                            (int32_t *)tensor_u8(selected),
@@ -4090,13 +4199,35 @@ int ds4_metal_indexer_topk_tensor(
                            n_comp);
         return rocm_launch_done("argmax launch", "argmax completion");
     }
-    /* Note: this O(n_comp * top_k) per-token loop is correct but slow; revisit
-     * with a proper bitonic top-k once correctness is validated. */
-    hipLaunchKernelGGL(rocm_indexer_topk_kernel, dim3(n_tokens), dim3(1), 0, g_stream,
+
+    if (top_k <= ROCM_INDEXER_TOPK_MAX_K && n_comp <= ROCM_INDEXER_TOPK_MAX_NCOMP) {
+        /* Block-parallel iterative argmax + bitonic re-sort. Replaces the
+         * single-thread O(n_comp * top_k) reference scan; production callers
+         * (DS4_N_INDEXER_TOP_K==512 across the indexer / spec verifier paths)
+         * land here. */
+        const uint32_t mask_words = (n_comp + 31u) >> 5;
+        uint32_t top_k_pow2 = 1u;
+        while (top_k_pow2 < top_k) top_k_pow2 <<= 1;
+        const size_t lds_bytes = (size_t)mask_words * sizeof(uint32_t)
+                               + (size_t)ROCM_INDEXER_TOPK_BLOCK * sizeof(float)
+                               + (size_t)ROCM_INDEXER_TOPK_BLOCK * sizeof(int32_t)
+                               + (size_t)top_k_pow2 * sizeof(int32_t);
+        hipLaunchKernelGGL(rocm_indexer_topk_parallel_kernel,
+                           dim3(n_tokens), dim3(ROCM_INDEXER_TOPK_BLOCK),
+                           lds_bytes, g_stream,
+                           (int32_t *)tensor_u8(selected),
+                           (const float *)tensor_u8_const(scores),
+                           n_comp, top_k);
+        return rocm_launch_done("indexer topk parallel launch",
+                                "indexer topk parallel completion");
+    }
+
+    /* Out-of-envelope fallback (never hit by ds4 production today). */
+    hipLaunchKernelGGL(rocm_indexer_topk_serial_kernel, dim3(n_tokens), dim3(1), 0, g_stream,
                        (int32_t *)tensor_u8(selected),
                        (const float *)tensor_u8_const(scores),
                        n_comp, top_k);
-    return rocm_launch_done("indexer topk launch", "indexer topk completion");
+    return rocm_launch_done("indexer topk serial launch", "indexer topk serial completion");
 }
 
 __global__ static void rocm_topk_mask_init_kernel(float *mask,

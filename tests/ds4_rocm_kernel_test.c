@@ -3265,6 +3265,173 @@ int main(void) {
         ds4_metal_tensor_free(tlog);
     }
 
+    /* Reference top-K: pick the top_k largest scores by value (descending),
+     * skipping the -inf sentinel; output the picked indices sorted ascending,
+     * with -1 sentinels for empty slots pushed to the end. Mirrors the
+     * semantics enforced by both rocm_indexer_topk_parallel_kernel and
+     * rocm_indexer_topk_serial_kernel. */
+    /* (Helper inline to keep the test self-contained.) */
+    #define TOPK_REFERENCE(scores_, n_comp_, top_k_, out_) do { \
+        for (uint32_t _k = 0; _k < (top_k_); _k++) (out_)[_k] = -1; \
+        for (uint32_t _k = 0; _k < (top_k_); _k++) { \
+            float _bv = -3.4028234663852886e38f; \
+            int32_t _bi = -1; \
+            for (uint32_t _c = 0; _c < (n_comp_); _c++) { \
+                float _v = (scores_)[_c]; \
+                if (_v == -3.4028234663852886e38f) continue; \
+                int _taken = 0; \
+                for (uint32_t _kk = 0; _kk < _k; _kk++) if ((out_)[_kk] == (int32_t)_c) { _taken = 1; break; } \
+                if (_taken) continue; \
+                if (_v > _bv) { _bv = _v; _bi = (int32_t)_c; } \
+            } \
+            (out_)[_k] = _bi; \
+        } \
+        /* sort ascending with sentinels at end */ \
+        for (uint32_t _i = 0; _i < (top_k_); _i++) { \
+            for (uint32_t _j = _i + 1; _j < (top_k_); _j++) { \
+                int32_t _a = (out_)[_i], _b = (out_)[_j]; \
+                int _swap = 0; \
+                if (_a < 0 && _b >= 0) _swap = 1; \
+                else if (_a >= 0 && _b >= 0 && _b < _a) _swap = 1; \
+                if (_swap) { (out_)[_i] = _b; (out_)[_j] = _a; } \
+            } \
+        } \
+    } while (0)
+
+    STEP("indexer_topk_tensor parallel (top_k=4, n_comp=64, single token)");
+    {
+        const uint32_t TK = 4, NC = 64, NT = 1;
+        float *scores = (float *)malloc(NC * sizeof(float));
+        int32_t ref[4], got[4];
+        for (uint32_t i = 0; i < NC; i++) scores[i] = sinf((float)(i + 1) * 0.37f) * 2.0f;
+        TOPK_REFERENCE(scores, NC, TK, ref);
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc((uint64_t)NT * NC * sizeof(float));
+        ds4_metal_tensor *tdt = ds4_metal_tensor_alloc((uint64_t)NT * TK * sizeof(int32_t));
+        require(tsc && tdt, "topk parallel alloc");
+        require(ds4_metal_tensor_write(tsc, 0, scores, NC * sizeof(float)),
+                "topk parallel scores write");
+        require(ds4_metal_indexer_topk_tensor(tdt, tsc, NC, NT, TK),
+                "indexer_topk parallel small");
+        require(ds4_metal_tensor_read(tdt, 0, got, TK * sizeof(int32_t)),
+                "topk parallel read");
+        for (uint32_t k = 0; k < TK; k++) {
+            require(got[k] == ref[k], "topk parallel small value");
+        }
+        ds4_metal_tensor_free(tdt);
+        ds4_metal_tensor_free(tsc);
+        free(scores);
+    }
+
+    STEP("indexer_topk_tensor parallel (top_k=7 non-pow2, batched n_tokens=3)");
+    {
+        const uint32_t TK = 7, NC = 100, NT = 3;
+        float *scores = (float *)malloc((size_t)NT * NC * sizeof(float));
+        int32_t ref[7], got[7];
+        for (uint32_t t = 0; t < NT; t++) {
+            for (uint32_t i = 0; i < NC; i++) {
+                scores[t * NC + i] = cosf((float)(t * NC + i + 1) * 0.21f) * 1.5f;
+            }
+        }
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc((uint64_t)NT * NC * sizeof(float));
+        ds4_metal_tensor *tdt = ds4_metal_tensor_alloc((uint64_t)NT * TK * sizeof(int32_t));
+        require(tsc && tdt, "topk parallel batched alloc");
+        require(ds4_metal_tensor_write(tsc, 0, scores, (size_t)NT * NC * sizeof(float)),
+                "topk parallel batched scores write");
+        require(ds4_metal_indexer_topk_tensor(tdt, tsc, NC, NT, TK),
+                "indexer_topk parallel batched");
+        for (uint32_t t = 0; t < NT; t++) {
+            TOPK_REFERENCE(scores + t * NC, NC, TK, ref);
+            require(ds4_metal_tensor_read(tdt, t * TK * sizeof(int32_t), got, TK * sizeof(int32_t)),
+                    "topk parallel batched read");
+            for (uint32_t k = 0; k < TK; k++) {
+                require(got[k] == ref[k], "topk parallel batched value");
+            }
+        }
+        ds4_metal_tensor_free(tdt);
+        ds4_metal_tensor_free(tsc);
+        free(scores);
+    }
+
+    STEP("indexer_topk_tensor parallel (top_k=512, n_comp=8194, production size)");
+    {
+        const uint32_t TK = 512, NC = 8194, NT = 1;
+        float *scores = (float *)malloc((size_t)NC * sizeof(float));
+        int32_t *ref = (int32_t *)malloc((size_t)TK * sizeof(int32_t));
+        int32_t *got = (int32_t *)malloc((size_t)TK * sizeof(int32_t));
+        require(scores && ref && got, "topk parallel large alloc");
+        for (uint32_t i = 0; i < NC; i++) scores[i] = sinf((float)(i + 17) * 0.013f) * 5.0f;
+        TOPK_REFERENCE(scores, NC, TK, ref);
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(NC * sizeof(float));
+        ds4_metal_tensor *tdt = ds4_metal_tensor_alloc(TK * sizeof(int32_t));
+        require(tsc && tdt, "topk parallel large tensor alloc");
+        require(ds4_metal_tensor_write(tsc, 0, scores, NC * sizeof(float)),
+                "topk parallel large scores write");
+        require(ds4_metal_indexer_topk_tensor(tdt, tsc, NC, NT, TK),
+                "indexer_topk parallel large");
+        require(ds4_metal_tensor_read(tdt, 0, got, TK * sizeof(int32_t)),
+                "topk parallel large read");
+        for (uint32_t k = 0; k < TK; k++) {
+            require(got[k] == ref[k], "topk parallel large value");
+        }
+        ds4_metal_tensor_free(tdt);
+        ds4_metal_tensor_free(tsc);
+        free(got); free(ref); free(scores);
+    }
+
+    STEP("indexer_topk_tensor parallel (n_comp < top_k, sentinels at end)");
+    {
+        const uint32_t TK = 16, NC = 5, NT = 1;
+        float scores[5] = { 1.0f, 5.0f, 2.0f, 4.0f, 3.0f };
+        int32_t ref[16], got[16];
+        TOPK_REFERENCE(scores, NC, TK, ref);
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(NC * sizeof(float));
+        ds4_metal_tensor *tdt = ds4_metal_tensor_alloc(TK * sizeof(int32_t));
+        require(tsc && tdt, "topk parallel sentinel alloc");
+        require(ds4_metal_tensor_write(tsc, 0, scores, sizeof(scores)),
+                "topk parallel sentinel scores write");
+        require(ds4_metal_indexer_topk_tensor(tdt, tsc, NC, NT, TK),
+                "indexer_topk parallel sentinel");
+        require(ds4_metal_tensor_read(tdt, 0, got, TK * sizeof(int32_t)),
+                "topk parallel sentinel read");
+        for (uint32_t k = 0; k < TK; k++) {
+            require(got[k] == ref[k], "topk parallel sentinel value");
+        }
+        ds4_metal_tensor_free(tdt);
+        ds4_metal_tensor_free(tsc);
+    }
+
+    STEP("indexer_topk_tensor parallel (-inf scores skipped)");
+    {
+        const uint32_t TK = 4, NC = 16, NT = 1;
+        float scores[16];
+        for (uint32_t i = 0; i < NC; i++) scores[i] = (float)i * 0.1f;
+        scores[3]  = -3.4028234663852886e38f;
+        scores[10] = -3.4028234663852886e38f;
+        scores[15] = -3.4028234663852886e38f;
+        int32_t ref[4], got[4];
+        TOPK_REFERENCE(scores, NC, TK, ref);
+        ds4_metal_tensor *tsc = ds4_metal_tensor_alloc(NC * sizeof(float));
+        ds4_metal_tensor *tdt = ds4_metal_tensor_alloc(TK * sizeof(int32_t));
+        require(tsc && tdt, "topk parallel inf alloc");
+        require(ds4_metal_tensor_write(tsc, 0, scores, sizeof(scores)),
+                "topk parallel inf scores write");
+        require(ds4_metal_indexer_topk_tensor(tdt, tsc, NC, NT, TK),
+                "indexer_topk parallel inf");
+        require(ds4_metal_tensor_read(tdt, 0, got, TK * sizeof(int32_t)),
+                "topk parallel inf read");
+        for (uint32_t k = 0; k < TK; k++) {
+            require(got[k] == ref[k], "topk parallel inf value");
+        }
+        for (uint32_t k = 0; k < TK; k++) {
+            require(got[k] != 3 && got[k] != 10 && got[k] != 15,
+                    "topk parallel inf excluded");
+        }
+        ds4_metal_tensor_free(tdt);
+        ds4_metal_tensor_free(tsc);
+    }
+
+    #undef TOPK_REFERENCE
+
     STEP("cleanup");
     ds4_metal_tensor_free(tnorm);
     ds4_metal_tensor_free(thc_out);

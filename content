@@ -1,0 +1,36 @@
+LDS-cached x for Q8_0 wave decode matmul
+
+## Status
+Proposed
+
+## Goal
+Load x cooperatively into LDS once per block, then have all NROWS waves read from LDS instead of each wave re-reading from global memory. Saves (NROWS-1)/NROWS of x global reads.
+
+## Context
+File: ds4_rocm.c:559, `rocm_matmul_q8_0_wave_##NROWS##_kernel`
+
+Current decode kernel: NROWS=8, blockDim=256 (8 waves of 32 lanes). Each wave independently reads x[4096] from global to compute its output row dot product. With 8 waves, x is read 8x redundantly.
+- x: 4096 floats = 16 KiB -> fits exactly in <=16 KiB LDS budget per block
+- w: each wave reads different weight rows (no redundancy there)
+
+Tradeoff: LDS staging costs __syncthreads() + reduces occupancy if LDS budget per block was the limiter. On RDNA 3.5 with 40 CUs, 8 waves/block at 16 KiB LDS still allows 2 blocks/CU (depending on register pressure).
+
+Earlier benchmark (L2431 comment) showed LDS variant 4x slower: "48 vs 185 GiB/s on 4096^2". That was likely from a different codebase state. Re-measure from current baseline (~75 GiB/s decode matvec).
+
+## Files
+- ds4_rocm.c: array-549 (ROCM_DEFINE_MATMUL_Q8_0_WAVE)
+- ds4_rocm.c: array-2420 (dispatch logic, selects nrows=8 or 4)
+
+## Validation
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. ./ds4_rocm_kernel_test - must end with OK
+3. DS4_ROCM_TIME=1 ./ds4 --backend rocm -p "..." -n 200 --temp 0 --seed 42
+4. Compare prefill (GiB/s) and decode tokens/sec
+5. Gate behind env var DS4_ROCM_MATMUL_LDS_X=1 for A/B comparison
+
+## Next steps
+1. Read current wave kernel, identify LDS decl + cooperative load site
+2. Add variant: extern __shared__ float x_lds[] + cooperative load + syncthreads
+3. Each wave reads x_lds instead of x[b] in inner loop
+4. Add __syncthreads() after main loop before next block reuses LDS
+5. Compare throughput with DS4_ROCM_TIME=1 timing histogram

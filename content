@@ -1,0 +1,45 @@
+Async execution pipeline with HIP events
+
+## Status
+Proposed
+
+## Goal
+Replace rocm_launch_done() (hipDeviceSynchronize) at layer boundaries with HIP event-based pipeline to overlap CPU graph scheduling with GPU execution across layers.
+
+## Context
+Files: ds4_rocm.c (rocm_launch_done at L80, called after every layer operation), ds4.c graph scheduler.
+
+Current behavior:
+- rocm_launch_done (L80) calls hipDeviceSynchronize()
+- This blocks CPU until ALL GPU work is done
+- For decode: ~32 layers x 10-15 kernel launches each = sync storm
+- On APU with 40 CUs and UMA, GPU is idle while CPU computes next layer ops
+
+Ideal approach:
+- Remove hipDeviceSynchronize() from layer boundaries
+- Insert hipEventRecord after last kernel of each layer
+- Before first kernel of next layer, hipStreamWaitEvent to ensure any needed dependencies
+- Full sync only at end_commands() for the user-facing synchronize contract
+
+## Challenges
+1. The graph scheduler in ds4.c calls back-to-back wrappers that read/write the same tensors. Need to ensure producer-consumer ordering without full sync.
+2. MoE and attention kernels read model weights (device-resident) - multiple layers can share weight reads if launched asynchronously.
+3. Generated token is consumed by CPU for sampler - need sync before reading output.
+
+## Dependency chain per decode layer:
+RMS norm -> Q8_0 matvec (x4) -> SwiGLU -> Q8_0 matvec -> attention -> RMS norm -> ...
+
+Each step writes to tensors that the next step reads. With hipStreamWaitEvent between dependent layers and independent layers running concurrently, we can pipeline multiple layers.
+
+## Validation
+1. DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+2. End-to-end: output must match exactly (deterministic GPU)
+3. Measure reduction in end-to-end latency per decode step
+4. Use DS4_ROCM_TIME=1 to verify GPU utilization increased
+
+## Next steps
+1. Change rocm_launch_done to record event instead of sync, return event handle (or add side-channel)
+2. Keep g_stream as the one stream (HIP queues are in-order, can still use events for CPU sync)
+3. Add rocm_wait_event() call at layer boundaries where CPU reads GPU output
+4. DS4_ROCM_ASYNC=1 env gate for A/B
+5. Benchmark latency and throughput

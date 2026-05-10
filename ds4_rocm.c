@@ -33,6 +33,12 @@ static bool g_quality;
 static uint64_t g_live_bytes;
 static uint64_t g_peak_bytes;
 
+/* Stream that all kernel launches and async memops are routed to.  NULL (the
+ * default) maps to HIP's default stream — identical behavior to the original
+ * code.  Capture mode swaps in a dedicated stream so hipStreamBeginCapture
+ * can record the launches.  Single-threaded engine; no atomicity needed. */
+static hipStream_t g_stream = 0;
+
 /* Registered model-map regions.  Each entry mirrors a slice of the mmap'd
  * model file into a device-resident buffer so kernels can dereference the
  * registered device pointer without per-call uploads.
@@ -973,6 +979,79 @@ __global__ static void rocm_matmul_f16_tile_##NROWS##x##NTOK##_kernel( \
 ROCM_DEFINE_MATMUL_F16_TILE(8, 8)
 ROCM_DEFINE_MATMUL_F16_TILE(4, 8)
 
+/* Wave-per-row F16 matmul for one-token decode (n_tok=1).
+ * Mirror of rocm_matmul_q8_0_wave_##NROWS##_kernel for F16 weights.
+ * Replaces the legacy single-block-per-row LDS-reduction kernel which was
+ * running at 7-100 GB/s in production; wave-per-row should scale with the
+ * available out_dim parallelism (one wavefront per output row, lane handles
+ * weight stride 32, in-wave shuffle reduction, no LDS, no syncthreads). */
+#define ROCM_DEFINE_MATMUL_F16_WAVE(NROWS) \
+__global__ static void rocm_matmul_f16_wave_##NROWS##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t row     = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    float sum = 0.0f; \
+    for (uint32_t i = lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum; \
+}
+
+ROCM_DEFINE_MATMUL_F16_WAVE(8)
+ROCM_DEFINE_MATMUL_F16_WAVE(4)
+
+/* K-split F16 matvec for shapes where out_dim is too small to fill 40 CUs
+ * with one workgroup per row (e.g. 16384x24, 16384x4 — the indexer/compressor
+ * paths). One workgroup handles one row across a K-tile of size SPLIT_K
+ * elements; an atomicAdd accumulates partial sums into out[row].
+ *
+ * Caller must zero out[] before launching, and use enough K-tiles to cover
+ * in_dim. NROWS=1 because small-out_dim shapes don't benefit from packing. */
+#define ROCM_DEFINE_MATMUL_F16_KSPLIT(SPLIT_K) \
+__global__ static void rocm_matmul_f16_ksplit_##SPLIT_K##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim) { \
+    const uint32_t tid  = threadIdx.x; \
+    const uint32_t lane = tid & 31u; \
+    const uint32_t wid  = tid >> 5; \
+    const uint32_t row  = blockIdx.x; \
+    const uint32_t kt   = blockIdx.y; \
+    if (row >= out_dim) return; \
+    const uint32_t k_start = kt * (uint32_t)(SPLIT_K); \
+    if (k_start >= in_dim) return; \
+    const uint32_t k_end = k_start + (uint32_t)(SPLIT_K) <= in_dim \
+                              ? k_start + (uint32_t)(SPLIT_K) : in_dim; \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    float sum = 0.0f; \
+    for (uint32_t i = k_start + tid; i < k_end; i += blockDim.x) { \
+        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    /* per-wave partials -> shared -> wave 0 -> atomicAdd out[row]. */ \
+    __shared__ float wave_partial[8]; \
+    if (lane == 0) wave_partial[wid] = sum; \
+    __syncthreads(); \
+    if (wid == 0) { \
+        const uint32_t n_waves = blockDim.x >> 5; \
+        float v = lane < n_waves ? wave_partial[lane] : 0.0f; \
+        v = rocm_wave32_sum(v); \
+        if (lane == 0) atomicAdd(&out[row], v); \
+    } \
+}
+
+ROCM_DEFINE_MATMUL_F16_KSPLIT(2048)
+
+__global__ static void rocm_zero_floats_kernel(float *p, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0.0f;
+}
+
 __global__ static void rocm_hc_split_weighted_sum_norm_kernel(float *out,
                                                               float *norm_out,
                                                               float *split,
@@ -1164,15 +1243,34 @@ int ds4_metal_init(void) {
         fprintf(stderr, "ds4: ROCm backend found no HIP devices\n");
         return 0;
     }
+    /* Block on sync waits via OS yield instead of busy-spinning. Default
+     * (hipDeviceScheduleSpin) has the runtime tight-loop on the GPU until
+     * work completes, pegging one CPU core throughout decode. With
+     * ScheduleBlockingSync, hipDeviceSynchronize() (called once per token in
+     * end_commands) yields to the kernel until the device interrupt fires.
+     * Set DS4_ROCM_SPIN_SYNC=1 to keep the spin behavior (lower latency for
+     * very short workloads where the spin pays off). */
+    {
+        const char *spin = getenv("DS4_ROCM_SPIN_SYNC");
+        const int want_spin = spin && spin[0] && spin[0] != '0';
+        const unsigned flags = want_spin ? hipDeviceScheduleSpin
+                                         : hipDeviceScheduleBlockingSync;
+        /* Must be set before any other HIP call that touches the context.
+         * hipGetDeviceCount above doesn't bind a context, so we're safe. */
+        if (!rocm_ok(hipSetDeviceFlags(flags), "device flags")) return 0;
+    }
     if (!rocm_ok(hipSetDevice(0), "device select")) return 0;
     g_initialized = 1;
     return 1;
 }
 
+void ds4_metal_destroy_capture(void); /* defined after ds4_metal_synchronize */
+
 void ds4_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)hipDeviceSynchronize();
     rocm_drain_pending_frees();
+    ds4_metal_destroy_capture();
     rocm_time_dump();
     for (int i = 0; i < g_registration_count; i++) {
         if (g_registrations[i].host_owned) {
@@ -1372,6 +1470,100 @@ int ds4_metal_synchronize(void) {
     return ok;
 }
 
+/* HIP graph capture state.  All four pointers are NULL when no capture has
+ * happened.  Reused across the engine lifetime; ds4_metal_destroy_capture
+ * frees them. */
+static hipStream_t   g_capture_stream;
+static hipGraph_t    g_captured_graph;
+static hipGraphExec_t g_graph_exec;
+static int           g_capture_active;
+
+int ds4_metal_capture_supported(void) { return 1; }
+
+int ds4_metal_begin_capture(void) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (g_capture_active) return 0;
+    if (g_batch_open) return 0; /* incompatible with begin_commands */
+    if (!g_capture_stream) {
+        if (!rocm_ok(hipStreamCreate(&g_capture_stream), "capture stream create")) {
+            return 0;
+        }
+    }
+    /* ThreadLocal limits capture to this thread; ds4 is single-threaded for
+     * inference so this is the strictest safe setting. */
+    if (!rocm_ok(hipStreamBeginCapture(g_capture_stream, hipStreamCaptureModeThreadLocal),
+                 "stream begin capture")) {
+        return 0;
+    }
+    g_stream = g_capture_stream;
+    g_capture_active = 1;
+    return 1;
+}
+
+int ds4_metal_end_capture(void) {
+    if (!g_capture_active) return 0;
+    hipGraph_t graph = NULL;
+    int end_ok = rocm_ok(hipStreamEndCapture(g_capture_stream, &graph),
+                         "stream end capture");
+    g_stream = 0;
+    g_capture_active = 0;
+    if (!end_ok) return 0;
+    /* Replace any previously captured/instantiated graph. */
+    if (g_graph_exec) {
+        (void)hipGraphExecDestroy(g_graph_exec);
+        g_graph_exec = NULL;
+    }
+    if (g_captured_graph) {
+        (void)hipGraphDestroy(g_captured_graph);
+        g_captured_graph = NULL;
+    }
+    g_captured_graph = graph;
+    if (!rocm_ok(hipGraphInstantiate(&g_graph_exec, g_captured_graph, NULL, NULL, 0),
+                 "graph instantiate")) {
+        (void)hipGraphDestroy(g_captured_graph);
+        g_captured_graph = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_metal_replay_graph(void) {
+    if (!g_graph_exec) return 0;
+    /* Launch on the dedicated capture stream so it doesn't serialize behind
+     * any default-stream work the caller may have queued. */
+    if (!rocm_ok(hipGraphLaunch(g_graph_exec, g_capture_stream),
+                 "graph launch")) {
+        return 0;
+    }
+    int sync_ok = rocm_ok(hipStreamSynchronize(g_capture_stream),
+                          "graph completion");
+    rocm_drain_pending_frees();
+    return sync_ok;
+}
+
+void ds4_metal_destroy_capture(void) {
+    if (g_capture_active) {
+        /* Close any in-flight capture and discard the graph. */
+        hipGraph_t scratch = NULL;
+        (void)hipStreamEndCapture(g_capture_stream, &scratch);
+        if (scratch) (void)hipGraphDestroy(scratch);
+        g_capture_active = 0;
+        g_stream = 0;
+    }
+    if (g_graph_exec) {
+        (void)hipGraphExecDestroy(g_graph_exec);
+        g_graph_exec = NULL;
+    }
+    if (g_captured_graph) {
+        (void)hipGraphDestroy(g_captured_graph);
+        g_captured_graph = NULL;
+    }
+    if (g_capture_stream) {
+        (void)hipStreamDestroy(g_capture_stream);
+        g_capture_stream = NULL;
+    }
+}
+
 /* Deferred-free queue: temporary hipHostMalloc'd staging buffers (router
  * bias, attention sinks, MoE expert pools, weight-upload fallbacks) used
  * to be hipHostFree'd immediately after their kernel was launched.  In
@@ -1430,6 +1622,8 @@ static int rocm_sync_each(void) {
 static int rocm_launch_done(const char *launch_label, const char *sync_label) {
     if (!rocm_ok(hipGetLastError(), launch_label)) return 0;
     if (g_batch_open && !rocm_sync_each()) return 1;
+    /* hipDeviceSynchronize is forbidden during stream capture. */
+    if (g_capture_active) return 1;
     return rocm_ok(hipDeviceSynchronize(), sync_label);
 }
 
@@ -1744,7 +1938,7 @@ int ds4_metal_embed_token_hc_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out_hc),
                        (const uint16_t *)row_dev,
                        n_embd,
@@ -1786,7 +1980,7 @@ int ds4_metal_embed_tokens_hc_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out_hc),
                        (const uint16_t *)table_dev,
                        (const int32_t *)tensor_u8_const(tokens),
@@ -1819,7 +2013,7 @@ int ds4_metal_repeat_hc_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(row),
                        n_embd,
@@ -1858,7 +2052,7 @@ int ds4_metal_rms_norm_plain_rows_tensor(
                        grid,
                        block,
                        threads * sizeof(float),
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(x),
                        n,
@@ -1890,7 +2084,7 @@ int ds4_metal_swiglu_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(gate),
                        (const float *)tensor_u8_const(up),
@@ -1916,12 +2110,21 @@ int ds4_metal_add_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(a),
                        (const float *)tensor_u8_const(b),
                        n);
     return rocm_launch_done("add launch", "add completion");
+}
+
+static int rocm_f16_audit_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_AUDIT_F16");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
 }
 
 int ds4_metal_matmul_f16_tensor(
@@ -1935,6 +2138,9 @@ int ds4_metal_matmul_f16_tensor(
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_f16_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_matmul_f16_tensor");
+    const int audit = rocm_f16_audit_enabled();
+    struct timespec audit_t0;
+    if (audit) clock_gettime(CLOCK_MONOTONIC, &audit_t0);
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -1961,14 +2167,14 @@ int ds4_metal_matmul_f16_tensor(
                         (unsigned)((n_tok + ntok - 1u) / ntok));
         if (nrows == 8u) {
             hipLaunchKernelGGL(rocm_matmul_f16_tile_8x8_kernel,
-                               grid, block, 0, 0,
+                               grid, block, 0, g_stream,
                                (float *)tensor_u8(out),
                                (const uint16_t *)w_dev,
                                (const float *)tensor_u8_const(x),
                                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         } else {
             hipLaunchKernelGGL(rocm_matmul_f16_tile_4x8_kernel,
-                               grid, block, 0, 0,
+                               grid, block, 0, g_stream,
                                (float *)tensor_u8(out),
                                (const uint16_t *)w_dev,
                                (const float *)tensor_u8_const(x),
@@ -1976,6 +2182,13 @@ int ds4_metal_matmul_f16_tensor(
         }
         ok = rocm_launch_done("F16 matmul tile launch", "F16 matmul tile completion");
     } else {
+        /* n_tok==1 decode path. The wave-per-row F16 attempt (2026-05-09) was
+         * a regression because each lane only processed 1 element/iteration —
+         * loop overhead dominated. The LDS kernel below uses 256 threads/row
+         * so each thread only does in_dim/256 iterations, amortizing overhead.
+         * Returning to it; needs replacement with a wave-per-row+unroll-by-N
+         * kernel that loads N consecutive F16 elements per lane per iteration
+         * to match the Q8_0 arithmetic intensity. See tsk-33 follow-up. */
         unsigned threads = 256;
         while (threads > 1 && threads / 2 >= in_dim) threads >>= 1;
         const dim3 block(threads);
@@ -1984,7 +2197,7 @@ int ds4_metal_matmul_f16_tensor(
                            grid,
                            block,
                            threads * sizeof(float),
-                           0,
+                           g_stream,
                            (float *)tensor_u8(out),
                            (const uint16_t *)w_dev,
                            (const float *)tensor_u8_const(x),
@@ -1993,6 +2206,21 @@ int ds4_metal_matmul_f16_tensor(
         ok = rocm_launch_done("F16 matmul launch", "F16 matmul completion");
     }
     rocm_defer_free(w_host);
+    if (audit) {
+        struct timespec audit_t1;
+        clock_gettime(CLOCK_MONOTONIC, &audit_t1);
+        const double dt_us = (audit_t1.tv_sec - audit_t0.tv_sec) * 1e6
+                           + (audit_t1.tv_nsec - audit_t0.tv_nsec) / 1e3;
+        const uint64_t aw_bytes = in_dim * out_dim * sizeof(uint16_t);
+        const uint64_t ax_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t ao_bytes = n_tok * out_dim * sizeof(float);
+        const uint64_t bytes = aw_bytes + ax_bytes + ao_bytes;
+        fprintf(stderr,
+                "F16_AUDIT in=%u out=%u n_tok=%u t_us=%.2f w_b=%llu x_b=%llu o_b=%llu tot_b=%llu\n",
+                (unsigned)in_dim, (unsigned)out_dim, (unsigned)n_tok, dt_us,
+                (unsigned long long)aw_bytes, (unsigned long long)ax_bytes,
+                (unsigned long long)ao_bytes, (unsigned long long)bytes);
+    }
     return ok;
 }
 
@@ -2049,7 +2277,7 @@ int ds4_metal_matmul_f32_tensor(
                        grid,
                        block,
                        threads * sizeof(float),
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)w_dev,
                        (const float *)tensor_u8_const(x),
@@ -2058,6 +2286,15 @@ int ds4_metal_matmul_f32_tensor(
     int ok = rocm_launch_done("F32 matmul launch", "F32 matmul completion");
     rocm_defer_free(w_host);
     return ok;
+}
+
+static int rocm_q8_audit_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROCM_AUDIT_Q8_0");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
 }
 
 int ds4_metal_matmul_q8_0_tensor(
@@ -2071,6 +2308,9 @@ int ds4_metal_matmul_q8_0_tensor(
         uint64_t                n_tok) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_matmul_q8_0_tensor");
+    const int audit = rocm_q8_audit_enabled();
+    struct timespec audit_t0;
+    if (audit) clock_gettime(CLOCK_MONOTONIC, &audit_t0);
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (!out || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -2114,14 +2354,14 @@ int ds4_metal_matmul_q8_0_tensor(
             const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows), 1u);
             if (nrows == 8u) {
                 hipLaunchKernelGGL(rocm_matmul_q8_0_wave_8_kernel,
-                                   grid, block, 0, 0,
+                                   grid, block, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)w_dev,
                                    (const float *)tensor_u8_const(x),
                                    (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
             } else {
                 hipLaunchKernelGGL(rocm_matmul_q8_0_wave_4_kernel,
-                                   grid, block, 0, 0,
+                                   grid, block, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)w_dev,
                                    (const float *)tensor_u8_const(x),
@@ -2162,7 +2402,7 @@ int ds4_metal_matmul_q8_0_tensor(
                     const dim3 mq_block(32u);
                     const dim3 mq_grid(blocks_per_row, (unsigned)n_tok);
                     hipLaunchKernelGGL(rocm_activation_microquant_q8_kernel,
-                                       mq_grid, mq_block, 0, 0,
+                                       mq_grid, mq_block, 0, g_stream,
                                        g_act_q8_scratch,
                                        (const float *)tensor_u8_const(x),
                                        (uint32_t)in_dim, (uint32_t)n_tok);
@@ -2170,7 +2410,7 @@ int ds4_metal_matmul_q8_0_tensor(
                     const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
                                      (unsigned)((n_tok   + 15u) / 16u));
                     hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_i8_kernel,
-                                       wgrid, wblock, 0, 0,
+                                       wgrid, wblock, 0, g_stream,
                                        (float *)tensor_u8(out),
                                        (const uint8_t *)w_dev,
                                        g_act_q8_scratch,
@@ -2187,7 +2427,7 @@ int ds4_metal_matmul_q8_0_tensor(
                 const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
                                  (unsigned)((n_tok   + 15u) / 16u));
                 hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_kernel,
-                                   wgrid, wblock, 0, 0,
+                                   wgrid, wblock, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)w_dev,
                                    (const float *)tensor_u8_const(x),
@@ -2200,7 +2440,7 @@ int ds4_metal_matmul_q8_0_tensor(
                             (unsigned)((n_tok + ntok - 1u) / ntok));
             if (nrows == 8u) {
                 hipLaunchKernelGGL(rocm_matmul_q8_0_tile_8x8_kernel,
-                                   grid, block, 0, 0,
+                                   grid, block, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)w_dev,
                                    (const float *)tensor_u8_const(x),
@@ -2208,7 +2448,7 @@ int ds4_metal_matmul_q8_0_tensor(
                                    (uint32_t)n_tok, row_bytes);
             } else {
                 hipLaunchKernelGGL(rocm_matmul_q8_0_tile_4x8_kernel,
-                                   grid, block, 0, 0,
+                                   grid, block, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)w_dev,
                                    (const float *)tensor_u8_const(x),
@@ -2222,7 +2462,7 @@ int ds4_metal_matmul_q8_0_tensor(
         const dim3 block(256);
         const dim3 grid((unsigned)out_dim, (unsigned)n_tok);
         hipLaunchKernelGGL(rocm_matmul_q8_0_kernel,
-                           grid, block, block.x * sizeof(float), 0,
+                           grid, block, block.x * sizeof(float), g_stream,
                            (float *)tensor_u8(out),
                            (const uint8_t *)w_dev,
                            (const float *)tensor_u8_const(x),
@@ -2230,6 +2470,21 @@ int ds4_metal_matmul_q8_0_tensor(
         ok = rocm_launch_done("Q8_0 matmul launch", "Q8_0 matmul completion");
     }
     rocm_defer_free(w_host);
+    if (audit) {
+        struct timespec audit_t1;
+        clock_gettime(CLOCK_MONOTONIC, &audit_t1);
+        const double dt_us = (audit_t1.tv_sec - audit_t0.tv_sec) * 1e6
+                           + (audit_t1.tv_nsec - audit_t0.tv_nsec) / 1e3;
+        const uint64_t aw_bytes = ((in_dim + 31u) / 32u) * 34u * out_dim;
+        const uint64_t ax_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t ao_bytes = n_tok * out_dim * sizeof(float);
+        const uint64_t bytes = aw_bytes + ax_bytes + ao_bytes;
+        fprintf(stderr,
+                "Q8_0_AUDIT in=%u out=%u n_tok=%u t_us=%.2f w_b=%llu x_b=%llu o_b=%llu tot_b=%llu\n",
+                (unsigned)in_dim, (unsigned)out_dim, (unsigned)n_tok, dt_us,
+                (unsigned long long)aw_bytes, (unsigned long long)ax_bytes,
+                (unsigned long long)ao_bytes, (unsigned long long)bytes);
+    }
     return ok;
 }
 
@@ -2280,7 +2535,7 @@ int ds4_metal_rms_norm_weight_rows_tensor(
                        grid,
                        block,
                        threads * sizeof(float),
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(x),
                        (const float *)w_dev,
@@ -2401,7 +2656,7 @@ int ds4_metal_hc_split_weighted_sum_norm_tensor(
                        grid,
                        block,
                        (4u + threads) * sizeof(float),
-                       0,
+                       g_stream,
                        (float *)tensor_u8(out),
                        (float *)tensor_u8(norm_out),
                        (float *)tensor_u8(split),
@@ -2454,7 +2709,7 @@ int ds4_metal_rope_tail_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(x),
                        n_tok,
                        n_head,
@@ -2491,7 +2746,7 @@ int ds4_metal_dsv4_fp8_kv_quantize_tensor(
                        grid,
                        block,
                        0,
-                       0,
+                       g_stream,
                        (float *)tensor_u8(x),
                        n_tok,
                        head_dim,
@@ -2544,7 +2799,7 @@ static int rocm_hc_weighted_sum_strided(ds4_metal_tensor       *out,
     const dim3 block(256);
     const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
     hipLaunchKernelGGL(rocm_hc_weighted_sum_kernel,
-                       grid, block, 0, 0,
+                       grid, block, 0, g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(residual_hc),
                        (const float *)(tensor_u8_const(weights) + weight_offset_bytes),
@@ -2682,7 +2937,7 @@ int ds4_metal_hc_split_sinkhorn_tensor(
 
     const dim3 block(64);
     const dim3 grid((unsigned)((rows + block.x - 1u) / block.x));
-    hipLaunchKernelGGL(rocm_hc_split_sinkhorn_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_hc_split_sinkhorn_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(mix),
                        (const float *)sd,
@@ -2763,7 +3018,7 @@ int ds4_metal_output_hc_weights_tensor(
     const uint64_t total = rows * n_hc;
     const dim3 block(256);
     const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
-    hipLaunchKernelGGL(rocm_output_hc_weights_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_output_hc_weights_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(pre),
                        (const float *)sd, (const float *)bd,
@@ -2840,7 +3095,7 @@ static int rocm_hc_expand_dispatch(
     const uint64_t total = (uint64_t)n_embd * n_tokens;
     const dim3 block_d(256);
     const dim3 grid_d((unsigned)((total + block_d.x - 1u) / block_d.x));
-    hipLaunchKernelGGL(rocm_hc_expand4_kernel, grid_d, block_d, 0, 0,
+    hipLaunchKernelGGL(rocm_hc_expand4_kernel, grid_d, block_d, 0, g_stream,
                        (float *)tensor_u8(out_hc),
                        (const float *)tensor_u8_const(block_out),
                        has_add ? (const float *)tensor_u8_const(block_add) : NULL,
@@ -2965,7 +3220,7 @@ int ds4_metal_store_raw_kv_tensor(
     float *raw = (float *)tensor_u8(raw_cache) + (uint64_t)row * head_dim;
     const dim3 block(256);
     const dim3 grid((head_dim + block.x - 1u) / block.x);
-    hipLaunchKernelGGL(rocm_store_raw_kv_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_store_raw_kv_kernel, grid, block, 0, g_stream,
                        raw, (const float *)tensor_u8_const(kv), head_dim);
     return rocm_launch_done("store raw kv launch", "store raw kv completion");
 }
@@ -2986,7 +3241,7 @@ int ds4_metal_store_raw_kv_batch_tensor(
     if (raw_cache->bytes < ((uint64_t)pos0 + n_tokens) * head_dim * sizeof(float)) return 0;
     const dim3 block(256);
     const dim3 grid((head_dim + block.x - 1u) / block.x, n_tokens);
-    hipLaunchKernelGGL(rocm_store_raw_kv_batch_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_store_raw_kv_batch_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(raw_cache),
                        (const float *)tensor_u8_const(kv),
                        head_dim, pos0, n_tokens);
@@ -3042,7 +3297,7 @@ int ds4_metal_kv_fp8_store_raw_tensor(
     if (kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
     if (raw_cache->bytes < ((uint64_t)row + 1u) * head_dim * sizeof(float)) return 0;
     float *raw = (float *)tensor_u8(raw_cache) + (uint64_t)row * head_dim;
-    hipLaunchKernelGGL(rocm_kv_fp8_store_raw_kernel, dim3(1), dim3(64), 0, 0,
+    hipLaunchKernelGGL(rocm_kv_fp8_store_raw_kernel, dim3(1), dim3(64), 0, g_stream,
                        (float *)tensor_u8(kv), raw, head_dim, n_rot);
     return rocm_launch_done("kv fp8 store launch", "kv fp8 store completion");
 }
@@ -3205,7 +3460,7 @@ static int rocm_attention_output_low_q8_dispatch(
         dim3 block(nrows * 32u, 1, 1);
         if (nrows == 8u) {
             hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_8_kernel,
-                               grid, block, 0, 0,
+                               grid, block, 0, g_stream,
                                (float *)tensor_u8(low),
                                (const uint8_t *)w_dev,
                                (const float *)tensor_u8_const(heads),
@@ -3213,7 +3468,7 @@ static int rocm_attention_output_low_q8_dispatch(
                                row_bytes, group_w_bytes);
         } else {
             hipLaunchKernelGGL(rocm_attn_out_low_q8_wave_4_kernel,
-                               grid, block, 0, 0,
+                               grid, block, 0, g_stream,
                                (float *)tensor_u8(low),
                                (const uint8_t *)w_dev,
                                (const float *)tensor_u8_const(heads),
@@ -3228,7 +3483,7 @@ static int rocm_attention_output_low_q8_dispatch(
         dim3 grid((unsigned)rank, (unsigned)n_groups, (unsigned)n_tokens);
         dim3 block(threads, 1, 1);
         hipLaunchKernelGGL(rocm_attn_out_low_q8_fused_kernel,
-                           grid, block, threads * sizeof(float), 0,
+                           grid, block, threads * sizeof(float), g_stream,
                            (float *)tensor_u8(low),
                            (const uint8_t *)w_dev,
                            (const float *)tensor_u8_const(heads),
@@ -3295,6 +3550,164 @@ int ds4_metal_attention_output_q8_batch_tensor(
                                         low_per, out_dim, low, n_tokens);
 }
 
+/* Fused Q8_0 matmul + HC=4 expand for one-token decode.
+ *
+ * One wave (32 lanes) reduces dot(W_row, x) for one output row d (= one of
+ * n_embd=4096 hidden dims). Lane 0 then writes block_out[d] AND immediately
+ * applies the HC-expand split (post[4] + comb[4*4]) against residual_hc[*, d]
+ * to write the four HC rows out_hc[h, d]. Replaces the two-kernel sequence
+ * (matmul_q8_0_wave_8 -> hc_expand4) for the composed wrappers.
+ *
+ * `block_add` provides the second addend for shared_down_hc_expand
+ * (bv = sum + routed_out[d]); pass NULL when HAS_ADD=0.
+ *
+ * The split tensor layout per row is [pre[4] | post[4] | comb[16]] — codex
+ * verified the post = split+4, comb = split+8 offsets. n_tokens=1 only;
+ * fallback path handles other cases. */
+#define ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(NROWS, HAS_ADD) \
+__global__ static void rocm_matmul_q8_0_hc4_expand_##NROWS##_##HAS_ADD##_kernel( \
+        float *out_hc, float *block_out, const float *block_add, \
+        const float *residual_hc, const float *split, \
+        const uint8_t *w, const float *x, \
+        uint32_t in_dim, uint32_t n_embd, uint64_t row_bytes) { \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    const uint32_t d       = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (d >= n_embd) return; \
+    const uint32_t blocks = in_dim >> 5; \
+    const uint8_t *wr = w + (uint64_t)d * row_bytes; \
+    float sum = 0.0f; \
+    for (uint32_t b = lane; b < blocks; b += 32u) { \
+        const uint8_t *blk = wr + (uint64_t)b * 34u; \
+        const uint16_t scale_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8); \
+        const int8_t *qs = (const int8_t *)(blk + 2); \
+        const float *xb = x + ((uint64_t)b << 5); \
+        float dot = 0.0f; \
+        _Pragma("unroll") \
+        for (int j = 0; j < 32; j++) dot += (float)qs[j] * xb[j]; \
+        sum += rocm_f16_to_f32(scale_bits) * dot; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0u) { \
+        block_out[d] = sum; \
+        float bv = sum; \
+        if ((HAS_ADD)) bv += block_add[d]; \
+        const float *post = split + 4u; \
+        const float *comb = split + 8u; \
+        const float r0 = residual_hc[0u * n_embd + d]; \
+        const float r1 = residual_hc[1u * n_embd + d]; \
+        const float r2 = residual_hc[2u * n_embd + d]; \
+        const float r3 = residual_hc[3u * n_embd + d]; \
+        _Pragma("unroll") \
+        for (uint32_t h = 0; h < 4u; h++) { \
+            float acc = bv * post[h]; \
+            acc += comb[h * 4u + 0u] * r0; \
+            acc += comb[h * 4u + 1u] * r1; \
+            acc += comb[h * 4u + 2u] * r2; \
+            acc += comb[h * 4u + 3u] * r3; \
+            out_hc[(uint64_t)h * n_embd + d] = acc; \
+        } \
+    } \
+}
+
+ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(8, 0)
+ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(4, 0)
+ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(8, 1)
+ROCM_DEFINE_MATMUL_Q8_0_HC4_EXPAND(4, 1)
+
+/* Returns 1 on success, 0 if the shape isn't supported by the fused path. */
+static int rocm_matmul_q8_0_hc4_expand_dispatch(
+        ds4_metal_tensor       *out_hc,
+        ds4_metal_tensor       *mat_out,    /* matmul writes here (block_out) */
+        const ds4_metal_tensor *block_add,  /* extra input added to bv (or NULL) */
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        const ds4_metal_tensor *residual_hc,
+        const ds4_metal_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int                     has_add) {
+    if (n_hc != 4u || n_embd == 0u || in_dim == 0u || (in_dim % 32u) != 0u) return 0;
+    if (out_dim != (uint64_t)n_embd) return 0;
+    if (!out_hc || !mat_out || !x || !residual_hc || !split) return 0;
+    if (has_add && !block_add) return 0;
+
+    const uint64_t row_bytes = ((in_dim + 31u) / 32u) * 34u;
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (mat_out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
+    if (out_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float)) return 0;
+    if (residual_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float)) return 0;
+    if (x->bytes < in_dim * sizeof(float)) return 0;
+    /* split row stride is 2*n_hc + n_hc*n_hc = 24 floats; only need the
+     * first row in decode (n_tokens=1). */
+    if (split->bytes < (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float)) return 0;
+    if (has_add && block_add->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
+
+    void *w_host = NULL;
+    void *w_dev = NULL;
+    const void *src = (const uint8_t *)model_map + weight_offset;
+    if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "Q8_0+HC4 weight upload")) return 0;
+
+    const uint32_t nrows = ((n_embd % 8u) == 0u && n_embd >= 256u) ? 8u : 4u;
+    const dim3 block(nrows * 32u);
+    const dim3 grid((unsigned)((n_embd + nrows - 1u) / nrows));
+
+    if (has_add) {
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_hc4_expand_8_1_kernel, grid, block, 0, g_stream,
+                               (float *)tensor_u8(out_hc),
+                               (float *)tensor_u8(mat_out),
+                               (const float *)tensor_u8_const(block_add),
+                               (const float *)tensor_u8_const(residual_hc),
+                               (const float *)tensor_u8_const(split),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, n_embd, row_bytes);
+        } else {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_hc4_expand_4_1_kernel, grid, block, 0, g_stream,
+                               (float *)tensor_u8(out_hc),
+                               (float *)tensor_u8(mat_out),
+                               (const float *)tensor_u8_const(block_add),
+                               (const float *)tensor_u8_const(residual_hc),
+                               (const float *)tensor_u8_const(split),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, n_embd, row_bytes);
+        }
+    } else {
+        if (nrows == 8u) {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_hc4_expand_8_0_kernel, grid, block, 0, g_stream,
+                               (float *)tensor_u8(out_hc),
+                               (float *)tensor_u8(mat_out),
+                               (const float *)NULL,
+                               (const float *)tensor_u8_const(residual_hc),
+                               (const float *)tensor_u8_const(split),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, n_embd, row_bytes);
+        } else {
+            hipLaunchKernelGGL(rocm_matmul_q8_0_hc4_expand_4_0_kernel, grid, block, 0, g_stream,
+                               (float *)tensor_u8(out_hc),
+                               (float *)tensor_u8(mat_out),
+                               (const float *)NULL,
+                               (const float *)tensor_u8_const(residual_hc),
+                               (const float *)tensor_u8_const(split),
+                               (const uint8_t *)w_dev,
+                               (const float *)tensor_u8_const(x),
+                               (uint32_t)in_dim, n_embd, row_bytes);
+        }
+    }
+    int ok = rocm_launch_done("Q8_0+HC4 fused launch", "Q8_0+HC4 fused completion");
+    rocm_defer_free(w_host);
+    return ok;
+}
+
 int ds4_metal_matmul_q8_0_hc_expand_tensor(
         ds4_metal_tensor       *out_hc,
         ds4_metal_tensor       *block_out,
@@ -3310,7 +3723,13 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_matmul_q8_0_hc_expand_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_matmul_q8_0_hc_expand_tensor");
-    /* Compose Q8 matmul (block_out = W . x) with HC expand (split layout). */
+    if (rocm_matmul_q8_0_hc4_expand_dispatch(out_hc, block_out, NULL,
+                                             model_map, model_size, weight_offset,
+                                             in_dim, out_dim, x, residual_hc, split,
+                                             n_embd, n_hc, 0)) {
+        return 1;
+    }
+    /* Fallback: legacy two-kernel path (n_hc != 4, in_dim % 32 != 0, etc.). */
     if (!ds4_metal_matmul_q8_0_tensor(block_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, x, 1)) return 0;
     return ds4_metal_hc_expand_split_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc);
@@ -3332,7 +3751,14 @@ int ds4_metal_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_hc) {
     if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_shared_down_hc_expand_q8_0_tensor\n");
     ROCM_TIME_SCOPE("ds4_metal_shared_down_hc_expand_q8_0_tensor");
-    /* shared_out = W . shared_mid (Q8); then HC expand uses (routed_out + shared_out) as block. */
+    /* Fused: matmul writes to shared_out, expand uses bv = shared_out + routed_out[d]. */
+    if (rocm_matmul_q8_0_hc4_expand_dispatch(out_hc, shared_out, routed_out,
+                                             model_map, model_size, weight_offset,
+                                             in_dim, out_dim, shared_mid, residual_hc, split,
+                                             n_embd, n_hc, 1)) {
+        return 1;
+    }
+    /* Fallback: legacy two-kernel path. */
     if (!ds4_metal_matmul_q8_0_tensor(shared_out, model_map, model_size, weight_offset,
                                       in_dim, out_dim, shared_mid, 1)) return 0;
     return ds4_metal_hc_expand_add_split_tensor(out_hc, routed_out, shared_out, residual_hc,
@@ -3419,7 +3845,7 @@ static int rocm_indexer_scores_dispatch(
     const dim3 block_d(threads);
     const dim3 grid_d(n_comp, n_tokens);
     hipLaunchKernelGGL(rocm_indexer_scores_kernel,
-                       grid_d, block_d, threads * sizeof(float), 0,
+                       grid_d, block_d, threads * sizeof(float), g_stream,
                        (float *)tensor_u8(scores),
                        (const float *)tensor_u8_const(q),
                        (const float *)tensor_u8_const(weights),
@@ -3578,7 +4004,7 @@ int ds4_metal_indexer_topk_tensor(
          * scan below and is essential for greedy decode where n_comp
          * == DS4_N_VOCAB == 129280. */
         hipLaunchKernelGGL(rocm_argmax_kernel, dim3(n_tokens),
-                           dim3(ROCM_ARGMAX_BLOCK), 0, 0,
+                           dim3(ROCM_ARGMAX_BLOCK), 0, g_stream,
                            (int32_t *)tensor_u8(selected),
                            (const float *)tensor_u8_const(scores),
                            n_comp);
@@ -3586,7 +4012,7 @@ int ds4_metal_indexer_topk_tensor(
     }
     /* Note: this O(n_comp * top_k) per-token loop is correct but slow; revisit
      * with a proper bitonic top-k once correctness is validated. */
-    hipLaunchKernelGGL(rocm_indexer_topk_kernel, dim3(n_tokens), dim3(1), 0, 0,
+    hipLaunchKernelGGL(rocm_indexer_topk_kernel, dim3(n_tokens), dim3(1), 0, g_stream,
                        (int32_t *)tensor_u8(selected),
                        (const float *)tensor_u8_const(scores),
                        n_comp, top_k);
@@ -3635,7 +4061,7 @@ int ds4_metal_dsv4_topk_mask_tensor(
         const uint64_t total = (uint64_t)n_comp * n_tokens;
         const dim3 block(256);
         const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
-        hipLaunchKernelGGL(rocm_topk_mask_init_kernel, grid, block, 0, 0,
+        hipLaunchKernelGGL(rocm_topk_mask_init_kernel, grid, block, 0, g_stream,
                            (float *)tensor_u8(mask), n_comp, n_tokens);
         if (!rocm_launch_done("topk mask init launch", "topk mask init completion")) return 0;
     }
@@ -3643,7 +4069,7 @@ int ds4_metal_dsv4_topk_mask_tensor(
         const uint64_t total = (uint64_t)top_k * n_tokens;
         const dim3 block(256);
         const dim3 grid((unsigned)((total + block.x - 1u) / block.x));
-        hipLaunchKernelGGL(rocm_topk_mask_scatter_kernel, grid, block, 0, 0,
+        hipLaunchKernelGGL(rocm_topk_mask_scatter_kernel, grid, block, 0, g_stream,
                            (float *)tensor_u8(mask), (const int32_t *)tensor_u8_const(topk),
                            n_comp, n_tokens, top_k);
         return rocm_launch_done("topk mask scatter launch", "topk mask scatter completion");
@@ -3728,6 +4154,198 @@ __global__ static void rocm_router_select_batch_kernel(int32_t *selected,
     for (uint32_t i = 0; i < n_used; i++) w_t[i] = probs_t[sel_t[i]] / sum * 1.5f;
 }
 
+/* Wave32 argmax: tournament reduction. Tie-break: lower index wins (matches
+ * the serial select kernel's `>` comparison, which preserves first occurrence).
+ * After the call, lane 0 holds (max value, lowest matching index). */
+static __device__ __forceinline__ void rocm_wave32_argmax(float *v, int *idx) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down(*v, off);
+        int   oi = __shfl_down(*idx, off);
+        const bool take_other =
+            (ov > *v) ||
+            (ov == *v && oi >= 0 && (*idx < 0 || oi < *idx));
+        if (take_other) { *v = ov; *idx = oi; }
+    }
+}
+
+/* Fused softplus+select for one-token decode. One block of 256 threads:
+ *   thread e (e < n_expert) computes probs[e] = sqrt(softplus(logits[e]))
+ *   then top-k via wave32 argmax shuffles + 8-entry shared wave summary.
+ * Replaces the 2-kernel sequence (softplus_sqrt + serial select-on-1-thread)
+ * that was 244 us/call in DS4_ROCM_SYNC_EACH=1 mode. */
+__global__ static void rocm_router_softplus_select_one_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const float *logits,
+        const float *bias,
+        const int32_t *hash,
+        uint32_t n_expert,
+        uint32_t n_used,
+        uint32_t hash_rows,
+        uint32_t token,
+        int has_bias,
+        int hash_mode) {
+    __shared__ int32_t sh_sel[8];
+    __shared__ float   wave_v[8];
+    __shared__ int     wave_i[8];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid  = tid >> 5;
+
+    /* probs := sqrt(softplus(logits)) using the stable
+     * softplus(z) = max(z,0) + log1p(exp(-|z|)) identity, so we don't blow up
+     * for large positive z (matches the original >20.0 short-circuit). */
+    float p     = 0.0f;
+    float score = -3.4028234663852886e38f;
+    if (tid < n_expert) {
+        const float z  = logits[tid];
+        const float sp = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+        p = sqrtf(sp > 0.0f ? sp : 0.0f);
+        probs[tid] = p;
+        score = has_bias ? p + bias[tid] : p;
+    }
+    __syncthreads();
+
+    if (hash_mode) {
+        if (tid < n_used) {
+            const uint32_t row = token < hash_rows ? token : hash_rows - 1u;
+            const int32_t idx = hash[(uint64_t)row * n_used + tid];
+            sh_sel[tid] = idx;
+            selected[tid] = idx;
+        }
+        __syncthreads();
+    } else {
+        for (uint32_t k = 0; k < n_used; k++) {
+            float v = score;
+            int   idx = (tid < n_expert) ? (int)tid : -1;
+            /* Mask out previously-selected experts (n_used <= 8 by construction). */
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                if (kk < k && idx == sh_sel[kk]) {
+                    v = -3.4028234663852886e38f;
+                    idx = -1;
+                }
+            }
+            rocm_wave32_argmax(&v, &idx);
+            if (lane == 0u) {
+                wave_v[wid] = v;
+                wave_i[wid] = idx;
+            }
+            __syncthreads();
+            if (wid == 0u) {
+                float bv = lane < 8u ? wave_v[lane] : -3.4028234663852886e38f;
+                int   bi = lane < 8u ? wave_i[lane] : -1;
+                rocm_wave32_argmax(&bv, &bi);
+                if (lane == 0u) {
+                    sh_sel[k] = bi;
+                    selected[k] = bi;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0u) {
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_used; i++) sum += probs[sh_sel[i]];
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint32_t i = 0; i < n_used; i++) {
+            weights[i] = probs[sh_sel[i]] / sum * 1.5f;
+        }
+    }
+}
+
+/* Batched variant: one block per token. Grid = n_tokens, block = 256. */
+__global__ static void rocm_router_softplus_select_batch_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const float *logits,
+        const float *bias,
+        const int32_t *hash,
+        const int32_t *tokens,
+        uint32_t n_expert,
+        uint32_t n_used,
+        uint32_t hash_rows,
+        int has_bias,
+        int hash_mode) {
+    __shared__ int32_t sh_sel[8];
+    __shared__ float   wave_v[8];
+    __shared__ int     wave_i[8];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid  = tid >> 5;
+    const uint32_t t    = blockIdx.x;
+
+    int32_t *sel_t       = selected + (uint64_t)t * n_used;
+    float   *w_t         = weights  + (uint64_t)t * n_used;
+    float   *probs_t     = probs    + (uint64_t)t * n_expert;
+    const float *logits_t = logits  + (uint64_t)t * n_expert;
+    const uint32_t token  = (uint32_t)tokens[t];
+
+    float p     = 0.0f;
+    float score = -3.4028234663852886e38f;
+    if (tid < n_expert) {
+        const float z  = logits_t[tid];
+        const float sp = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+        p = sqrtf(sp > 0.0f ? sp : 0.0f);
+        probs_t[tid] = p;
+        score = has_bias ? p + bias[tid] : p;
+    }
+    __syncthreads();
+
+    if (hash_mode) {
+        if (tid < n_used) {
+            const uint32_t row = token < hash_rows ? token : hash_rows - 1u;
+            const int32_t idx = hash[(uint64_t)row * n_used + tid];
+            sh_sel[tid] = idx;
+            sel_t[tid] = idx;
+        }
+        __syncthreads();
+    } else {
+        for (uint32_t k = 0; k < n_used; k++) {
+            float v = score;
+            int   idx = (tid < n_expert) ? (int)tid : -1;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                if (kk < k && idx == sh_sel[kk]) {
+                    v = -3.4028234663852886e38f;
+                    idx = -1;
+                }
+            }
+            rocm_wave32_argmax(&v, &idx);
+            if (lane == 0u) {
+                wave_v[wid] = v;
+                wave_i[wid] = idx;
+            }
+            __syncthreads();
+            if (wid == 0u) {
+                float bv = lane < 8u ? wave_v[lane] : -3.4028234663852886e38f;
+                int   bi = lane < 8u ? wave_i[lane] : -1;
+                rocm_wave32_argmax(&bv, &bi);
+                if (lane == 0u) {
+                    sh_sel[k] = bi;
+                    sel_t[k] = bi;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0u) {
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_used; i++) sum += probs_t[sh_sel[i]];
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint32_t i = 0; i < n_used; i++) {
+            w_t[i] = probs_t[sh_sel[i]] / sum * 1.5f;
+        }
+    }
+}
+
 __global__ static void rocm_router_select_one_kernel(int32_t *selected,
                                                      float *weights,
                                                      const float *probs,
@@ -3794,22 +4412,6 @@ int ds4_metal_router_select_tensor(
     if (weights->bytes < (uint64_t)n_group_used * sizeof(float)) return 0;
     if (probs->bytes < (uint64_t)n_expert_groups * sizeof(float)) return 0;
 
-    /* probs := sqrt(softplus(logits)) on the GPU.  Done as a launched
-     * kernel rather than a CPU loop so we don't force a stream drain in
-     * batched mode (router_select fires ~6 times per layer; a CPU drain
-     * each time was 99% of inference wall in DS4_ROCM_TIME profiles). */
-    {
-        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
-        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
-        hipLaunchKernelGGL(rocm_router_softplus_sqrt_kernel,
-                           dim3(blocks), dim3(threads), 0, 0,
-                           (float *)tensor_u8(probs),
-                           (const float *)tensor_u8_const(logits),
-                           n_expert_groups);
-        if (!rocm_launch_done("router softplus_sqrt launch",
-                              "router softplus_sqrt completion")) return 0;
-    }
-
     void *bh = NULL, *bd = NULL;
     void *hh = NULL, *hd = NULL;
     if (has_bias) {
@@ -3821,23 +4423,57 @@ int ds4_metal_router_select_tensor(
     if (hash_mode) {
         const uint64_t hash_bytes = (uint64_t)hash_rows * n_group_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) {
-            if (bh) (void)hipHostFree(bh); return 0;
+            rocm_defer_free(bh); return 0;
         }
         if (!rocm_upload_mapped((const uint8_t *)model_map + hash_offset, hash_bytes,
                                 &hh, &hd, "router hash upload")) {
-            if (bh) (void)hipHostFree(bh); return 0;
+            rocm_defer_free(bh); return 0;
         }
     }
 
-    hipLaunchKernelGGL(rocm_router_select_one_kernel, dim3(1), dim3(1), 0, 0,
-                       (int32_t *)tensor_u8(selected),
-                       (float *)tensor_u8(weights),
-                       (const float *)tensor_u8_const(probs),
-                       (const float *)bd,
-                       (const int32_t *)hd,
-                       n_expert_groups, n_group_used, hash_rows, token,
-                       has_bias ? 1 : 0, hash_mode ? 1 : 0);
-    int ok = rocm_launch_done("router select launch", "router select completion");
+    int ok;
+    if (n_expert_groups <= 256u && n_group_used <= 8u) {
+        /* Fused softplus + parallel top-k in a single 256-thread block.
+         * Replaces the two-kernel sequence (softplus_sqrt parallel +
+         * select-on-1-thread serial) that was 244 us/call in SYNC_EACH. */
+        hipLaunchKernelGGL(rocm_router_softplus_select_one_kernel,
+                           dim3(1), dim3(256), 0, g_stream,
+                           (int32_t *)tensor_u8(selected),
+                           (float *)tensor_u8(weights),
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           (const float *)bd,
+                           (const int32_t *)hd,
+                           n_expert_groups, n_group_used, hash_rows, token,
+                           has_bias ? 1 : 0, hash_mode ? 1 : 0);
+        ok = rocm_launch_done("router softplus_select launch",
+                              "router softplus_select completion");
+    } else {
+        /* Fallback: legacy two-kernel path, preserved for n_expert > 256
+         * or n_used > 8 (no current call site exercises this branch). */
+        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
+        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
+        hipLaunchKernelGGL(rocm_router_softplus_sqrt_kernel,
+                           dim3(blocks), dim3(threads), 0, g_stream,
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           n_expert_groups);
+        if (!rocm_launch_done("router softplus_sqrt launch",
+                              "router softplus_sqrt completion")) {
+            rocm_defer_free(bh);
+            rocm_defer_free(hh);
+            return 0;
+        }
+        hipLaunchKernelGGL(rocm_router_select_one_kernel, dim3(1), dim3(1), 0, g_stream,
+                           (int32_t *)tensor_u8(selected),
+                           (float *)tensor_u8(weights),
+                           (const float *)tensor_u8_const(probs),
+                           (const float *)bd,
+                           (const int32_t *)hd,
+                           n_expert_groups, n_group_used, hash_rows, token,
+                           has_bias ? 1 : 0, hash_mode ? 1 : 0);
+        ok = rocm_launch_done("router select launch", "router select completion");
+    }
     rocm_defer_free(bh);
     rocm_defer_free(hh);
     return ok;
@@ -3871,20 +4507,6 @@ int ds4_metal_router_select_batch_tensor(
     if (logits->bytes   < (uint64_t)n_tokens * n_expert_groups * sizeof(float))return 0;
     if (tokens->bytes   < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
 
-    /* Batched probs := sqrt(softplus(logits)) over (n_expert × n_tokens). */
-    {
-        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
-        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
-        const dim3 grid(blocks, n_tokens);
-        const dim3 block(threads);
-        hipLaunchKernelGGL(rocm_router_softplus_sqrt_batch_kernel, grid, block, 0, 0,
-                           (float *)tensor_u8(probs),
-                           (const float *)tensor_u8_const(logits),
-                           n_expert_groups, n_tokens);
-        if (!rocm_launch_done("router softplus_sqrt batch launch",
-                              "router softplus_sqrt batch completion")) return 0;
-    }
-
     void *bh = NULL, *bd = NULL;
     void *hh = NULL, *hd = NULL;
     if (has_bias) {
@@ -3905,16 +4527,48 @@ int ds4_metal_router_select_batch_tensor(
         }
     }
 
-    hipLaunchKernelGGL(rocm_router_select_batch_kernel, dim3(n_tokens), dim3(1), 0, 0,
-                       (int32_t *)tensor_u8(selected),
-                       (float *)tensor_u8(weights),
-                       (const float *)tensor_u8_const(probs),
-                       (const float *)bd,
-                       (const int32_t *)hd,
-                       (const int32_t *)tensor_u8_const(tokens),
-                       n_expert_groups, n_group_used, hash_rows,
-                       has_bias ? 1 : 0, hash_mode ? 1 : 0);
-    int ok = rocm_launch_done("router select batch launch", "router select batch completion");
+    int ok;
+    if (n_expert_groups <= 256u && n_group_used <= 8u) {
+        /* Fused softplus + parallel top-k, one block per token. */
+        hipLaunchKernelGGL(rocm_router_softplus_select_batch_kernel,
+                           dim3(n_tokens), dim3(256), 0, g_stream,
+                           (int32_t *)tensor_u8(selected),
+                           (float *)tensor_u8(weights),
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           (const float *)bd,
+                           (const int32_t *)hd,
+                           (const int32_t *)tensor_u8_const(tokens),
+                           n_expert_groups, n_group_used, hash_rows,
+                           has_bias ? 1 : 0, hash_mode ? 1 : 0);
+        ok = rocm_launch_done("router softplus_select batch launch",
+                              "router softplus_select batch completion");
+    } else {
+        const uint32_t threads = 64u < n_expert_groups ? 64u : n_expert_groups;
+        const uint32_t blocks = (n_expert_groups + threads - 1u) / threads;
+        const dim3 grid(blocks, n_tokens);
+        const dim3 block(threads);
+        hipLaunchKernelGGL(rocm_router_softplus_sqrt_batch_kernel, grid, block, 0, g_stream,
+                           (float *)tensor_u8(probs),
+                           (const float *)tensor_u8_const(logits),
+                           n_expert_groups, n_tokens);
+        if (!rocm_launch_done("router softplus_sqrt batch launch",
+                              "router softplus_sqrt batch completion")) {
+            rocm_defer_free(bh);
+            rocm_defer_free(hh);
+            return 0;
+        }
+        hipLaunchKernelGGL(rocm_router_select_batch_kernel, dim3(n_tokens), dim3(1), 0, g_stream,
+                           (int32_t *)tensor_u8(selected),
+                           (float *)tensor_u8(weights),
+                           (const float *)tensor_u8_const(probs),
+                           (const float *)bd,
+                           (const int32_t *)hd,
+                           (const int32_t *)tensor_u8_const(tokens),
+                           n_expert_groups, n_group_used, hash_rows,
+                           has_bias ? 1 : 0, hash_mode ? 1 : 0);
+        ok = rocm_launch_done("router select batch launch", "router select batch completion");
+    }
     rocm_defer_free(bh);
     rocm_defer_free(hh);
     return ok;
@@ -4014,7 +4668,7 @@ int ds4_metal_compressor_store_batch_tensor(
     dim3 grid(state_rows, lane_blocks, 1);
     dim3 block(threads, 1, 1);
 
-    hipLaunchKernelGGL(rocm_compressor_store_batch_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_compressor_store_batch_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(state_kv),
                        (float *)tensor_u8(state_score),
                        (const float *)tensor_u8_const(kv),
@@ -4098,7 +4752,7 @@ static int rocm_compressor_pool_dispatch(ds4_metal_tensor *out,
     const uint32_t coff = (ratio == 4u) ? 2u : 1u;
     const uint32_t threads = head_dim < 256u ? head_dim : 256u;
     const uint32_t blocks = (head_dim + threads - 1u) / threads;
-    hipLaunchKernelGGL(rocm_compressor_pool_kernel, dim3(blocks), dim3(threads), 0, 0,
+    hipLaunchKernelGGL(rocm_compressor_pool_kernel, dim3(blocks), dim3(threads), 0, g_stream,
                        (float *)tensor_u8(out),
                        (const float *)tensor_u8_const(state_kv),
                        (const float *)tensor_u8_const(state_score),
@@ -4112,7 +4766,7 @@ static int rocm_compressor_ratio4_shift_dispatch(ds4_metal_tensor *state_kv,
     const uint32_t n = 4u * width;
     const uint32_t threads = n < 256u ? n : 256u;
     const uint32_t blocks = (n + threads - 1u) / threads;
-    hipLaunchKernelGGL(rocm_compressor_ratio4_shift_kernel, dim3(blocks), dim3(threads), 0, 0,
+    hipLaunchKernelGGL(rocm_compressor_ratio4_shift_kernel, dim3(blocks), dim3(threads), 0, g_stream,
                        (float *)tensor_u8(state_kv),
                        (float *)tensor_u8(state_score),
                        width);
@@ -4198,7 +4852,7 @@ static int rocm_fill_f32_dispatch(void *p, float v, uint64_t n) {
     if (n == 0) return 1;
     const uint64_t threads = 256;
     const uint64_t blocks = (n + threads - 1) / threads;
-    hipLaunchKernelGGL(rocm_fill_f32_kernel, dim3((uint32_t)blocks), dim3((uint32_t)threads), 0, 0,
+    hipLaunchKernelGGL(rocm_fill_f32_kernel, dim3((uint32_t)blocks), dim3((uint32_t)threads), 0, g_stream,
                        (float *)p, v, n);
     return rocm_launch_done("fill f32 launch", "fill f32 completion");
 }
@@ -4356,7 +5010,7 @@ int ds4_metal_compressor_prefill_state_ratio4_tensor(
     const uint32_t lane_blocks = (width + threads - 1u) / threads;
     dim3 grid(ratio, lane_blocks, 1);
     dim3 block(threads, 1, 1);
-    hipLaunchKernelGGL(rocm_compressor_prefill_state_ratio4_kernel, grid, block, 0, 0,
+    hipLaunchKernelGGL(rocm_compressor_prefill_state_ratio4_kernel, grid, block, 0, g_stream,
                        (float *)tensor_u8(state_kv),
                        (float *)tensor_u8(state_score),
                        (const float *)tensor_u8_const(kv_tail),
@@ -4551,7 +5205,7 @@ int ds4_metal_attention_decode_heads_tensor(
     const uint32_t n_kv = n_raw + n_comp;
     const uint64_t smem_bytes = ((uint64_t)n_kv + threads) * sizeof(float);
     hipLaunchKernelGGL(rocm_attn_decode_heads_kernel, dim3(n_head), dim3(threads),
-                       (uint32_t)smem_bytes, 0,
+                       (uint32_t)smem_bytes, g_stream,
                        (float *)tensor_u8(heads),
                        (const float *)tensor_u8_const(q),
                        (const float *)tensor_u8_const(raw_kv),
@@ -4663,7 +5317,7 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
     dim3 grid(n_tokens, n_head, 1);
     dim3 block(threads, 1, 1);
     hipLaunchKernelGGL(rocm_attn_prefill_raw_heads_kernel, grid, block,
-                       (uint32_t)smem_bytes, 0,
+                       (uint32_t)smem_bytes, g_stream,
                        (float *)tensor_u8(heads),
                        (const float *)tensor_u8_const(q),
                        (const float *)tensor_u8_const(raw_kv),
@@ -5049,7 +5703,7 @@ static int rocm_attn_batch_dispatch(
         const uint64_t smem_bytes = (uint64_t)(BR + 1u) * head_dim * sizeof(float);
         dim3 grid((n_tokens + BR - 1u) / BR, n_head, 1);
         dim3 block(threads, 1, 1);
-        hipLaunchKernelGGL(rocm_attn_fa_kernel, grid, block, (uint32_t)smem_bytes, 0,
+        hipLaunchKernelGGL(rocm_attn_fa_kernel, grid, block, (uint32_t)smem_bytes, g_stream,
                            (float *)tensor_u8(heads),
                            (const float *)tensor_u8_const(q),
                            (const float *)tensor_u8_const(raw_kv),
@@ -5064,7 +5718,7 @@ static int rocm_attn_batch_dispatch(
         const uint64_t smem_bytes = ((uint64_t)n_keys + threads) * sizeof(float);
         dim3 grid(n_tokens, n_head, 1);
         dim3 block(threads, 1, 1);
-        hipLaunchKernelGGL(rocm_attn_batch_kernel, grid, block, (uint32_t)smem_bytes, 0,
+        hipLaunchKernelGGL(rocm_attn_batch_kernel, grid, block, (uint32_t)smem_bytes, g_stream,
                            (float *)tensor_u8(heads),
                            (const float *)tensor_u8_const(q),
                            (const float *)tensor_u8_const(raw_kv),
@@ -6281,7 +6935,7 @@ static int rocm_moe_run(
 
             hipLaunchKernelGGL(rocm_moe_group_pairs_kernel,
                                dim3(1u), dim3(sched_block),
-                               (uint32_t)sched_smem, 0,
+                               (uint32_t)sched_smem, g_stream,
                                sched_n_unique, sched_expert_ids, sched_expert_pair_off,
                                sched_pair_token, sched_pair_slot, sched_pair_weight,
                                (const int32_t *)tensor_u8_const(selected),
@@ -6299,7 +6953,7 @@ static int rocm_moe_run(
             if (em_ok && n_unique > 0u) {
                 dim3 gu_grid(n_unique, em_gu_row_blocks, 1);
                 dim3 gu_block(em_nrows * 32u, 1, 1);
-                hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_em_n8_c4_kernel, gu_grid, gu_block, 0, 0,
+                hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_em_n8_c4_kernel, gu_grid, gu_block, 0, g_stream,
                                    (float *)tensor_u8(mid),
                                    (const uint8_t *)gate_d,
                                    (const uint8_t *)up_d,
@@ -6312,12 +6966,12 @@ static int rocm_moe_run(
                 em_ok = rocm_launch_done("moe em gate_up launch", "moe em gate_up completion");
             }
             if (em_ok) {
-                em_ok = (hipMemsetAsync(tensor_u8(out), 0, em_out_bytes, 0) == hipSuccess);
+                em_ok = (hipMemsetAsync(tensor_u8(out), 0, em_out_bytes, g_stream) == hipSuccess);
             }
             if (em_ok && n_unique > 0u) {
                 dim3 dn_grid(n_unique, em_dn_row_blocks, 1);
                 dim3 dn_block(em_nrows * 32u, 1, 1);
-                hipLaunchKernelGGL(rocm_moe_down_q2k_em_n8_c4_kernel, dn_grid, dn_block, 0, 0,
+                hipLaunchKernelGGL(rocm_moe_down_q2k_em_n8_c4_kernel, dn_grid, dn_block, 0, g_stream,
                                    (float *)tensor_u8(out),
                                    (const uint8_t *)down_d,
                                    down_expert_bytes, down_row_bytes,
@@ -6344,7 +6998,7 @@ static int rocm_moe_run(
         const uint32_t row_blocks = (expert_mid_dim + nrows - 1) / nrows;
         dim3 grid(n_used, row_blocks, n_tokens);
         dim3 block(nrows * 32u, 1, 1);
-        hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wave_n8_kernel, grid, block, 0, 0,
+        hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wave_n8_kernel, grid, block, 0, g_stream,
                            (float *)tensor_u8(mid),
                            (const uint8_t *)gate_d,
                            (const uint8_t *)up_d,
@@ -6360,7 +7014,7 @@ static int rocm_moe_run(
         const uint32_t row_blocks = (expert_mid_dim + threads - 1) / threads;
         dim3 grid(n_used, row_blocks, n_tokens);
         dim3 block(threads, 1, 1);
-        hipLaunchKernelGGL(rocm_moe_gate_up_matvec_kernel, grid, block, 0, 0,
+        hipLaunchKernelGGL(rocm_moe_gate_up_matvec_kernel, grid, block, 0, g_stream,
                            (float *)tensor_u8(mid),
                            (const uint8_t *)gate_d,
                            (const uint8_t *)up_d,
@@ -6381,7 +7035,7 @@ static int rocm_moe_run(
             const uint32_t row_blocks = (out_dim + nrows - 1) / nrows;
             dim3 grid(row_blocks, n_tokens, 1);
             dim3 block(nrows * 32u, 1, 1);
-            hipLaunchKernelGGL(rocm_moe_down_q2k_wave_n8_kernel, grid, block, 0, 0,
+            hipLaunchKernelGGL(rocm_moe_down_q2k_wave_n8_kernel, grid, block, 0, g_stream,
                                (float *)tensor_u8(out),
                                (const uint8_t *)down_d,
                                down_expert_bytes, down_row_bytes,
@@ -6394,7 +7048,7 @@ static int rocm_moe_run(
             const uint32_t row_blocks = (out_dim + threads - 1) / threads;
             dim3 grid(row_blocks, n_tokens, 1);
             dim3 block(threads, 1, 1);
-            hipLaunchKernelGGL(rocm_moe_down_matvec_kernel, grid, block, 0, 0,
+            hipLaunchKernelGGL(rocm_moe_down_matvec_kernel, grid, block, 0, g_stream,
                                (float *)tensor_u8(out),
                                (const uint8_t *)down_d,
                                down_type,

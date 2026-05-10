@@ -34,6 +34,26 @@ int ds4_metal_flush_commands(void);
 int ds4_metal_end_commands(void);
 int ds4_metal_synchronize(void);
 
+/* Backend-graph capture (HIP Graph on ROCm; no-op on Metal).
+ *
+ * Usage:
+ *   begin_capture() — route subsequent kernel launches to a capture stream.
+ *   ... enqueue the same wrappers you would normally call between
+ *       begin_commands/end_commands ...
+ *   end_capture()   — close capture, instantiate an executable graph.
+ *   replay_graph()  — launch the previously instantiated graph + sync.
+ *
+ * Caller is responsible for ensuring the captured kernel sequence is
+ * topology-stable across replays (no per-call kernel arg variation).
+ * Returns 0 if the backend does not support graph capture or if an error
+ * occurs; in that case callers should fall back to begin/end_commands.
+ */
+int ds4_metal_capture_supported(void);
+int ds4_metal_begin_capture(void);
+int ds4_metal_end_capture(void);
+int ds4_metal_replay_graph(void);
+void ds4_metal_destroy_capture(void);
+
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 void ds4_metal_set_quality(bool quality);

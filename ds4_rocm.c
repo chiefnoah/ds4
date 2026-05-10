@@ -678,8 +678,15 @@ __global__ static void rocm_matmul_q8_0_wmma_kernel(
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
         uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t r0   = blockIdx.x * 16u;       /* output-row tile origin */
-    const uint32_t t0   = blockIdx.y * 16u;       /* token tile origin */
+    /* Grid is launched with X = token tile, Y = row tile so consecutive
+     * blocks share the same weight tile (Infinity-Cache-friendly).  See
+     * project_strix_halo_bw_ceiling.md: with 32 MB Infinity Cache, this
+     * keeps each row tile's ~139 KB weight slab hot across all 16 token
+     * tiles before moving to the next row tile.  Y-major was the old
+     * default and cycled 35 MB of weights between reuses, blowing the
+     * cache on the (8192,4096,245) shape. */
+    const uint32_t t0   = blockIdx.x * 16u;       /* token tile origin */
+    const uint32_t r0   = blockIdx.y * 16u;       /* output-row tile origin */
     if (r0 >= out_dim || t0 >= n_tok) return;
 
     const uint32_t row_in_tile = lane & 15u;       /* A-row index */
@@ -942,8 +949,10 @@ __global__ static void rocm_matmul_f16_wmma_kernel(
         float *out, const uint16_t *w, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t r0   = blockIdx.x * 16u;
-    const uint32_t t0   = blockIdx.y * 16u;
+    /* X=token tile, Y=row tile: Infinity-Cache-friendly launch order — see
+     * project_strix_halo_bw_ceiling.md. */
+    const uint32_t t0   = blockIdx.x * 16u;
+    const uint32_t r0   = blockIdx.y * 16u;
     if (r0 >= out_dim || t0 >= n_tok) return;
 
     const uint32_t row_in_tile = lane & 15u;
@@ -2263,8 +2272,9 @@ int ds4_metal_matmul_f16_tensor(
                             && n_tok   >= 16u;
         if (wmma_ok) {
             const dim3 wblock(32u);
-            const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
-                             (unsigned)((n_tok   + 15u) / 16u));
+            /* X=token, Y=row tile — see kernel comment. */
+            const dim3 wgrid((unsigned)((n_tok   + 15u) / 16u),
+                             (unsigned)((out_dim + 15u) / 16u));
             hipLaunchKernelGGL(rocm_matmul_f16_wmma_kernel,
                                wgrid, wblock, 0, g_stream,
                                (float *)tensor_u8(out),
@@ -2644,8 +2654,12 @@ int ds4_metal_matmul_q8_0_tensor(
             }
             if (!dispatched_wmma_i8 && wmma_ok) {
                 const dim3 wblock(32u);
-                const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
-                                 (unsigned)((n_tok   + 15u) / 16u));
+                /* X=token, Y=row tile: HIP launches X-major, so all 16
+                 * token tiles for one row tile run before moving to the
+                 * next row — keeps the row-tile weight slab hot in the
+                 * 32 MB Infinity Cache. */
+                const dim3 wgrid((unsigned)((n_tok   + 15u) / 16u),
+                                 (unsigned)((out_dim + 15u) / 16u));
                 hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_kernel,
                                    wgrid, wblock, 0, g_stream,
                                    (float *)tensor_u8(out),
@@ -3659,8 +3673,11 @@ __global__ static void rocm_attn_out_low_q8_wmma_kernel(
         uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
         uint64_t row_bytes, uint64_t group_w_bytes) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t r0   = blockIdx.x * 16u;
-    const uint32_t t0   = blockIdx.y * 16u;
+    /* X = token tile, Y = rank tile, Z = group: keeps each rank-tile's
+     * weight slab hot in the 32 MB Infinity Cache across all 16 token
+     * tiles before evicting. */
+    const uint32_t t0   = blockIdx.x * 16u;
+    const uint32_t r0   = blockIdx.y * 16u;
     const uint32_t g    = blockIdx.z;
     if (r0 >= rank || t0 >= n_tokens || g >= n_groups) return;
 
@@ -3763,8 +3780,9 @@ static int rocm_attention_output_low_q8_dispatch(
                             && rank     >= 16u;
         if (wmma_ok) {
             const dim3 wblock(32u);
-            const dim3 wgrid((unsigned)((rank     + 15u) / 16u),
-                             (unsigned)((n_tokens + 15u) / 16u),
+            /* X=token, Y=rank tile, Z=group — see kernel comment. */
+            const dim3 wgrid((unsigned)((n_tokens + 15u) / 16u),
+                             (unsigned)((rank     + 15u) / 16u),
                              (unsigned)n_groups);
             hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_kernel,
                                wgrid, wblock, 0, g_stream,

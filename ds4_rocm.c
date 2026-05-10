@@ -7188,6 +7188,138 @@ __global__ static void rocm_moe_gate_up_iq2xxs_wave_n##NROWS##_kernel( \
 
 ROCM_DEFINE_MOE_GATE_UP_IQ2XXS_WAVE(8)
 
+#if 0  /* Disabled: LDS-x activation staging regressed MoE gate_up (49 ms ->
+        * 187 ms per call on the 245-token prefill chunk).  The legacy
+        * kernel is already memory-bound on the IQ2_XXS weight reads (per
+        * memo: MemUnitBusy=93%, 188 GiB/s on a 256 GiB/s bus), so cutting
+        * the 7/8 redundant x re-reads doesn't recover the cost of the
+        * cooperative load + __syncthreads.  Activation traffic is a tiny
+        * slice of the kernel's total DRAM footprint here (2 KB per
+        * 1.08 MB expert read).  Kept as dead code so the design idea is
+        * recorded; do not re-enable without re-measuring on this gen. */
+__global__ static void rocm_moe_gate_up_iq2xxs_wave_n8_lds_kernel(
+        float *mid,
+        const uint8_t *gate_pool,
+        const uint8_t *up_pool,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        const float *x,
+        const int32_t *selected,
+        const float *weights,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint32_t n_tokens,
+        uint32_t n_total_experts,
+        float clamp) {
+    extern __shared__ float x_lds[];
+    const uint32_t slot     = blockIdx.x;
+    const uint32_t row_base = blockIdx.y * 8u;
+    const uint32_t token    = blockIdx.z;
+    if (slot >= n_used || token >= n_tokens) return;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5;
+    const uint32_t row  = row_base + wave;
+    const bool active_row = (row < mid_dim);
+    const int32_t e = selected[(uint64_t)token * n_used + slot];
+    const bool valid_expert = (e >= 0 && (uint32_t)e < n_total_experts);
+
+    /* Cooperative load: all 256 threads share the LDS, each fetching one
+     * uint4 (4 floats) at a time until in_dim floats are staged.  Use
+     * uint4 loads so the wave issues 128-byte coalesced reads. */
+    const uint4 *x_src = (const uint4 *)(x + (uint64_t)token * in_dim);
+    uint4 *x_dst = (uint4 *)x_lds;
+    const uint32_t num_uint4 = in_dim >> 2;
+    for (uint32_t i = tid; i < num_uint4; i += blockDim.x) {
+        x_dst[i] = x_src[i];
+    }
+    __syncthreads();
+
+    if (!valid_expert) {
+        if (active_row && lane == 0)
+            mid[((uint64_t)token * n_used + slot) * mid_dim + row] = 0.0f;
+        return;
+    }
+    if (!active_row) return;
+    const uint32_t nb = in_dim / DS4_QK_K;
+    const uint32_t total_subs = nb * 8u;
+    const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *)
+        (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const rocm_block_iq2_xxs *up_row_p = (const rocm_block_iq2_xxs *)
+        (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)row * up_row_bytes);
+    float gate_v = 0.0f, up_v = 0.0f;
+    for (uint32_t sub = lane; sub < total_subs; sub += 32u) {
+        const uint32_t bi   = sub >> 3;
+        const uint32_t ib32 = sub & 7u;
+        const float *y = x_lds + (uint64_t)sub * 32u;
+        const rocm_block_iq2_xxs *gb = gate_row_p + bi;
+        const rocm_block_iq2_xxs *ub = up_row_p   + bi;
+        const float gd = rocm_f16_to_f32(gb->d);
+        const float ud = rocm_f16_to_f32(ub->d);
+        const uint16_t *gq = gb->qs + ib32 * 4u;
+        const uint16_t *uq = ub->qs + ib32 * 4u;
+        {
+            const uint32_t ag = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16);
+            const uint32_t as = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16);
+            const float dl = gd * (0.5f + (float)(as >> 28)) * 0.25f;
+            const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0));
+            const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8));
+            const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16));
+            const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24));
+            const uint8_t s0 = rocm_ksigns_iq2xs[(as >>  0) & 127u];
+            const uint8_t s1 = rocm_ksigns_iq2xs[(as >>  7) & 127u];
+            const uint8_t s2 = rocm_ksigns_iq2xs[(as >> 14) & 127u];
+            const uint8_t s3 = rocm_ksigns_iq2xs[(as >> 21) & 127u];
+            float sub_acc = 0.0f;
+            for (int j = 0; j < 8; j++) {
+                const float v0 = (float)g0[j] * (((s0 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v1 = (float)g1[j] * (((s1 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v2 = (float)g2[j] * (((s2 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v3 = (float)g3[j] * (((s3 >> j) & 1u) ? -1.0f : 1.0f);
+                sub_acc += y[j +  0] * v0 + y[j +  8] * v1 + y[j + 16] * v2 + y[j + 24] * v3;
+            }
+            gate_v += dl * sub_acc;
+        }
+        {
+            const uint32_t ag = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16);
+            const uint32_t as = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16);
+            const float dl = ud * (0.5f + (float)(as >> 28)) * 0.25f;
+            const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0));
+            const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8));
+            const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16));
+            const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24));
+            const uint8_t s0 = rocm_ksigns_iq2xs[(as >>  0) & 127u];
+            const uint8_t s1 = rocm_ksigns_iq2xs[(as >>  7) & 127u];
+            const uint8_t s2 = rocm_ksigns_iq2xs[(as >> 14) & 127u];
+            const uint8_t s3 = rocm_ksigns_iq2xs[(as >> 21) & 127u];
+            float sub_acc = 0.0f;
+            for (int j = 0; j < 8; j++) {
+                const float v0 = (float)g0[j] * (((s0 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v1 = (float)g1[j] * (((s1 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v2 = (float)g2[j] * (((s2 >> j) & 1u) ? -1.0f : 1.0f);
+                const float v3 = (float)g3[j] * (((s3 >> j) & 1u) ? -1.0f : 1.0f);
+                sub_acc += y[j +  0] * v0 + y[j +  8] * v1 + y[j + 16] * v2 + y[j + 24] * v3;
+            }
+            up_v += dl * sub_acc;
+        }
+    }
+    gate_v = rocm_wave32_sum(gate_v);
+    up_v   = rocm_wave32_sum(up_v);
+    if (lane == 0) {
+        if (clamp > 1.0e-6f) {
+            if (gate_v > clamp) gate_v = clamp;
+            if (up_v > clamp) up_v = clamp;
+            if (up_v < -clamp) up_v = -clamp;
+        }
+        const float w = weights[(uint64_t)token * n_used + slot];
+        mid[((uint64_t)token * n_used + slot) * mid_dim + row] = rocm_silu(gate_v) * up_v * w;
+    }
+}
+#endif /* MoE LDS-x experiment disabled */
+
 /* Wave-per-row Q2_K down matvec.  Each lane handles a subset of the 16
  * "is" quarter-blocks (16 elements each) per QK_K block, summing across
  * all active experts before the final wave-shuffle reduction. */

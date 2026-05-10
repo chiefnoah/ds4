@@ -1,0 +1,30 @@
+F16 decode round 2: structurally bound at ~100 GiB/s
+
+Status: COMPLETED 2026-05-09. Codex round-2 explored 4 variants of the V8 kernel via compile-time DS4_ROCM_F16_DECODE_4096_VARIANT switch.
+
+Variants tested:
+  0: baseline V8 (uint4 weight load + scalar LDS x reads)
+  1: V8 + float4 LDS reads, NROWS={8,4}
+  2: V16 (two K-tiles/iter) + float4 LDS reads, NROWS={8,4}
+  3: V8 + float4 LDS reads, NROWS=16
+  4: V16 + float4 LDS reads, NROWS=16
+
+Microbench (ds4_rocm_matmul_bench, in=4096 out={256,512,1024}):
+  All 5 variants within ~2% of each other on each shape.
+  4096x256:  v3 best at 25.9 us (75.5 GiB/s) vs v0 26.5 us
+  4096x512:  flat (~41 us) all variants
+  4096x1024: v3 best at 75.7 us (103 GiB/s) vs v0 77.2 us
+
+End-to-end (v3 vs v0 baseline):
+  v3: 15.60 / 15.64 t/s
+  v0: 15.66 / 15.68 t/s
+  -> within noise; v3 NOT consistently faster end-to-end.
+
+Decision: REVERTED codex variant changes. Kept the F16 microbench mode addition (commit 3b8867c) since it is reusable infrastructure.
+
+Conclusion: 4096-input F16 decode shapes are at ~53% of 190 GiB/s ceiling and not advancing further with kernel-internal changes (vectorized loads, larger N unroll, NROWS scaling, LDS access patterns all tested and converged). The remaining 47% gap is structural — most likely cache miss patterns on Strix Halo MALL or wave dispatch overhead at 41-1024 micro-launches per token.
+
+Next biggest levers:
+1. Reduce launch count: matmul_f16_pair currently calls 2x matmul_f16; fuse into single kernel (2x x re-read elimination, 1 launch saved per pair). 60+ pair calls/tok = ~30 launches saved.
+2. Look outside F16: matmul_f16 is only ~10 ms/tok of ~65 ms decode. Bigger remaining contributors per histogram: routed MoE matmul, attention output low-q8, decompressed KV ops. Audit the next-biggest GPU consumer.
+3. Persistent kernels for 16384x{4,24}: 84 calls/tok * 27 us = 2.3 ms/tok wasted on 24-row launches. A persistent-kernel batch ABI could amortize.

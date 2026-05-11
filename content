@@ -1,0 +1,36 @@
+Cross-layer MoE weight prefetch (overlap layer N+1 MoE DRAM with layer N compute)
+
+STATUS: open. Successor to tsk-53 with concrete plan.
+
+CONTEXT: Each layer reads ~5.4 GB of routed MoE weights (active 6 experts
+x (2 gate_up + down)).  MoE wall = 46% of prefill.  The non-MoE work per
+layer (attention prefill + matmuls + norms) is ~28 ms.  Layer-N+1 MoE
+DRAM read of 5.4 GB at 188 GB/s ceiling = ~28 ms.  Perfect overlap would
+hide ~all MoE DRAM time -> -40% wall.
+
+REALISTIC: only the time after layer-N attention input is computed can
+overlap.  Partial overlap of 50-70% of MoE DRAM (~14-20 ms saved per
+layer x 43 = 600-860 ms saved out of 4.7 s total) -> -13-18% wall.
+
+DESIGN:
+  1. Add a prefetch stream (rocm_prefetch_stream) separate from g_stream.
+  2. After layer-N FA writes Q/K/V, kick off layer-(N+1) routed expert
+     weight prefetches into L2/IC via hipMemPrefetchAsync or a
+     prefetch-only kernel that reads weights into a scratch tensor.
+  3. Sync prefetch_stream before the MoE kernel of layer N+1 launches.
+  4. Selector knowledge: router_select happens DURING layer-N gating, so
+     we know which experts to prefetch.
+
+TRICKY: MoE expert selection only known at layer-N+1 router_select time.
+One option: prefetch ALL active experts speculatively, accept some
+over-fetch.  Another: do the layer-(N+1) router_select early using
+layer-N hidden state passed through the (N+1) router gating matmul as
+an async preflight.
+
+SUCCESS CRITERIA:
+  - Kernel test green.
+  - Long prefill +5 to +10 t/s.
+  - rocprofv3 shows MoE kernels with reduced MemUnitBusy stalls.
+
+WARNINGS: invasive cross-layer change.  Don't commit until end-to-end
+long prompt remains coherent and consistent vs baseline output.

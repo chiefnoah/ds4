@@ -1,0 +1,68 @@
+Persistent dispatch for Q2_K down kernel
+
+Persistent dispatch for Q2_K down kernel
+
+STATUS: open. Untested follow-up to the gate_up persistent+LDS-grid win
+(commit ff4aec4) which gave +7% on the gate_up half of routed_moe.
+
+CONTEXT: rocm_moe_down_q2k_wmma_kernel is the larger half of the
+routed_moe wall fraction.  Current profile (184-tok prefill,
+DS4_ROCM_SYNC_EACH=1):
+  routed_moe_batch total:  59.6% wall (1.513 s / 2.539 s)
+  gate_up (optimized):    ~22% wall (post-session)
+  down (untouched):       ~27% wall (per feedback_moe_wmma_at_memunit_ceiling.md
+                                     down is the larger contributor)
+
+Down is launched as a 2D grid (dn_row_blocks x n_unique_experts).  No
+persistent variant exists today.  Gate_up's persistent+LDS-grid won by
+amortizing the 2 KiB LDS-grid staging across 320 grid-stride blocks
+instead of ~32K (e, row_block) tiles.  Down has no LUT to stage so the
+same amortization doesn't apply directly, BUT persistent grouping may
+still help by keeping per-expert weight rows L2-warm across all its
+row_blocks before moving to the next expert.
+
+GOAL: positive prefill delta from a persistent down kernel, validated
+on the 184-tok canonical bench.  Threshold to land: >= +1.5% prefill.
+
+NEXT STEPS:
+1. Add rocm_moe_down_q2k_wmma_persistent_kernel.  Mirror the existing
+   rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel structure: grid
+   (N_PERSIST, 1, 1) with grid-stride over (e_dense, row_block) tiles
+   in expert-major order.  Same per-tile body as the non-persistent
+   down kernel.
+2. Env-gate via a new DS4_ROCM_MOE_DOWN_PERSISTENT (or share
+   DS4_ROCM_MOE_PERSISTENT and gate both at once).  N_PERSIST default
+   320 to match gate_up.
+3. Wire dispatch in the same site as gate_up persistent (~ds4_rocm.c
+   line 9940-ish, after the gate_up persistent branch).  Down is
+   launched after gate_up so persistent down can follow immediately.
+4. Bench: 184-tok long_prompt, --temp 0 --seed 42, 3 runs each:
+   - Default (persistent gate_up only)
+   - +Persistent down enabled
+   Compare medians.
+5. If positive, also sweep N_PERSIST for the down kernel separately
+   (the optimum may differ from gate_up's 320 since down has different
+   per-tile work).
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test (40 tests OK)
+- Validation prompt -n 200 --temp 0 --seed 42: coherent thinking-mode reply
+- Bench above
+
+RISKS:
+- Persistent down may regress like persistent gate_up did pre-LDS-grid
+  (-1.7..-2.7%).  The gate_up regression was caused by HIP's native
+  scheduler clustering tiles better than grid-stride.  Down has the
+  same characteristics, so a regression is plausible.
+- Activations (mid[] = 9 MB at n_tokens=184, n_used=6, mid_dim=2048)
+  fit in 32 MB Infinity Cache anyway; locality benefit may be marginal.
+
+UPPER BOUND: optimistic ~5% wall improvement if expert-major locality
+gives a 20% kernel speedup; realistic 0-2% wall.
+
+RELATED:
+- feedback_persistent_moe_no_win.md (reversed for gate_up)
+- feedback_iq2_lds_grid_win.md (the analogous gate_up win)
+- feedback_moe_wmma_at_memunit_ceiling.md (down at 99.8% MemUnitBusy)
+- commits f140eef, 0f42434, ff4aec4 (the gate_up persistent+LDS landings)

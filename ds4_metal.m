@@ -4883,6 +4883,23 @@ int ds4_metal_dsv4_topk_mask_tensor(
     return 1;
 }
 
+/* Metal fallback for the fused rms_norm + matmul_f16.  Always returns
+ * 0 so the caller falls back to two separate dispatches; same rationale
+ * as the q8_0 pair stub below. */
+int ds4_metal_rms_matmul_f16_fused_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        float                   eps) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)eps;
+    return 0;
+}
+
 /* Metal fallback for the Q8_0 pair matmul.  Always returns 0 so the
  * caller falls back to two separate matmul_q8_0 calls.  ROCm has a fused
  * implementation that wins on its launch-overhead profile; Metal's

@@ -206,6 +206,21 @@ int ds4_metal_matmul_f16_pair_tensor(
         const ds4_metal_tensor *x,
         uint64_t                n_tok);
 
+/* Fused (rms_norm_plain + matmul_f16) for decode-shape HC mixing
+ * projections.  Computes y = (W @ (x * rms(x))) for one input vector.
+ * Returns 0 if the shape isn't supported — caller must fall back to a
+ * separate ds4_metal_rms_norm_plain_tensor + ds4_metal_matmul_f16_tensor
+ * pair. */
+int ds4_metal_rms_matmul_f16_fused_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        float                   eps);
+
 int ds4_metal_matmul_f32_tensor(
         ds4_metal_tensor       *out,
         const void             *model_map,

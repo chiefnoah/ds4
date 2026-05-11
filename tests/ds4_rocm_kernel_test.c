@@ -2741,6 +2741,54 @@ int main(void) {
         free(xv); free(Wb); free(Wa);
     }
 
+    /* Fused (rms_norm + matmul_f16) at the canonical HC-mixing shape
+     * (in=hc_dim, out=mix_hc).  Uses small dims for fast unit testing;
+     * the actual fused kernel covers any in_dim % 32 == 0 with
+     * out_dim divisible by 4 or 8. */
+    STEP("rms_matmul_f16_fused (decode HC-mixing shape, in=256, out=8)");
+    {
+        const uint32_t IN = 256, OUT = 8;
+        uint16_t *W   = (uint16_t *)malloc((size_t)IN * OUT * sizeof(uint16_t));
+        float    *xv  = (float    *)malloc((size_t)IN * sizeof(float));
+        float    *ref = (float    *)malloc((size_t)OUT * sizeof(float));
+        float    *got = (float    *)malloc((size_t)OUT * sizeof(float));
+        require(W && xv && ref && got, "rms_matmul_f16 alloc");
+        for (uint32_t i = 0; i < IN; i++) xv[i] = (float)((int)(i % 11) - 5) * 0.25f;
+        for (uint32_t r = 0; r < OUT; r++) {
+            for (uint32_t i = 0; i < IN; i++) {
+                W[r * IN + i] = f32_to_f16((float)((int)((r * 5 + i) % 17) - 8) * 0.125f);
+            }
+        }
+        const float eps = 1.0e-6f;
+        float sq = 0.0f;
+        for (uint32_t i = 0; i < IN; i++) sq += xv[i] * xv[i];
+        const float rms = 1.0f / sqrtf(sq / (float)IN + eps);
+        for (uint32_t r = 0; r < OUT; r++) {
+            float s = 0.0f;
+            for (uint32_t i = 0; i < IN; i++) {
+                s += f16_to_f32(W[r * IN + i]) * (xv[i] * rms);
+            }
+            ref[r] = s;
+        }
+        const size_t wsize = (size_t)IN * OUT * sizeof(uint16_t);
+        ds4_metal_tensor *txw = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *tow = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        require(txw && tow, "rms_matmul_f16 tensor alloc");
+        require(ds4_metal_tensor_write(txw, 0, xv, IN * sizeof(float)),
+                "rms_matmul_f16 x write");
+        require(ds4_metal_rms_matmul_f16_fused_tensor(tow, W, wsize, 0,
+                                                       IN, OUT, txw, eps),
+                "rms_matmul_f16_fused");
+        require(ds4_metal_tensor_read(tow, 0, got, OUT * sizeof(float)),
+                "rms_matmul_f16 read");
+        for (uint32_t r = 0; r < OUT; r++) {
+            require(nearf(got[r], ref[r], 1e-2f), "rms_matmul_f16 value");
+        }
+        ds4_metal_tensor_free(tow);
+        ds4_metal_tensor_free(txw);
+        free(got); free(ref); free(xv); free(W);
+    }
+
     /* Q8_0 pair-matmul (qr + kv_raw shape).  In=256 lets us use the
      * wave-per-row kernel without WMMA gating; out_dim_a=256 + out_dim_b=8
      * exercises the asymmetric out_dim path (need NROWS=8 since both >= 256

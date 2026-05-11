@@ -8736,9 +8736,31 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    {
+        /* Try the fused rms_norm + matmul_f16 kernel: one launch instead
+         * of two, plus skips the intermediate flat_hc DRAM round-trip.
+         * Falls back to separate dispatches if the wrapper returns 0
+         * (non-F16 weights, unsupported shape, etc.).  Disable via
+         * DS4_ROCM_HC_RMS_FUSED=0. */
+        static int hc_rms_fused_cached = -1;
+        if (hc_rms_fused_cached < 0) {
+            const char *env = getenv("DS4_ROCM_HC_RMS_FUSED");
+            hc_rms_fused_cached = (env && env[0] == '0') ? 0 : 1;
+        }
+        int fused_ok = 0;
+        if (ok && hc_rms_fused_cached &&
+            layer->hc_attn_fn->type == DS4_TENSOR_F16) {
+            fused_ok = ds4_metal_rms_matmul_f16_fused_tensor(
+                           g->hc_mix, model->map, model->size,
+                           layer->hc_attn_fn->abs_offset,
+                           hc_dim, mix_hc, g->cur_hc, DS4_RMS_EPS);
+        }
+        if (ok && !fused_ok) {
+            ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+            if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
+                                                         hc_dim, mix_hc, g->flat_hc, 1);
+        }
+    }
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
@@ -9266,9 +9288,28 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    if (ok) ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    {
+        /* Same fused rms_norm + matmul_f16 path as the HC-attention pre.
+         * Gated by DS4_ROCM_HC_RMS_FUSED (cached at the first call site). */
+        static int hc_rms_fused_cached_ffn = -1;
+        if (hc_rms_fused_cached_ffn < 0) {
+            const char *env = getenv("DS4_ROCM_HC_RMS_FUSED");
+            hc_rms_fused_cached_ffn = (env && env[0] == '0') ? 0 : 1;
+        }
+        int fused_ok = 0;
+        if (ok && hc_rms_fused_cached_ffn &&
+            layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
+            fused_ok = ds4_metal_rms_matmul_f16_fused_tensor(
+                           g->hc_mix, model->map, model->size,
+                           layer->hc_ffn_fn->abs_offset,
+                           hc_dim, mix_hc, g->after_attn_hc, DS4_RMS_EPS);
+        }
+        if (ok && !fused_ok) {
+            ok = ds4_metal_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+            if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
+                                                         hc_dim, mix_hc, g->flat_hc, 1);
+        }
+    }
     if (ok && fuse_hc_norm) {
         ok = ds4_metal_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
                                                          g->ffn_norm,

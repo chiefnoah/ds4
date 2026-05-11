@@ -1183,6 +1183,80 @@ __global__ static void rocm_matmul_f16_wave_lds_##NROWS##_v8_kernel( \
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(8)
 ROCM_DEFINE_MATMUL_F16_WAVE_LDS_V8(4)
 
+/* Fused (rms_norm_plain + matmul_f16) for decode-shape HC mixing projections.
+ *
+ * At decode time the HC attention/FFN projections (hc_attn_fn, hc_ffn_fn)
+ * normalize the 28672-element HC-flat vector and project it through an
+ * F16 weight matrix to a tiny 24-element output (mix_hc).  Each pair was
+ * costing ~75 us wall-clock: ~35 us per kernel launch + ~7 us of actual
+ * compute.  Fusing into one dispatch saves one launch + the intermediate
+ * normalized-x DRAM round-trip.
+ *
+ * Pass 1: each thread reads its strided slice of x and accumulates
+ * partial sum of squares; block-wide LDS reduction yields the rms scale.
+ * Pass 2: each wave computes one output row of (W @ x) and applies rms
+ * once at the end (algebraically equivalent: sum_i w_i * x_i * rms =
+ * rms * sum_i w_i * x_i, and rms is per-block-constant).
+ *
+ * Each block redundantly computes the rms scale.  At out_dim=24 with
+ * NROWS=4 that's 6 blocks, each re-reading the full x.  L1/L2 absorbs
+ * most of the redundancy since x is only ~112 KB; the launch savings
+ * dominate.  NROWS=8 (3 blocks) underutilizes CUs at 40-CU silicon. */
+#define ROCM_DEFINE_RMS_MATMUL_F16_FUSED(NROWS) \
+__global__ static void rocm_rms_matmul_f16_fused_##NROWS##_kernel( \
+        float *out, const uint16_t *w, const float *x, \
+        uint32_t in_dim, uint32_t out_dim, float eps) { \
+    extern __shared__ float sh[]; \
+    const uint32_t tid     = threadIdx.x; \
+    const uint32_t row_idx = tid >> 5; \
+    const uint32_t lane    = tid & 31u; \
+    \
+    float sq = 0.0f; \
+    for (uint32_t i = tid; i < in_dim; i += (uint32_t)blockDim.x) { \
+        const float v = x[i]; \
+        sq += v * v; \
+    } \
+    sh[tid] = sq; \
+    __syncthreads(); \
+    for (uint32_t stride = (uint32_t)blockDim.x / 2u; stride > 0u; stride >>= 1) { \
+        if (tid < stride) sh[tid] += sh[tid + stride]; \
+        __syncthreads(); \
+    } \
+    const float rms = rsqrtf(sh[0] / (float)in_dim + eps); \
+    \
+    const uint32_t row = blockIdx.x * (uint32_t)(NROWS) + row_idx; \
+    if (row >= out_dim) return; \
+    \
+    const uint16_t *wr = w + (uint64_t)row * in_dim; \
+    const uint32_t step = 256u; \
+    const uint32_t in_dim_pack = (in_dim / step) * step; \
+    float sum = 0.0f; \
+    for (uint32_t base = 0; base < in_dim_pack; base += step) { \
+        const uint32_t i = base + lane * 8u; \
+        const uint4 hv = *(const uint4 *)(const void *)(wr + i); \
+        const uint32_t h0 = hv.x; \
+        const uint32_t h1 = hv.y; \
+        const uint32_t h2 = hv.z; \
+        const uint32_t h3 = hv.w; \
+        sum += rocm_f16_to_f32((uint16_t)(h0        & 0xffffu)) * x[i + 0u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h0 >> 16) & 0xffffu)) * x[i + 1u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h1        & 0xffffu)) * x[i + 2u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h1 >> 16) & 0xffffu)) * x[i + 3u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h2        & 0xffffu)) * x[i + 4u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h2 >> 16) & 0xffffu)) * x[i + 5u]; \
+        sum += rocm_f16_to_f32((uint16_t)(h3        & 0xffffu)) * x[i + 6u]; \
+        sum += rocm_f16_to_f32((uint16_t)((h3 >> 16) & 0xffffu)) * x[i + 7u]; \
+    } \
+    for (uint32_t i = in_dim_pack + lane; i < in_dim; i += 32u) { \
+        sum += rocm_f16_to_f32(wr[i]) * x[i]; \
+    } \
+    sum = rocm_wave32_sum(sum); \
+    if (lane == 0) out[row] = sum * rms; \
+}
+
+ROCM_DEFINE_RMS_MATMUL_F16_FUSED(8)
+ROCM_DEFINE_RMS_MATMUL_F16_FUSED(4)
+
 /* Fused decode matmul for the matmul_f16_pair call sites: a single block
  * computes NROWS rows of out_a and NROWS rows of out_b at the same row
  * tile, both projecting the same x.  Block holds 2*NROWS waves: the first
@@ -2610,6 +2684,72 @@ int ds4_metal_matmul_f16_pair_tensor(
                                        weight_a_offset, in_dim, out_dim, x, n_tok) &&
            ds4_metal_matmul_f16_tensor(out_b, model_map, model_size,
                                        weight_b_offset, in_dim, out_dim, x, n_tok);
+}
+
+/* Fused (rms_norm_plain + matmul_f16) for decode HC-mixing projections.
+ * Computes y = (W @ (x * rms(x))) where rms(x) = rsqrt(mean(x^2) + eps).
+ * Returns 0 if the shape isn't supported — caller should fall back to
+ * two separate dispatches.  Supported shape envelope: in_dim % 32 == 0,
+ * out_dim divisible by 4 or 8, x is a single vector (no batch). */
+int ds4_metal_rms_matmul_f16_fused_tensor(
+        ds4_metal_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        float                   eps) {
+    if (rocm_trace()) fprintf(stderr, "ds4: ROCm enter ds4_metal_rms_matmul_f16_fused_tensor\n");
+    ROCM_TIME_SCOPE("ds4_metal_rms_matmul_f16_fused_tensor");
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!out || !model_map || !x) return 0;
+    if (in_dim == 0 || out_dim == 0) return 0;
+    if ((in_dim % 32u) != 0u) return 0;
+
+    /* NROWS=4 (6 blocks at out_dim=24) gives better CU utilization than
+     * NROWS=8 (3 blocks) at the canonical HC-mix shape; redundant rms
+     * computation across blocks is L1-absorbed for the 28672-float x. */
+    uint32_t nrows;
+    if ((out_dim % 4u) == 0u) {
+        nrows = 4u;
+    } else if ((out_dim % 8u) == 0u) {
+        nrows = 8u;
+    } else {
+        return 0;
+    }
+
+    const uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < in_dim * sizeof(float)) return 0;
+    if (out->bytes < out_dim * sizeof(float)) return 0;
+
+    void *w_host = NULL, *w_dev = NULL;
+    const void *src = (const uint8_t *)model_map + weight_offset;
+    if (!rocm_upload_mapped(src, weight_bytes, &w_host, &w_dev, "rms+matmul_f16 weight")) return 0;
+
+    const uint32_t threads = nrows * 32u;
+    const dim3 block(threads);
+    const dim3 grid((unsigned)((out_dim + nrows - 1u) / nrows));
+    const size_t shmem_bytes = (size_t)threads * sizeof(float);
+    if (nrows == 8u) {
+        hipLaunchKernelGGL(rocm_rms_matmul_f16_fused_8_kernel,
+                           grid, block, (uint32_t)shmem_bytes, g_stream,
+                           (float *)tensor_u8(out),
+                           (const uint16_t *)w_dev,
+                           (const float *)tensor_u8_const(x),
+                           (uint32_t)in_dim, (uint32_t)out_dim, eps);
+    } else {
+        hipLaunchKernelGGL(rocm_rms_matmul_f16_fused_4_kernel,
+                           grid, block, (uint32_t)shmem_bytes, g_stream,
+                           (float *)tensor_u8(out),
+                           (const uint16_t *)w_dev,
+                           (const float *)tensor_u8_const(x),
+                           (uint32_t)in_dim, (uint32_t)out_dim, eps);
+    }
+    int ok = rocm_launch_done("rms+matmul_f16 fused launch", "rms+matmul_f16 fused completion");
+    rocm_defer_free(w_host);
+    return ok;
 }
 
 int ds4_metal_matmul_f32_tensor(

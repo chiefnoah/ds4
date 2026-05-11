@@ -2470,13 +2470,17 @@ int ds4_metal_matmul_f16_tensor(
 
     int ok;
     if (n_tok > 1u) {
-        /* Prefill path.  n_tok>=16 uses WMMA (v_wmma_f32_16x16x16_f16 on
+        /* Prefill path.  n_tok>=2 uses WMMA (v_wmma_f32_16x16x16_f16 on
          * gfx1151 wave32) which beats the scalar tile kernel by reusing
          * each loaded weight across 16 tokens via the matrix-fma op
-         * instead of 8 explicit lane FMAs; smaller token counts stay on
-         * the tile kernel because a single 16-token WMMA tile would
-         * waste >50% of its lanes when n_tok < 8.  in_dim must be a
-         * multiple of 16 for WMMA (K-stride). */
+         * instead of 8 explicit lane FMAs.  in_dim must be a multiple
+         * of 16 for WMMA (K-stride).
+         *
+         * Threshold dropped from 16 to 2 (2026-05-11): tile kernel was
+         * compute-bound at ~18 GiB/s effective for n_tok=8 vs WMMA's
+         * 62-150 GiB/s at n_tok=16.  Partial WMMA tiles waste lanes but
+         * still win by a factor of 3-9x in this regime.  Unlocks
+         * speculative decoding (n_tok=2..8) where verify-N matmuls fire. */
         static int g_f16_wmma_cached = -1;
         if (g_f16_wmma_cached < 0) {
             const char *env = getenv("DS4_ROCM_WMMA");
@@ -2485,7 +2489,7 @@ int ds4_metal_matmul_f16_tensor(
         const int wmma_ok = g_f16_wmma_cached
                             && (in_dim % 16u) == 0u
                             && out_dim >= 16u
-                            && n_tok   >= 16u;
+                            && n_tok   >= 2u;
         if (wmma_ok) {
             const dim3 wblock(32u);
             /* X=token, Y=row tile — see kernel comment. */
@@ -2893,10 +2897,16 @@ int ds4_metal_matmul_q8_0_tensor(
                 const char *env = getenv("DS4_ROCM_WMMA");
                 g_wmma_enabled_cached = (env && env[0] == '0') ? 0 : 1;
             }
+            /* Threshold dropped from n_tok>=16 to n_tok>=2 (2026-05-11): at
+             * n_tok=2..15 the scalar tile kernel is compute-bound at ~17%
+             * peak FLOPS; WMMA at 16-wide token tile saturates DRAM even
+             * at half-token utilization.  Bench measured 0.50 -> 0.10 ms
+             * at n_tok=8 (4096,4096) — 5x speedup.  Unlocks speculative
+             * decoding regimes (MTP/Eagle) where verify-N runs at n_tok=2..8. */
             const int wmma_ok = g_wmma_enabled_cached
                                 && (in_dim  % 32u) == 0u
                                 && out_dim >= 16u
-                                && n_tok   >= 16u;
+                                && n_tok   >= 2u;
             /* WMMA_I8 path: default on (DS4_ROCM_WMMA_I8=0 to disable).
              * Microquantizes activations f32 -> Q8 per-block then runs
              * v_wmma_i32_16x16x16_iu8.  At n_tok=184 prefill this is
@@ -4362,18 +4372,23 @@ static int rocm_attention_output_low_q8_dispatch(
 
     int ok;
     if ((group_dim % 32u) == 0u) {
-        /* Prefill (n_tokens >= 16): WMMA path mirrors the matmul_q8_0 WMMA
+        /* Prefill (n_tokens >= 2): WMMA path mirrors the matmul_q8_0 WMMA
          * kernel.  Each 32-lane block produces a 16x16 (rank, token) tile
          * via v_wmma_f32_16x16x16_f16; grid Z drives n_groups so all 8
-         * groups dispatch in one launch.  Wave-per-row stays for n_tokens
-         * < 16 (decode and tiny prefill chunks). */
+         * groups dispatch in one launch.  Wave-per-row stays only for
+         * n_tokens=1 (true decode).
+         *
+         * Threshold dropped from 16 to 2 (2026-05-11): scalar wave path
+         * was compute-bound at small n_tokens; WMMA partial-tile wins by
+         * 3-9x like the matmul kernel.  Unlocks speculative-decode
+         * regimes (n_tokens=2..8). */
         static int g_attn_out_wmma_cached = -1;
         if (g_attn_out_wmma_cached < 0) {
             const char *env = getenv("DS4_ROCM_WMMA");
             g_attn_out_wmma_cached = (env && env[0] == '0') ? 0 : 1;
         }
         const int wmma_ok = g_attn_out_wmma_cached
-                            && n_tokens >= 16u
+                            && n_tokens >= 2u
                             && rank     >= 16u;
         if (wmma_ok) {
             /* Wide-token-tile variant pays off when n_tokens >= 64 and

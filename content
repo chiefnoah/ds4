@@ -1,0 +1,34 @@
+FA prefill br16 is the only kernel with headroom (MemUnitBusy=55%)
+
+Confirmed 2026-05-11 with rocprofv3 PMC counters: every other meaningful
+ROCm kernel in ds4 is at MemUnitBusy >97% on gfx1151 at n_tokens=600:
+
+  rocm_moe_down_q2k_wmma_kernel        99.80%   24.9% wall
+  rocm_attn_out_low_q8_wmma_wide_kernel 99.55%    7.9% wall
+  rocm_moe_gate_up_iq2xxs_wmma_kernel   99.46%   21.9% wall
+  rocm_matmul_q8_0_wmma_kernel          98.44%   18.7% wall
+  rocm_matmul_q8_0_wmma_wide_kernel     98.46%    5.7% wall
+  rocm_matmul_f16_wmma_kernel           98.27%    3.6% wall
+  rocm_rms_norm_plain_kernel            97.22%    0.9% wall
+  rocm_attn_fa_kernel_br16              55.48%    7.5% wall  <-- ONLY outlier
+
+FA br16 is compute-bound, not memory-bound (exp/softmax + register
+pressure).  Headroom exists but cutting it requires reducing actual
+compute, not better memory access.
+
+Upper bound: if FA went from 7.5% to ~3.5% wall (a 2x speedup, optimistic
+for compute-bound code), that frees ~4% of total prefill = ~3 t/s win
+(70 -> ~73 t/s).  Modest.
+
+Approach ideas:
+* Larger BR tile (BR=32 or 64) for fewer softmax passes per output row
+* Online softmax with fewer normalizations
+* Mixed precision: keep softmax in f32 but accumulate attention in f16
+* Tensor core path for the attention QK^T and PV matmuls inside FA
+
+First step: profile FA br16 with PMC counters to confirm the bottleneck
+(SQ_INSTS_VALU per wave, VALU utilization, LDS pressure).  Compare to
+the softmax-dominated theoretical compute count.
+
+Validation: kernel test + long-prompt prefill -> coherent output,
+FA ms/call drops, prefill t/s rises.

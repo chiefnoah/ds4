@@ -1,0 +1,35 @@
+Rebuild routed MoE gate/up as IQ1_S (or smallest viable) -- requires new weights
+
+STATUS: open.  Biggest single quant lever, requires GGUF rebuild.
+
+CONTEXT: feedback_moe_q8_gate_up_regresses.md shows MoE wall scales
+linearly with weight bytes/elt at 99% MemUnitBusy ceiling.  Current
+IQ2_XXS = 0.563 B/elt.  Production wall 46% of prefill from gate+up+down.
+Gate+up are 2/3 of MoE byte traffic.
+
+IQ1_S (1.06 bits/elt = ~0.13 B/elt) would cut gate+up DRAM 4.2x at the
+kernel ceiling, dropping the 31% gate+up portion of wall to ~7% =
+-24% wall.  At ~70 t/s prefill -> ~93 t/s (single biggest lever toward
+150).
+
+QUALITY: IQ1_S is aggressive; verify model still scores well on a held-
+out eval (perplexity vs IQ2_XXS).  Per llama.cpp experience IQ1_S
+is usable for experts but degrades chat quality 1-2 BPB perplexity.
+IQ1_M or Q1_K_XL (~1.5 bits) is a middle-ground.
+
+PLAN:
+  1. Implement IQ1_S dequant in ds4_rocm.c.
+  2. Add a load-time conversion path: parse IQ1_S from a custom GGUF
+     (built externally via llama.cpp quant tools).
+  3. Validate FA + matmul kernels remain coherent.
+  4. A/B benchmark gate_up kernel: ms/call vs IQ2_XXS baseline.
+  5. Compare full-prefill output to baseline -- coherency check.
+
+SUCCESS CRITERIA:
+  - tests/ds4_rocm_moe_bench at n_tokens=600 with IQ1_S gate_up shows
+    >3x speedup vs IQ2_XXS baseline.
+  - End-to-end model produces coherent multi-paragraph response on
+    the standard prompt.
+  - Long prefill >100 t/s.
+
+ALT: Q1_K_XL or IQ2_XS (1.5-bit variants) if IQ1_S quality is unacceptable.

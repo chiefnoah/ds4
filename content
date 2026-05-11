@@ -1,0 +1,95 @@
+LDS-stage Q2_K block headers for routed_moe down kernel
+
+LDS-stage Q2_K block headers for routed_moe down kernel
+
+STATUS: open. Speculative analog of the IQ2_XXS gate_up LDS-grid win
+(commit f140eef, +2.7% prefill).  Targets the down half of routed_moe
+which is ~27% of prefill wall and at 99.8% MemUnitBusy.
+
+CONTEXT: per feedback_moe_wmma_at_memunit_ceiling.md (2026-05-11):
+  "rocm_moe_down_q2k_wmma_kernel: MemUnitBusy = 99.80%, 65536 waves/call,
+  wall 32.7 ms/call ... most cycles go to L1/L2 traffic from
+  divergent-lane Q2_K scale reads + IQ2_XXS grid LUT lookups."
+
+The IQ2_XXS grid lookups portion of that bottleneck has been attacked
+in gate_up via LDS-staging (commit f140eef).  The Q2_K scale reads on
+the down kernel are the structural analog -- divergent per-lane reads
+that consume vector-memory-unit cycles even when L1-resident.
+
+UNLIKE IQ2_XXS grid, Q2_K scales are NOT a shared LUT.  Each lane
+reads its OWN row's Q2_K block headers (d, dmin, scales[16]).  So
+LDS-staging is not a deduplication -- it's a pipeline migration:
+move the divergent scale reads off the VMEM pipeline onto the LDS
+pipeline, freeing memory-unit cycles for the dominant qs (weight
+quant byte) reads.
+
+Q2_K block structure (84 bytes total):
+  scales[16]:  16 bytes (4-bit packed scale+min per sub-block)
+  qs[64]:      64 bytes (2-bit quant data, 4 elems per byte)
+  d:           2 bytes (fp16 quant scale)
+  dmin:        2 bytes (fp16 quant offset)
+
+Per K-block (256 elems) per row, the inner loop reads:
+  1 byte (scales[inn]) per inn iter
+  16 bytes (qs) per inn iter
+  d, dmin once per block (compiler should hoist)
+
+Pre-stage the 20 bytes of headers (d + dmin + scales[16]) per row at
+each new bi into LDS.  16 rows in WMMA tile x 20 bytes = 320 bytes per
+new bi.  LDS budget per block at 8 blocks/CU resident: 17.6 KiB total
+including the staging; well under 64 KiB.
+
+The IDEAL form is per-K-block staging: when bi advances, all 16 lanes
+cooperatively load their own row's 20-byte header to LDS, __syncthreads,
+then the inner inn loop reads from LDS.  Staging cost amortizes over
+16 inn iterations per bi.
+
+GOAL: positive prefill delta from staging Q2_K block headers in LDS.
+Threshold to land: >= +1.5% prefill on 184-tok canonical.
+
+NEXT STEPS:
+1. Read rocm_moe_down_q2k_wmma_kernel carefully.  Confirm d, dmin,
+   scales[inn] access pattern matches the analysis above.
+2. Add rocm_moe_down_q2k_wmma_lds_scales_kernel.  Layout:
+     __shared__ uint32_t lds_header[16];  // 16 rows x 20 bytes per bi
+                                           // packed: 16-byte scales +
+                                           // 4 bytes d/dmin = 5 dwords
+   per row x 16 rows = 16 dwords per row?  Actually 20 bytes / 4 =
+   5 dwords per row.  16 rows = 80 dwords = 320 bytes.  Round up to
+   uint32_t lds_header[80] (320 bytes total).
+3. Each new bi: lane L=row R cooperatively writes its own 20-byte
+   header to LDS at offset R*5 dwords, __syncthreads, inner loop
+   reads from LDS.
+4. Env-gate DS4_ROCM_MOE_DOWN_LDS_SCALES (or extend DS4_ROCM_MOE_LDS_GRID
+   to cover both gate_up grid and down scales).  Land as opt-in first.
+5. Bench: 184-tok prefill, 3 runs each.  Compare to current default
+   (persistent + LDS-grid F16 gate_up + plain down).
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test (40 tests OK)
+- Validation prompt coherent
+- Bench above
+
+RISKS:
+- Q2_K block headers may already be L1-resident enough that VMEM
+  cycles spent on them are dominated by latency-hiding (not bandwidth).
+  In that case LDS staging won't help.  Counter-argument: 99.8%
+  MemUnitBusy says SOMETHING is saturating the pipeline; staging
+  ANY divergent read could lift the ceiling.
+- Pre-load cost: 16 lanes write 5 dwords each per bi = 5 LDS writes
+  per lane per bi.  Plus __syncthreads barrier.  If bi loop is short
+  (= nb = mid_dim / 256 = 8 for mid_dim=2048), barrier overhead may
+  dominate.
+- Bank conflicts on the LDS reads (16 lanes reading 1 byte each from
+  different banks at the same iter): unlikely but worth checking.
+
+UPPER BOUND: 5-8% wall if the structural argument is correct (analogous
+to the +2.7% gate_up LDS-grid).  Realistic 1-4% wall.
+
+RELATED:
+- feedback_iq2_lds_grid_win.md (the gate_up analog that landed)
+- feedback_moe_wmma_at_memunit_ceiling.md (down at 99.8% MemUnit)
+- feedback_q8_lds_x_universally_bad.md (LDS-x bad on Q8_0 wave; this
+  is WMMA+Q2_K so different regime, but be cautious)
+- commit f140eef (gate_up LDS-grid landing)

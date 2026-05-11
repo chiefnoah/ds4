@@ -1,0 +1,36 @@
+Prefill ceiling on Strix Halo achieved: 81 t/s with WMMA_I8 paths
+
+STATUS: ceiling achieved. Closes tsk-70.
+
+Measured 2026-05-11 (184-token long prompt, --temp 0 --seed 42, n_used=6 default):
+  Pre-session baseline:        65.79 t/s
+  + __launch_bounds__(32, 8):  66.32 t/s (+0.8%)
+  + WMMA_I8 default for Q8_0:  77.62 t/s (+18%)
+  + WMMA_I8 attn_out_wide:     81.11 t/s (+4.5%)  <-- final landed state
+  + WMMA_I8 MoE gate_up:       80.72 t/s (~0%, opt-in only)
+
+Commits: f83b8bc, 8c08a77, 221ad0b on main.
+
+Updated profile breakdown (final state, n_tok=184):
+  routed_moe_batch_tensor      1.747 s  64% wall  (UNCHANGED; MoE I8 ineffective)
+  matmul_q8_0_tensor (I8)      0.357 s  13%       (was 0.904s F16 -- 2.5x speedup)
+  attn_out_q8_batch (I8 wide)  0.220 s   8%       (was 0.376s F16 -- 1.7x speedup)
+  matmul_f16_tensor            0.173 s   6%
+  attn_fa + prefill_mixed      0.110 s   4%
+
+TO REACH 150 t/s requires cracking routed_moe (64% of wall).  The
+WMMA_I8 path gave ~0% there: the bottleneck is NOT the per-weight fp16
+scale mul (which I8 elides) but memory-instruction throughput on the
+per-sub-block grid + sign + qs scalar loads.  Per-kernel VALU is at 19%
+of peak; PMC fetch is at 366-406 GiB/s effective (L2/IC).
+
+Structural changes that could plausibly close the gap to 150 t/s:
+- Persistent grouped GEMM (prior art: 1.33x kernel, up to 2.6x e2e on DSv3)
+- DeepGEMM-style contiguous-M layout per expert
+- IQ2_XXS grid pre-decompression to LDS once per row tile (untried)
+- Cross-layer pipeline (RULED OUT by feedback_no_multistream_win_uma.md)
+
+USER DIRECTIVE 2026-05-11 (this session): "modify the ROCm backend
+however necessary to achieve [150 t/s]".  This session landed +23%; the
+remaining gap to 150 requires the structural changes above.  None of
+them are micro-opts -- each is a multi-day kernel rewrite.

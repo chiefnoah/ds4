@@ -1,0 +1,42 @@
+ds4 ROCm prefill ceiling on Strix Halo with locked weights: ~80 t/s
+
+STATUS: documented ceiling, no further engineering-only path forward.
+
+Measured 2026-05-11 (260-word prompt, --temp 0 --seed 42, default n_used=6):
+  Baseline (session start):  ~69 t/s
+  + FA br16 specialization:  70.4 t/s
+  + prefill_raw_heads rewrite: 70.4 t/s (kernel -94.8% but UMA-overlapped)
+  + DS4_N_USED=5:           76.5 t/s   <-- production-safe operating point
+
+ROCPROFV3 kernel-trace breakdown (default n_used=6, 4.78 s total):
+  moe_down_q2k_wmma            26.8%  bandwidth-bound, 99.8% MemUnit
+  moe_gate_up_iq2xxs_wmma      24.1%  bandwidth-bound, 99.5% MemUnit
+  matmul_q8_0_wmma             19.6%  bandwidth-bound, 98% MemUnit
+  attn_out_low_q8_wmma_wide     8.5%  bandwidth-bound, 99% MemUnit (already wide)
+  matmul_q8_0_wmma_wide         7.9%  bandwidth-bound, 98% MemUnit
+  attn_fa_kernel_br16_dpl16     5.5%  COMPUTE-BOUND, 55% MemUnit (only outlier)
+  (other)                       7.6%
+
+WALL DECOMPOSITION:
+  ~92% of wall is at MemUnitBusy >=98% (saturated by 188 GB/s DRAM bus).
+  Cannot speed up via parallelism (UMA shared bus per
+  feedback_no_multistream_win_uma.md).
+  Cannot speed up via kernel rewrites (all at memory-unit ceiling).
+  
+  Remaining engineering levers:
+  - FA br16 compute reduction:  upper bound +2 t/s
+  - attn_out LDS multi-wave:    speculative +0 to +3 t/s
+  - KV cache fp16:              +0.5 t/s (FA path now <2% wall)
+  Total realistic max:          ~+5 t/s -> ~80 t/s ceiling
+
+TO REACH 150 t/s on this hardware requires ONE of:
+  - Smaller weight quants (IQ1_S MoE gate/up = 4x DRAM cut; needs rebuild)
+  - Smaller model variant (fewer params or layers)
+  - Algorithm change beyond n_used=5 (current quality knee)
+
+USER DIRECTIVE (2026-05-11): weight changes are not an option.
+Conclusion: 80 t/s is the practical prefill ceiling on Strix Halo gfx1151
+with the stock DSv4 weights.
+
+DROPPED FROM QUEUE (all confirmed dead-end given UMA + weight lock):
+  tsk-53, tsk-64, tsk-65, tsk-66, tsk-67, tsk-68, tsk-60, tsk-61

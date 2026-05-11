@@ -1,0 +1,31 @@
+Goal: 150 t/s prefill (from current ~70 t/s baseline)
+
+STATUS: tracking task for the 150 t/s prefill goal on Strix Halo gfx1151.
+
+CURRENT BASELINE (2026-05-11, 600-token prompt): ~70 t/s prefill.
+TARGET: 150 t/s. Requires ~53% wall reduction.
+
+WALL BREAKDOWN (SYNC_EACH=1, 71-word prompt; structure holds on 600-tok):
+  routed_moe_batch                 46%   <- biggest lever
+  matmul_q8_0 (qa, kva, attn_a, attn_b, shared) 20%
+  attn_prefill_raw_heads (own kernel)  13%
+  attn_out_q8_batch                11%
+  matmul_f16                        5%
+  attn_prefill_static_mixed (FA)     1%
+  (other)                            4%
+
+Most kernels are at MemUnitBusy >97% (per feedback memory).
+The wall is dominated by DRAM/L2 bytes, not VALU compute.
+
+CRITICAL PATH (estimated savings, see follow-up tasks):
+  - MoE gate/up IQ1_S quant rebuild: -32% wall  (NEW WEIGHTS)
+  - prefill_raw_heads kernel rewrite: -11% wall (NO WEIGHTS)
+  - Other Q8_0 matmuls -> Q4_K/Q5_K: -8% wall   (NEW WEIGHTS)
+  - Cross-layer MoE weight prefetch: -15% wall  (engineering only)
+  - KV cache fp16 -> fp8 in FA path: -2% wall   (compute change)
+  Total upper bound: -68% -> 218 t/s. Realistic with friction: 150 t/s.
+
+TRACKING: each lever below is its own task.  Update this body as tasks land
+with measured numbers.
+
+Follow-ups: tsk-62 .. tsk-68 (created together)

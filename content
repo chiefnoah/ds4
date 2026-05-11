@@ -1,0 +1,33 @@
+Async multi-stream pipeline: overlap attention compute with MoE memory
+
+STATUS: open.  Complementary to cross-layer prefetch.
+
+CONTEXT: Within ONE layer the MoE kernel waits for FA + attn_out to
+finish before launching.  But the routed_moe kernel is DRAM-bound;
+attn_out_q8_batch is also DRAM-bound on a SEPARATE weight set (attn_b).
+With two CUDA streams + events, attention output writes could begin
+while MoE weight reads are issued and held in IC.
+
+Alternative angle: the f16 matmuls (5% wall) are compute-bound but small.
+Running them in parallel with the heavyweight Q8_0 matmul could shave
+2-3% wall.
+
+DIFFERS FROM cross-layer prefetch: that operates on layer boundaries.
+This is INTRA-layer scheduling on independent op DAG paths.
+
+PLAN:
+  1. Audit per-layer dependency graph in ds4.c graph scheduler.
+  2. Identify ops with no data dependency (e.g., shared expert path
+     vs routed MoE — they consume the same x but independently).
+  3. Add an alternate ROCm stream and use hipEventRecord + hipStreamWaitEvent
+     for sync.
+  4. Measure with rocprofv3 trace whether scheduler actually overlaps
+     (driver may serialize on UMA — needs verification).
+
+SUCCESS CRITERIA:
+  - Kernel test green.
+  - Long prefill +3 to +6 t/s.
+  - rocprofv3 trace shows kernel overlap timeline.
+
+RISK: UMA bandwidth is shared; two streams competing for the same
+188 GB/s might not help and could regress.  Measure carefully.

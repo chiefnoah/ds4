@@ -1,0 +1,36 @@
+attn_out stage 1: structural change needed; wide-tile dead-end
+
+Status: tsk-58 (wide-tile follow-ups) closed negative; option 3 tried
+and regressed.
+
+Results of wide-token-tile (64-tok) experiment:
+  wide32 baseline:   stage 1 10.25 ms/call,  attn_out_q8_batch 18.1 ms/call
+  wide64 candidate:  stage 1 ~17.6 ms/call,  attn_out_q8_batch 25.5 ms/call (-7% prefill)
+
+Root-cause analysis:
+* Stage 1 wide32 achieves only ~65 GB/s effective DRAM (666 MB weight /
+  10.25 ms) -- 35% of the 188 GB/s ceiling.  So stage 1 is NOT
+  memory-bound; the bottleneck is compute/latency/occupancy.
+* Wide-token doubles live VGPR pressure (4 accumulators + 4 B operands
+  vs 2+2 in wide32).  Likely halves wave occupancy on gfx1151, which
+  is the dominant cost given we are already latency-bound.
+* Wide-rank (option 2) has the SAME VGPR pressure as wide64 and saves
+  zero DRAM (block count halves but per-block weight reads double),
+  so it would not differ.
+
+Remaining options on this kernel:
+* Option 1 (LDS staging) requires multi-wave block restructure (sharing
+  activation slab in LDS across rank tiles within a block).
+  Substantial rewrite; uncertain payoff given we are not memory-bound.
+* Option 4 (FA prefill layout [group, token, group_dim]) addresses the
+  root strided access pattern.  Touches prefill + decode + batch FA
+  variants.  Invasive but theoretically the cleanest win.
+
+Deferred for now: stage 1 at 10.25 ms/call x 43 layers = 440 ms per
+prefill (~9% of wall).  Top bucket is routed_moe_batch at ~62 ms/call.
+Next leverage is MoE, not attn_out stage 1.
+
+Validation command:
+  time ./ds4 --backend rocm --prompt-file /tmp/long_prompt.txt -n 30 \
+       --temp 0 --seed 42
+baseline: 70 t/s long-prompt prefill (commit 37ba6c9).

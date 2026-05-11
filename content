@@ -1,0 +1,35 @@
+Rewrite rocm_attn_prefill_raw_heads_kernel to wave-parallel (13% wall, no weights)
+
+STATUS: open. Biggest engineering-only lever for prefill.
+
+CONTEXT: rocm_attn_prefill_raw_heads_kernel (ds4_rocm.c ~line 6552) is
+the hot kernel behind ds4_metal_attention_prefill_raw_heads_tensor.
+22 calls/prefill at 13.8 ms/call = 13.26% of total prefill wall.
+
+It uses CPU-style serial scans:
+  for each thread i (0..n_kv): serial dot of head_dim=512 per K row
+Grid = (n_tokens, n_head). Block = 128 threads.
+No FA, no wave-parallel reduction, no Q LDS staging.
+
+DS4_N_HEAD_DIM=512 -> 512 serial FMAs per K row per thread.  Wave-parallel
+would drop this to 16 FMAs + wave-shuffle reduce = >10x VALU.  At
+>97% MemUnitBusy on other attention kernels, the bottleneck mix here is
+likely different — measure with rocprofv3 PMC first.
+
+OPTIONS:
+  A. Route this wrapper through rocm_attn_batch_dispatch (use FA br16).
+     The FA path already handles sliding window via the (window, ratio=1)
+     args; need to verify the math matches (raw_kv layout, sinks treatment,
+     output write).
+  B. Write a dedicated wave-parallel kernel mirroring FA br16 but without
+     the comp K/V path (smaller smem, simpler).
+
+SUCCESS CRITERIA:
+  - kernel test STEP "attention prefill_raw_heads" stays green
+  - 70-word prompt prefill_raw_heads_tensor ms/call drops >5x
+  - 600-tok prefill end-to-end +3-5 t/s
+
+VALIDATION:
+  DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+  ./ds4_rocm_kernel_test  # OK, all 40 tests
+  time ./ds4 --backend rocm --prompt-file /tmp/long_prompt.txt -n 1 --temp 0 --seed 42

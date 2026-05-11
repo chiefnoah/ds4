@@ -114,6 +114,32 @@ static int g_ds4_lock_fd = -1;
 #define DS4_MAYBE_UNUSED
 #endif
 
+/* DS4_N_USED env override: speculative quality-vs-speed lever for routed-MoE.
+ * Clamps the per-token active expert count to a value <= DS4_N_EXPERT_USED.
+ * Returns 0 (no override) unless the env var parses to 1..DS4_N_EXPERT_USED. */
+static uint32_t ds4_n_used_override(void) {
+    static uint32_t cached = 0;
+    static int read_once = 0;
+    if (!read_once) {
+        read_once = 1;
+        const char *env = getenv("DS4_N_USED");
+        if (env && env[0]) {
+            long v = strtol(env, NULL, 10);
+            if (v >= 1 && v <= (long)DS4_N_EXPERT_USED) {
+                cached = (uint32_t)v;
+                fprintf(stderr, "ds4: DS4_N_USED override active: %u experts per token "
+                                "(model default %d)\n", cached, DS4_N_EXPERT_USED);
+            }
+        }
+    }
+    return cached;
+}
+
+static uint32_t ds4_effective_n_used(void) {
+    const uint32_t ov = ds4_n_used_override();
+    return ov ? ov : (uint32_t)DS4_N_EXPERT_USED;
+}
+
 /* =========================================================================
  * GGUF Quant Block Formats.
  * =========================================================================
@@ -9366,7 +9392,7 @@ static bool metal_graph_encode_decode_layer(
                                                 layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                 (uint32_t)token,
                                                 0,
-                                                0,
+                                                ds4_n_used_override(),
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
                                                 g->router_logits) != 0;
@@ -9394,7 +9420,7 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+                                                 ds4_effective_n_used(), DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -12073,7 +12099,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                       layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                       0,
-                                                      0,
+                                                      ds4_n_used_override(),
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       g->batch_router_logits,
@@ -12112,7 +12138,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    (uint32_t)routed_out_dim,
                                                    g->batch_router_selected,
                                                    g->batch_router_weights,
-                                                   DS4_N_EXPERT_USED,
+                                                   ds4_effective_n_used(),
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,
                                                    n_tokens) != 0;

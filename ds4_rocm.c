@@ -723,7 +723,8 @@ ROCM_DEFINE_MATMUL_Q8_0_TILE(4, 8)
 typedef _Float16 rocm_v16f16 __attribute__((ext_vector_type(16)));
 typedef float    rocm_v8f32  __attribute__((ext_vector_type(8)));
 
-__global__ static void rocm_matmul_q8_0_wmma_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_matmul_q8_0_wmma_kernel(
         float *out, const uint8_t *w, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
         uint64_t row_bytes) {
@@ -810,7 +811,8 @@ __global__ static void rocm_matmul_q8_0_wmma_kernel(
  * only for in_dim >= 6144 to target the cache-edge shapes.  For n_tok
  * that isn't 32-aligned, the trailing block has wasted lanes — efficiency
  * cliff at small n_tok. */
-__global__ static void rocm_matmul_q8_0_wmma_wide_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_matmul_q8_0_wmma_wide_kernel(
         float *out, const uint8_t *w, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
         uint64_t row_bytes) {
@@ -1084,7 +1086,8 @@ ROCM_DEFINE_MATMUL_F16_TILE(4, 8)
  * store).  Used when n_tok >= 16; smaller token counts stay on the
  * scalar tile kernel where launching 8x fewer 16-token tiles wastes
  * more lanes than the WMMA reuse saves. */
-__global__ static void rocm_matmul_f16_wmma_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_matmul_f16_wmma_kernel(
         float *out, const uint16_t *w, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
     const uint32_t lane = threadIdx.x & 31u;
@@ -2894,14 +2897,18 @@ int ds4_metal_matmul_q8_0_tensor(
                                 && (in_dim  % 32u) == 0u
                                 && out_dim >= 16u
                                 && n_tok   >= 16u;
-            /* WMMA_I8 path: opt-in via DS4_ROCM_WMMA_I8=1 (lossy: int8
-             * activations have ~7-bit mantissa vs fp16's 11-bit).  When
-             * enabled, microquantize activations f32 -> Q8 once, then
-             * run the matmul with v_wmma_i32_16x16x16_iu8. */
+            /* WMMA_I8 path: default on (DS4_ROCM_WMMA_I8=0 to disable).
+             * Microquantizes activations f32 -> Q8 per-block then runs
+             * v_wmma_i32_16x16x16_iu8.  At n_tok=184 prefill this is
+             * 2.4x faster than the WMMA_F16 path (cuts Q8_0 matmul wall
+             * from 0.9s to 0.38s; ~+18% end-to-end prefill).  Lossy:
+             * int8 activations have ~7-bit mantissa vs fp16's 11-bit,
+             * but per-block scaling preserves dynamic range and output
+             * stays coherent on the validation gate. */
             static int g_wmma_i8_enabled_cached = -1;
             if (g_wmma_i8_enabled_cached < 0) {
                 const char *env = getenv("DS4_ROCM_WMMA_I8");
-                g_wmma_i8_enabled_cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+                g_wmma_i8_enabled_cached = (env && env[0] == '0') ? 0 : 1;
             }
             int dispatched_wmma_i8 = 0;
             if (wmma_ok && g_wmma_i8_enabled_cached) {
@@ -4072,7 +4079,8 @@ ROCM_DEFINE_ATTN_OUT_LOW_Q8_WAVE(4)
  * driving grid Z so all 8 groups dispatch in one launch.  Q8_0 K-block of
  * 32 elements contributes two 16x16x16 WMMA ops sharing the same fp16
  * scale.  out layout: [n_tokens, n_groups, rank]. */
-__global__ static void rocm_attn_out_low_q8_wmma_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_attn_out_low_q8_wmma_kernel(
         float *low, const uint8_t *w, const float *heads,
         uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
         uint64_t row_bytes, uint64_t group_w_bytes) {
@@ -4147,7 +4155,8 @@ __global__ static void rocm_attn_out_low_q8_wmma_kernel(
  * of the attention output projection.  Per-group weight footprint is
  * group_dim x rank Q8 = 4.4 MB (for group_dim=4096, rank=1024); across
  * 8 groups that's 35 MB total, sitting on the Infinity Cache edge. */
-__global__ static void rocm_attn_out_low_q8_wmma_wide_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_attn_out_low_q8_wmma_wide_kernel(
         float *low, const uint8_t *w, const float *heads,
         uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
         uint64_t row_bytes, uint64_t group_w_bytes) {
@@ -8272,7 +8281,8 @@ ROCM_DEFINE_MOE_DOWN_Q2K_EM(8, 4)
  *     (L/16) + i*2 for i=0..7, col=(L%16).
  */
 
-__global__ static void rocm_moe_gate_up_iq2xxs_wmma_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_moe_gate_up_iq2xxs_wmma_kernel(
         float *mid,
         const uint8_t *gate_pool,
         const uint8_t *up_pool,
@@ -8430,7 +8440,8 @@ __global__ static void rocm_moe_gate_up_iq2xxs_wmma_kernel(
  *
  * Multiple experts contribute to the same out[token, row]; we use atomicAdd
  * to merge.  Caller zeroes out[] before launching. */
-__global__ static void rocm_moe_down_q2k_wmma_kernel(
+__global__ __launch_bounds__(32, 8)
+static void rocm_moe_down_q2k_wmma_kernel(
         float *out,
         const uint8_t *down_pool,
         uint64_t down_expert_bytes,

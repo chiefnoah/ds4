@@ -4232,6 +4232,107 @@ static void rocm_attn_out_low_q8_wmma_wide_kernel(
     }
 }
 
+/* WMMA_I8 wide-token-tile variant of rocm_attn_out_low_q8_wmma_kernel.
+ * Mirrors matmul_q8_0_wmma_i8: weights are Q8_0 (i8 + fp16 scale per K=32),
+ * activations are microquantized fp32->i8 once per (token, group) before
+ * dispatch and stored in the same 34-byte-per-32-element block format as
+ * weights, then we run v_wmma_i32_16x16x16_iu8 and fold the int32
+ * accumulator to fp32 using (w_scale * x_scale) once per K=32 step.
+ * Saves the 32 per-weight fp16 multiplications the F16 path runs per
+ * sub-block per output row.
+ *
+ * Activation scratch layout: [(token, group), block, 34 bytes].  Per
+ * (token, group) row owns blocks_per_group * 34 bytes (= group_dim/32
+ * * 34).  The microquant pre-pass walks all (token * n_groups) "outer"
+ * rows × group_dim columns. */
+__global__ __launch_bounds__(32, 8)
+static void rocm_attn_out_low_q8_wmma_wide_i8_kernel(
+        float *low, const uint8_t *w, const uint8_t *heads_q8,
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
+        uint64_t row_bytes, uint64_t group_w_bytes,
+        uint64_t heads_row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t g    = blockIdx.y;
+    const uint32_t t0   = blockIdx.z * 32u;
+    if (r0 >= rank || t0 >= n_tokens || g >= n_groups) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok_a   = t0 + col_in_tile;
+    const uint32_t tok_b   = t0 + 16u + col_in_tile;
+
+    const uint32_t safe_row = (out_row < rank)     ? out_row : (rank     - 1u);
+    const uint32_t safe_tok_a = (tok_a < n_tokens) ? tok_a : (n_tokens - 1u);
+    const uint32_t safe_tok_b = (tok_b < n_tokens) ? tok_b : (n_tokens - 1u);
+    const uint8_t *wr  = w + (uint64_t)g * group_w_bytes + (uint64_t)safe_row * row_bytes;
+    const uint8_t *xta = heads_q8 + ((uint64_t)safe_tok_a * n_groups + g) * heads_row_bytes;
+    const uint8_t *xtb = heads_q8 + ((uint64_t)safe_tok_b * n_groups + g) * heads_row_bytes;
+    const uint32_t blocks = group_dim >> 5;
+
+    rocm_v8f32 ca = {0, 0, 0, 0, 0, 0, 0, 0};
+    rocm_v8f32 cb = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *wblk = wr + (uint64_t)b * 34u;
+        const uint8_t *xblka = xta + (uint64_t)b * 34u;
+        const uint8_t *xblkb = xtb + (uint64_t)b * 34u;
+        const uint16_t w_scale_bits = (uint16_t)wblk[0] | ((uint16_t)wblk[1] << 8);
+        const uint16_t xa_scale_bits = (uint16_t)xblka[0] | ((uint16_t)xblka[1] << 8);
+        const uint16_t xb_scale_bits = (uint16_t)xblkb[0] | ((uint16_t)xblkb[1] << 8);
+        const float w_scale = rocm_f16_to_f32(w_scale_bits);
+        const float xa_scale = rocm_f16_to_f32(xa_scale_bits);
+        const float xb_scale = rocm_f16_to_f32(xb_scale_bits);
+        const float combined_a = w_scale * xa_scale;
+        const float combined_b = w_scale * xb_scale;
+        const int8_t *wqs  = (const int8_t *)(wblk  + 2);
+        const int8_t *xqsa = (const int8_t *)(xblka + 2);
+        const int8_t *xqsb = (const int8_t *)(xblkb + 2);
+
+        rocm_v16i8 a1, bv1a, bv1b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a1[kk]   = wqs[kk];
+            bv1a[kk] = xqsa[kk];
+            bv1b[kk] = xqsb[kk];
+        }
+        rocm_v8i32 acc_a1 = {0,0,0,0,0,0,0,0};
+        rocm_v8i32 acc_b1 = {0,0,0,0,0,0,0,0};
+        acc_a1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bv1a, acc_a1, false);
+        acc_b1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bv1b, acc_b1, false);
+
+        rocm_v16i8 a2, bv2a, bv2b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk]   = wqs[16 + kk];
+            bv2a[kk] = xqsa[16 + kk];
+            bv2b[kk] = xqsb[16 + kk];
+        }
+        rocm_v8i32 acc_a2 = {0,0,0,0,0,0,0,0};
+        rocm_v8i32 acc_b2 = {0,0,0,0,0,0,0,0};
+        acc_a2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2a, acc_a2, false);
+        acc_b2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2b, acc_b2, false);
+
+        _Pragma("unroll")
+        for (int i = 0; i < 8; i++) {
+            ca[i] += (float)(acc_a1[i] + acc_a2[i]) * combined_a;
+            cb[i] += (float)(acc_b1[i] + acc_b2[i]) * combined_b;
+        }
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r  = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t ta = t0 + col_in_tile;
+        const uint32_t tb = t0 + 16u + col_in_tile;
+        if (r < rank) {
+            if (ta < n_tokens) low[((uint64_t)ta * n_groups + g) * rank + r] = ca[i];
+            if (tb < n_tokens) low[((uint64_t)tb * n_groups + g) * rank + r] = cb[i];
+        }
+    }
+}
+
 static int rocm_attention_output_low_q8_dispatch(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -4288,7 +4389,48 @@ static int rocm_attention_output_low_q8_dispatch(
                                 && group_dim >= 4096u
                                 && n_tokens  >= 64u;
             const dim3 wblock(32u);
-            if (wide_ok) {
+            /* WMMA_I8 wide path: microquantize heads once across all
+             * (token * n_groups) rows, then run the I8 wmma_wide kernel.
+             * Mirrors matmul_q8_0 I8 wins (~2x kernel speedup, +6%
+             * end-to-end).  Default on (DS4_ROCM_WMMA_I8=0 to disable).  */
+            static int g_attn_low_i8_cached = -1;
+            if (g_attn_low_i8_cached < 0) {
+                const char *env = getenv("DS4_ROCM_WMMA_I8");
+                g_attn_low_i8_cached = (env && env[0] == '0') ? 0 : 1;
+            }
+            int dispatched_attn_i8 = 0;
+            if (wide_ok && g_attn_low_i8_cached
+                && (group_dim % 32u) == 0u) {
+                const uint64_t outer_rows = (uint64_t)n_tokens * n_groups;
+                const uint32_t blocks_per_row = (uint32_t)(group_dim / 32u);
+                const uint64_t scratch_bytes  = outer_rows * blocks_per_row * 34ull;
+                if (rocm_act_q8_scratch_ensure(scratch_bytes)) {
+                    /* Microquant outer = n_tokens * n_groups, in_dim = group_dim.
+                     * The microquant kernel writes [outer * blocks_per_row * 34]. */
+                    const dim3 mq_block(32u);
+                    const dim3 mq_grid(blocks_per_row, (unsigned)outer_rows);
+                    hipLaunchKernelGGL(rocm_activation_microquant_q8_kernel,
+                                       mq_grid, mq_block, 0, g_stream,
+                                       g_act_q8_scratch,
+                                       (const float *)tensor_u8_const(heads),
+                                       (uint32_t)group_dim, (uint32_t)outer_rows);
+                    const uint64_t heads_row_bytes = (uint64_t)blocks_per_row * 34ull;
+                    const dim3 wgrid((unsigned)((rank + 15u) / 16u),
+                                     (unsigned)n_groups,
+                                     (unsigned)((n_tokens + 31u) / 32u));
+                    hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_wide_i8_kernel,
+                                       wgrid, wblock, 0, g_stream,
+                                       (float *)tensor_u8(low),
+                                       (const uint8_t *)w_dev,
+                                       g_act_q8_scratch,
+                                       (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                                       row_bytes, group_w_bytes, heads_row_bytes);
+                    ok = rocm_launch_done("attn out low Q8 wmma_wide_i8 launch",
+                                          "attn out low Q8 wmma_wide_i8 completion");
+                    dispatched_attn_i8 = 1;
+                }
+            }
+            if (!dispatched_attn_i8 && wide_ok) {
                 /* Grid order (X=rank, Y=group, Z=token) is intentional.
                  *
                  * Stage 1's `heads` layout is [token, n_head, head_dim],
@@ -4319,7 +4461,7 @@ static int rocm_attention_output_low_q8_dispatch(
                                    row_bytes, group_w_bytes);
                 ok = rocm_launch_done("attn out low Q8 wmma_wide launch",
                                       "attn out low Q8 wmma_wide completion");
-            } else {
+            } else if (!dispatched_attn_i8) {
                 /* X=token, Y=rank tile, Z=group — see kernel comment. */
                 const dim3 wgrid((unsigned)((n_tokens + 15u) / 16u),
                                  (unsigned)((rank     + 15u) / 16u),

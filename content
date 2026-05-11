@@ -1,0 +1,38 @@
+IQ2_XXS gate_up LDS-grid landed +2.7% prefill (closed)
+
+CLOSED 2026-05-11 positive +2.7% prefill. Landed in commit f140eef.
+
+Approach: stage rocm_iq2xxs_grid[256] (2 KiB) + rocm_ksigns_iq2xs[128]
+into __shared__ LDS once per block (32 lanes loading 8+4 entries each,
+one __syncthreads).  Grid lookups in the inner WMMA loop read as uint64
+from LDS and byte-extract via register shift; sign lookups are direct
+LDS byte reads.
+
+Measured (median of 3, --temp 0 --seed 42, baseline = DS4_ROCM_MOE_LDS_GRID=0):
+  184-tok long_prompt.txt:  81.63 -> 83.84 t/s  (+2.7%)
+  260-word long_prompt2:    88.47 -> 90.41 t/s  (+2.2%)
+  700-word longprompt:      95.50 -> 96.29 t/s  (+0.8%)
+
+Validation: kernel test OK (40 tests).  Validation gate prompt produces
+coherent multi-paragraph thinking-mode output; short-prompt prefill
+unchanged (WMMA path doesn't fire below n_tok=128).
+
+Output drifts to a different token stream vs the original kernel -- same
+class as WMMA-vs-scalar drift already accepted in this codebase.  Both
+remain coherent.
+
+Updated memory:
+  - feedback_iq2_lds_grid_win.md (new)
+  - feedback_prefill_ceiling_locked_weights.md (ceiling 80 -> 84 t/s)
+  - feedback_iq2_grid_load.md (clarified global vs LDS path)
+
+FOLLOW-UP opportunities (separate tsk if pursued):
+  1. Mirror LDS-staging to rocm_moe_gate_up_iq2xxs_wmma_i8_kernel
+     (DS4_ROCM_MOE_WMMA_I8=1; same grid+ksigns access pattern).
+     Per feedback_wmma_i8_path.md the I8 MoE bottleneck is
+     memory-instruction throughput -- LDS-grid attacks exactly that.
+  2. Mirror to rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel (opt-in).
+  3. Q2_K down kernel has divergent scale reads (12 B / block).  Smaller
+     LUT than IQ2_XXS grid (2 KiB) so smaller cycle savings; speculative.
+
+Related: tsk-71, feedback_moe_wmma_at_memunit_ceiling.md.

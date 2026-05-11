@@ -1,0 +1,63 @@
+Re-bench MTP speculative decoding with WMMA-small-n_tok hole closed
+
+STATUS: open. Successor to the negative MTP result in project_mtp_rocm_negative.md.
+
+CONTEXT: MTP regressed -14..-78% in the prior attempt because the verify-N
+matmul/attn_out kernels fell into the WMMA threshold gap at n_tok=2..15
+and ran on the scalar tile kernel at ~17% peak FLOPS. That gap is now
+closed by commit eb99f50 (lowered WMMA threshold to n_tok>=2). Microbench
+shows 3-9x speedup on (4096,4096) and (8192,4096) Q8_0/F16 matmuls at
+n_tok=8. The MoE wave_n8 path naturally scales with n_tokens via the
+grid axis so it should not be in a hole.
+
+GOAL: positive decode throughput (t/s) with --mtp-draft K for some K
+in {2, 4, 8}, vs autoregressive baseline.
+
+BASELINE (to capture before starting):
+  ./ds4 --backend rocm -p \"<long prompt>\" -n 200 --temp 0 --seed 42
+  Record: decode t/s with default (mtp_draft_tokens=1, i.e., off)
+
+NEXT STEPS:
+1. Capture autoregressive decode baseline (n_tok=1 path). Use the
+   validation gate prompt; report decode t/s.
+2. Run with --mtp-draft 2, 4, 8 (--temp 0 for deterministic verify).
+   Confirm output is identical to baseline (temp=0 should be exact).
+   Report decode t/s and accept-rate at each K.
+3. If a K wins: check the kernel time histogram with DS4_ROCM_TIME=1
+   to verify the bottleneck shifted (no kernel should be in a hole).
+4. If all K regress: profile with DS4_ROCM_TIME=1 + DS4_ROCM_SYNC_EACH=1
+   to find the remaining hole. Likely suspects:
+   - MoE wave_n8 at small n_tok (per-row, per-token grid -- should scale)
+   - Attention prefill_raw_heads or fa kernels at n_tok < 16
+   - Compressor / RoPE / norm kernels at n_tok < threshold
+5. Land --mtp-draft N as default for decode if any K wins by >10%.
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test -- must end OK (40 tests)
+- ./ds4 --backend rocm -p \"Briefly explain what makes the AMD Strix Halo
+  APU well-suited for running large language models on a single chip.\"
+  -n 200 --temp 0 --seed 42 -- must stay coherent
+- Compare temp=0 output with --mtp-draft K vs baseline; must be
+  byte-identical (MTP verify is strict).
+
+RISKS:
+- MoE wave_n8 may have internal latency overhead that doesn't scale to
+  small n_tok cleanly; may need a wave_n8 variant tuned for n_tok=2..8.
+- Attention prefill kernels (br16 prefill, prefill_raw_heads) have
+  thresholds we haven't touched; may also be in a hole at small n_tok.
+- Quality at temp>0 needs separate validation (verify samples from same
+  distribution).
+
+UPPER BOUND (back-of-envelope):
+  Autoregressive decode is bounded by total weight bytes / DRAM bandwidth.
+  At ~3 GB/layer * 43 layers = ~130 GB / 188 GB/s = ~700 ms / token = ~1.4 t/s
+  theoretical pure-DRAM floor. Actual decode is faster because IC absorbs
+  some, kernels overlap, etc. With K=4 accepted draft tokens per big-pass,
+  effective t/s scales by accept-rate * K. Realistic 2-3x.
+
+RELATED:
+- project_mtp_rocm_negative.md (prior failure mode)
+- feedback_wmma_paths.md (WMMA dispatch logic)
+- feedback_microbench.md (matmul bench harness)
+- commit eb99f50 (this session's threshold change)

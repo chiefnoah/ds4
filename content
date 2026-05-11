@@ -1,0 +1,48 @@
+WMMA-gather MoE prefill kernel
+
+Status: open. Biggest single lever for prefill on Strix Halo.
+
+Goal: get routed_moe_batch from current ~160 ms/call to ~50 ms/call by
+batching tokens picking the same expert into a dense matmul, then doing
+WMMA over IQ2_XXS/Q2_K weights after on-the-fly dequant to F16 in LDS.
+
+Why current path is at the ceiling:
+- wave_n8 kernel reads each expert weight row n_tokens times (no cross-
+  token reuse).  Per memory note feedback_moe_at_memory_unit_limit.md,
+  it saturates DRAM at 188 GiB/s (~93% of 256 GiB/s bus).  Reading less
+  is the only knob.
+- Legacy EM path (DS4_ROCM_MOE_EM=1) regresses 3x at long prefill (430
+  vs 159 ms/call).  Per per-pair CHUNK=4 register pressure on gfx1151
+  (matches llama.cpp issue #21284: gfx1151 spills at high VGPR).  Also
+  no WMMA, so compute-bound at ~130 ms.  Reducing max_dense to
+  min(n_pairs, total_experts) tried, no measurable difference.
+
+Proposed design:
+1. Scheduler kernel (existing rocm_moe_group_pairs_kernel, fine) builds
+   per-expert pair lists.
+2. Per-expert WMMA matmul kernel:
+   - Block: one expert, NROWS=16 output rows × 16 tokens token-tile.
+   - LDS: 16x256 F16 weight tile (dequant from IQ2_XXS on the fly),
+     16x16 F16 activation tile (gathered from x via pair_token).
+   - 16x16x16 WMMA inner over in_dim/16=256 K-iterations.
+   - Accumulate F32; apply silu(gate)*up*weight; write to mid[].
+3. Similar gather + WMMA for the Q2_K down kernel.
+
+Key llama.cpp findings (from research agent 2026-05-11):
+- gfx1151 wants mmq_x=48, mmq_y=64, nwarps=4 (not their default 128/128/8
+  which spills VGPR).  See llama.cpp issue #21284.
+- AMD_WMMA path uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32.
+- IQ2_XXS has no native WMMA tile in llama.cpp; must dequant→F16 first.
+- No double-buffer / cp.async on AMD path.
+
+Expected impact: routed_moe 6.85 sec → ~1.5 sec at end-to-end on the
+855-token benchmark.  Combined with already-landed BR=16 FA, prefill
+51 → ~90-100 t/s.  Memory-bound ceiling on Strix Halo for this model
+is ~500-570 t/s (80 GB weights at 188 GiB/s × 43 layers).
+
+Validation: ds4_rocm_kernel_test must pass.  End-to-end on --seed 42
+--temp 0 prompt must produce same first ~30 tokens as baseline (small
+drift after that is expected due to F32→F16 quant of activations).
+
+Related: feedback_em_moe_never_wins_gfx1151.md (says EM dead — but
+that was without WMMA path; WMMA flips the math).

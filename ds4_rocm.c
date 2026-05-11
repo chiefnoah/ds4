@@ -8432,6 +8432,174 @@ static void rocm_moe_gate_up_iq2xxs_wmma_kernel(
     }
 }
 
+/* WMMA_I8 routed-MoE gate_up (IQ2_XXS).  Companion to the WMMA_F16 kernel
+ * above.  Both gate and up weights are stored as raw signed int8 (sign
+ * applied per-bit from the IQ2_XXS sign byte; grid magnitudes top out
+ * at 43, so int8 is comfortable).  The per-sub-block fp16 scale comes
+ * out of the WMMA: we run v_wmma_i32_16x16x16_iu8 against microquantized
+ * int8 activations (Q8_0 block format: 32 i8 + fp16 scale) and fold the
+ * int32 accumulator to fp32 once per K=32 step using (gscale * x_scale).
+ * That saves the 64 per-weight fp16 multiplications the F16 path runs
+ * per sub-block per row, which is the dominant VALU work in the F16
+ * version.  Activations are microquantized once per layer via the same
+ * rocm_activation_microquant_q8_kernel the matmul_q8_0 I8 path uses. */
+__global__ __launch_bounds__(32, 8)
+static void rocm_moe_gate_up_iq2xxs_wmma_i8_kernel(
+        float *mid,
+        const uint8_t *gate_pool,
+        const uint8_t *up_pool,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        const uint8_t *x_q8,
+        uint64_t       x_row_bytes,
+        const uint32_t *expert_ids,
+        const uint32_t *expert_pair_offsets,
+        const uint32_t *pair_token,
+        const uint32_t *pair_slot,
+        const float    *pair_weight,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        float clamp) {
+    const uint32_t e_dense    = blockIdx.y;
+    const uint32_t pair_start = expert_pair_offsets[e_dense];
+    const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u];
+    if (pair_start >= pair_end) return;
+    const uint32_t e          = expert_ids[e_dense];
+
+    const uint32_t row_base = blockIdx.x * 16u;
+    if (row_base >= mid_dim) return;
+
+    const uint32_t lane        = threadIdx.x & 31u;
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t out_row     = row_base + row_in_tile;
+    const uint32_t safe_row    = (out_row < mid_dim) ? out_row : (mid_dim - 1u);
+
+    const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *)
+        (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)safe_row * gate_row_bytes);
+    const rocm_block_iq2_xxs *up_row_p   = (const rocm_block_iq2_xxs *)
+        (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)safe_row * up_row_bytes);
+
+    const uint32_t nb         = in_dim / DS4_QK_K;
+    const uint32_t total_subs = nb * 8u;
+
+    for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += 16u) {
+        const uint32_t p_in_tile     = lane & 15u;
+        const uint32_t pair_idx_raw  = pair_base + p_in_tile;
+        const int      pair_valid    = (pair_idx_raw < pair_end);
+        const uint32_t pair_clamped  = pair_valid ? pair_idx_raw : (pair_end - 1u);
+        const uint32_t token         = pair_token[pair_clamped];
+        const uint8_t *x_pair        = x_q8 + (uint64_t)token * x_row_bytes;
+
+        rocm_v8f32 c_gate = {0,0,0,0,0,0,0,0};
+        rocm_v8f32 c_up   = {0,0,0,0,0,0,0,0};
+
+        for (uint32_t sub = 0; sub < total_subs; sub++) {
+            const uint32_t bi   = sub >> 3;
+            const uint32_t ib32 = sub & 7u;
+
+            const uint8_t *xblk = x_pair + (uint64_t)sub * 34u;
+            const uint16_t x_scale_bits = (uint16_t)xblk[0] | ((uint16_t)xblk[1] << 8);
+            const float x_scale = rocm_f16_to_f32(x_scale_bits);
+            const int8_t *xqs = (const int8_t *)(xblk + 2);
+            rocm_v16i8 bv1, bv2;
+            _Pragma("unroll")
+            for (int kk = 0; kk < 16; kk++) {
+                bv1[kk] = xqs[kk];
+                bv2[kk] = xqs[16 + kk];
+            }
+
+            const rocm_block_iq2_xxs *gb = gate_row_p + bi;
+            const float    gd     = rocm_f16_to_f32(gb->d);
+            const uint16_t *gq    = gb->qs + ib32 * 4u;
+            const uint32_t ag     = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16);
+            const uint32_t asg    = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16);
+            const float    gscale = gd * (0.5f + (float)(asg >> 28)) * 0.25f;
+            const uint8_t *g0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  0));
+            const uint8_t *g1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >>  8));
+            const uint8_t *g2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 16));
+            const uint8_t *g3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(ag >> 24));
+            const uint8_t gs0 = rocm_ksigns_iq2xs[(asg >>  0) & 127u];
+            const uint8_t gs1 = rocm_ksigns_iq2xs[(asg >>  7) & 127u];
+            const uint8_t gs2 = rocm_ksigns_iq2xs[(asg >> 14) & 127u];
+            const uint8_t gs3 = rocm_ksigns_iq2xs[(asg >> 21) & 127u];
+
+            rocm_v16i8 a_gate1, a_gate2;
+            _Pragma("unroll")
+            for (int j = 0; j < 8; j++) {
+                a_gate1[j]      = (int8_t)((int)g0[j] * (((gs0 >> j) & 1u) ? -1 : 1));
+                a_gate1[j + 8]  = (int8_t)((int)g1[j] * (((gs1 >> j) & 1u) ? -1 : 1));
+                a_gate2[j]      = (int8_t)((int)g2[j] * (((gs2 >> j) & 1u) ? -1 : 1));
+                a_gate2[j + 8]  = (int8_t)((int)g3[j] * (((gs3 >> j) & 1u) ? -1 : 1));
+            }
+
+            const rocm_block_iq2_xxs *ub = up_row_p + bi;
+            const float    ud     = rocm_f16_to_f32(ub->d);
+            const uint16_t *uq    = ub->qs + ib32 * 4u;
+            const uint32_t uag    = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16);
+            const uint32_t uas    = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16);
+            const float    uscale = ud * (0.5f + (float)(uas >> 28)) * 0.25f;
+            const uint8_t *u0 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >>  0));
+            const uint8_t *u1 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >>  8));
+            const uint8_t *u2 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >> 16));
+            const uint8_t *u3 = (const uint8_t *)(rocm_iq2xxs_grid + (uint8_t)(uag >> 24));
+            const uint8_t us0 = rocm_ksigns_iq2xs[(uas >>  0) & 127u];
+            const uint8_t us1 = rocm_ksigns_iq2xs[(uas >>  7) & 127u];
+            const uint8_t us2 = rocm_ksigns_iq2xs[(uas >> 14) & 127u];
+            const uint8_t us3 = rocm_ksigns_iq2xs[(uas >> 21) & 127u];
+
+            rocm_v16i8 a_up1, a_up2;
+            _Pragma("unroll")
+            for (int j = 0; j < 8; j++) {
+                a_up1[j]      = (int8_t)((int)u0[j] * (((us0 >> j) & 1u) ? -1 : 1));
+                a_up1[j + 8]  = (int8_t)((int)u1[j] * (((us1 >> j) & 1u) ? -1 : 1));
+                a_up2[j]      = (int8_t)((int)u2[j] * (((us2 >> j) & 1u) ? -1 : 1));
+                a_up2[j + 8]  = (int8_t)((int)u3[j] * (((us3 >> j) & 1u) ? -1 : 1));
+            }
+
+            rocm_v8i32 acc_g1 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_g2 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_u1 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_u2 = {0,0,0,0,0,0,0,0};
+            acc_g1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_gate1, true, bv1, acc_g1, false);
+            acc_g2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_gate2, true, bv2, acc_g2, false);
+            acc_u1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_up1,   true, bv1, acc_u1, false);
+            acc_u2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_up2,   true, bv2, acc_u2, false);
+
+            const float combined_g = gscale * x_scale;
+            const float combined_u = uscale * x_scale;
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) {
+                c_gate[i] += (float)(acc_g1[i] + acc_g2[i]) * combined_g;
+                c_up[i]   += (float)(acc_u1[i] + acc_u2[i]) * combined_u;
+            }
+        }
+
+        const uint32_t p = pair_base + p_in_tile;
+        if (p < pair_end) {
+            const uint32_t slot = pair_slot[p];
+            const uint32_t tok  = pair_token[p];
+            const float    w    = pair_weight[p];
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) {
+                const uint32_t r = row_base + (lane >> 4) + (uint32_t)i * 2u;
+                if (r < mid_dim) {
+                    float gv = c_gate[i];
+                    float uv = c_up[i];
+                    if (clamp > 1.0e-6f) {
+                        if (gv > clamp) gv = clamp;
+                        if (uv > clamp) uv = clamp;
+                        if (uv < -clamp) uv = -clamp;
+                    }
+                    mid[((uint64_t)tok * n_used + slot) * mid_dim + r] = rocm_silu(gv) * uv * w;
+                }
+            }
+        }
+    }
+}
+
 /* WMMA-gather routed-MoE down (Q2_K).  Mirrors the gate_up kernel: each
  * block produces a 16-row x 16-pair output tile via v_wmma_*.  Per K-step
  * (one Q2_K sub-block = 16 elements) lane L=(L%16) dequants its row's 16
@@ -8804,7 +8972,48 @@ static int rocm_moe_run(
              * blocks past n_unique bail on pair_start >= pair_end. */
             const uint32_t gu_grid_y = (max_dense < (uint32_t)total_experts)
                                         ? max_dense : (uint32_t)total_experts;
-            if (wm_ok && gu_grid_y > 0u) {
+            /* I8 path: microquantize activations once then run WMMA_I8 gate_up.
+             * Default on (set DS4_ROCM_MOE_WMMA_I8=0 to disable).  Mirrors the
+             * matmul_q8_0 WMMA_I8 path: replaces per-weight fp16 scaling with
+             * one (gscale * x_scale) fold per K=32 sub-block. */
+            static int g_moe_wmma_i8_cached = -1;
+            if (g_moe_wmma_i8_cached < 0) {
+                const char *env = getenv("DS4_ROCM_MOE_WMMA_I8");
+                g_moe_wmma_i8_cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            int dispatched_gu_i8 = 0;
+            if (wm_ok && gu_grid_y > 0u && g_moe_wmma_i8_cached
+                && (expert_in_dim % 32u) == 0u) {
+                const uint32_t blocks_per_row = expert_in_dim / 32u;
+                const uint64_t scratch_bytes  = (uint64_t)n_tokens * blocks_per_row * 34ull;
+                if (rocm_act_q8_scratch_ensure(scratch_bytes)) {
+                    const dim3 mq_block(32u);
+                    const dim3 mq_grid(blocks_per_row, n_tokens);
+                    hipLaunchKernelGGL(rocm_activation_microquant_q8_kernel,
+                                       mq_grid, mq_block, 0, g_stream,
+                                       g_act_q8_scratch,
+                                       (const float *)tensor_u8_const(x),
+                                       expert_in_dim, n_tokens);
+                    dim3 gu_grid(gu_row_blocks, gu_grid_y, 1);
+                    dim3 gu_block(32u, 1, 1);
+                    hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_i8_kernel,
+                                       gu_grid, gu_block, 0, g_stream,
+                                       (float *)tensor_u8(mid),
+                                       (const uint8_t *)gate_d,
+                                       (const uint8_t *)up_d,
+                                       gate_expert_bytes, gate_row_bytes,
+                                       up_expert_bytes, up_row_bytes,
+                                       g_act_q8_scratch,
+                                       (uint64_t)blocks_per_row * 34ull,
+                                       sched_expert_ids, sched_expert_pair_off,
+                                       sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                       expert_in_dim, expert_mid_dim, n_used, clamp);
+                    wm_ok = rocm_launch_done("moe wmma_i8 gate_up launch",
+                                             "moe wmma_i8 gate_up completion");
+                    dispatched_gu_i8 = 1;
+                }
+            }
+            if (wm_ok && gu_grid_y > 0u && !dispatched_gu_i8) {
                 dim3 gu_grid(gu_row_blocks, gu_grid_y, 1);
                 dim3 gu_block(32u, 1, 1);
                 hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_kernel,

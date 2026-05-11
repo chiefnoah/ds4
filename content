@@ -1,0 +1,79 @@
+attn_out_q8_batch occupancy/latency optimization
+
+attn_out_q8_batch occupancy / latency optimization
+
+STATUS: open. The attn_out kernel is the second-biggest single non-MoE
+contributor to prefill wall (9.3%) and per memory is the only major
+kernel that is NOT memory-bound -- the bottleneck is different class.
+
+CONTEXT: per feedback_attn_out_stage1_wide_dead_end.md (2026-05-11):
+  "attn_out stage 1 wide-tile variants are dead-end -- 64-tok wide
+  regresses 7%; stage 1 is not memory-bound (65 GB/s eff); bottleneck
+  is occupancy/latency."
+
+Current profile (184-tok prefill, sync_each):
+  attn_out_q8_batch: 9.3% wall (236 ms / 2.54 s), 43 calls,
+                     5.49 ms/call.
+
+This is unusual: every other big kernel on the prefill profile is at
+98%+ MemUnitBusy.  attn_out at 65 GB/s effective means the memory
+unit is NOT the limit -- compute issue rate, latency hiding, or
+occupancy must be.  Different lever class.
+
+GOAL: identify the actual bottleneck via rocprofv3 PMC counters
+(MemUnitBusy, SQ_WAVES, SQ_INSTS_VALU, SALU_BUSY, VALU_BUSY,
+SQ_WAIT_INST_LDS, etc.) and apply the appropriate lever.  Threshold to
+land: >= +1.5% prefill (= ~15% kernel speedup).
+
+NEXT STEPS:
+1. rocprofv3 PMC measurement on attn_out_q8_batch at n_tok=184.
+   Counters: SQ_WAVES, MemUnitBusy, VALU_BUSY, SALU_BUSY,
+   SQ_WAIT_INST_LDS, SQ_WAIT_INST_VMEM, SQ_WAIT_INST_EXP.  Use:
+     nix shell nixpkgs#rocmPackages.rocprofiler-sdk -c \
+       rocprofv3 -i counters.txt --output-format csv \
+       --output-file out -- ./ds4 --backend rocm \
+       --prompt-file /tmp/long_prompt.txt -n 1 --temp 0 --seed 42
+   counters.txt:
+     pmc: SQ_WAVES MemUnitBusy VALU_BUSY SALU_BUSY SQ_WAIT_INST_LDS SQ_WAIT_INST_VMEM
+     kernel: rocm_matmul_q8_0_attn_out_low_wmma_wide_kernel
+              rocm_matmul_q8_0_attn_out_low_wmma_kernel
+              (whichever is dispatched at n_tok=184)
+2. Read the actual kernel (search for attn_out_low_wmma in ds4_rocm.c).
+   Note __launch_bounds__, VGPR usage (from compiler output), waves/CU,
+   inner loop structure.
+3. Based on PMC findings, apply ONE of:
+   a. If SQ_WAVES < 8: occupancy-limited.  Lower VGPR pressure (smaller
+      per-thread accumulator, recompute instead of store), or reduce
+      __launch_bounds__ second arg to allow more blocks/CU.
+   b. If SQ_WAIT_INST_VMEM high: memory-latency-limited.  Need more
+      independent loads in flight; loop unroll for software pipelining.
+   c. If VALU_BUSY < 60% AND MemUnit < 80%: compute-issue starved.
+      Check for ALU dependencies; rearrange.
+   d. If SALU_BUSY high: scalar-instruction bound (rare); compress
+      addressing.
+4. Implement one variant.  Bench 184-tok prefill 3 runs.
+5. If positive, also test on 260-word and 700-word.
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test (40 tests OK)
+- Validation prompt -n 200 --temp 0 --seed 42 coherent
+- Bench above
+
+RISKS:
+- Past wide-tile attempts on this kernel REGRESSED 7% (see
+  feedback_attn_out_stage1_wide_dead_end.md).  Don't redo wide-tile.
+- Different occupancy/latency tweaks may interact poorly with each
+  other; change one at a time.
+- VGPR pressure reductions can change accumulator precision; verify
+  output coherence carefully.
+
+UPPER BOUND: 1-3% wall.  9.3% wall fraction means a 30% kernel
+speedup is the absolute ceiling.  Realistic 10-15% kernel speedup
+= ~1-1.5% wall.
+
+RELATED:
+- feedback_attn_out_stage1_wide_dead_end.md (wide-tile already ruled out)
+- feedback_wmma_paths.md (the WMMA-default ruling)
+- feedback_wmma_i8_path.md (attn_out_low_wide WMMA_I8 already default)
+- feedback_rocprof_workflow.md (rocprofv3 setup on this NixOS box)

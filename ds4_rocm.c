@@ -4343,6 +4343,147 @@ static void rocm_attn_out_low_q8_wmma_wide_i8_kernel(
     }
 }
 
+/* LDS-staged variant of rocm_attn_out_low_q8_wmma_wide_i8_kernel.
+ *
+ * Wave32 WMMA tile layout shares row_in_tile = lane&15 across L and L+16,
+ * and col_in_tile = lane&15 across L and L+16.  In the base kernel each
+ * lane issues its own global load for wqs / xqsa / xqsb, so all three
+ * arrays are loaded 2x per K-block.  Stage them in LDS once per K-block
+ * and have all 32 lanes consume from LDS.  Mirrors the Q2_K down
+ * LDS-scales win (commit a4182b4).
+ *
+ * Staging schedule per K-block:
+ *  - Pass A (32 lanes): lanes 0..15 stage weight row[lane],
+ *                       lanes 16..31 stage tok_a row[lane-16].
+ *  - Pass B (16 lanes): lanes 0..15 stage tok_b row[lane].
+ *
+ * LDS budget: 3 * 16 * 32 = 1536 B qs + 3 * 16 * 2 = 96 B scales per
+ * block.  At launch_bounds(32, 8) → ~13 KiB total LDS, within budget. */
+__global__ __launch_bounds__(32, 8)
+static void rocm_attn_out_low_q8_wmma_wide_i8_lds_kernel(
+        float *low, const uint8_t *w, const uint8_t *heads_q8,
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens,
+        uint64_t row_bytes, uint64_t group_w_bytes,
+        uint64_t heads_row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t g    = blockIdx.y;
+    const uint32_t t0   = blockIdx.z * 32u;
+    if (r0 >= rank || t0 >= n_tokens || g >= n_groups) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+
+    /* Cooperative load pointers: each lane owns one slot (independent of
+     * row_in_tile/col_in_tile), so 32 lanes load 32 distinct rows in
+     * Pass A and 16 lanes load 16 distinct rows in Pass B. */
+    const uint32_t slot = lane & 15u;
+    const uint32_t load_w_out_row = r0 + slot;
+    const uint32_t load_w_safe    = (load_w_out_row < rank) ? load_w_out_row : (rank - 1u);
+    const uint8_t *load_w_src     = w + (uint64_t)g * group_w_bytes
+                                      + (uint64_t)load_w_safe * row_bytes;
+
+    const uint32_t load_a_tok  = t0 + slot;
+    const uint32_t load_a_safe = (load_a_tok < n_tokens) ? load_a_tok : (n_tokens - 1u);
+    const uint8_t *load_a_src  = heads_q8 + ((uint64_t)load_a_safe * n_groups + g) * heads_row_bytes;
+
+    const uint32_t load_b_tok  = t0 + 16u + slot;
+    const uint32_t load_b_safe = (load_b_tok < n_tokens) ? load_b_tok : (n_tokens - 1u);
+    const uint8_t *load_b_src  = heads_q8 + ((uint64_t)load_b_safe * n_groups + g) * heads_row_bytes;
+
+    const uint32_t blocks = group_dim >> 5;
+
+    rocm_v8f32 ca = {0, 0, 0, 0, 0, 0, 0, 0};
+    rocm_v8f32 cb = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    __shared__ uint8_t  lds_w_qs[16][32];
+    __shared__ uint8_t  lds_xa_qs[16][32];
+    __shared__ uint8_t  lds_xb_qs[16][32];
+    __shared__ uint16_t lds_w_scale[16];
+    __shared__ uint16_t lds_xa_scale[16];
+    __shared__ uint16_t lds_xb_scale[16];
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint64_t b_off = (uint64_t)b * 34u;
+
+        /* Pass A: lanes 0..15 stage weight, lanes 16..31 stage tok_a. */
+        if (lane < 16u) {
+            const uint8_t *src = load_w_src + b_off;
+            lds_w_scale[slot] = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+            const uint8_t *qs = src + 2;
+            _Pragma("unroll")
+            for (int kk = 0; kk < 32; kk++) lds_w_qs[slot][kk] = qs[kk];
+        } else {
+            const uint8_t *src = load_a_src + b_off;
+            lds_xa_scale[slot] = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+            const uint8_t *qs = src + 2;
+            _Pragma("unroll")
+            for (int kk = 0; kk < 32; kk++) lds_xa_qs[slot][kk] = qs[kk];
+        }
+
+        /* Pass B: lanes 0..15 stage tok_b. */
+        if (lane < 16u) {
+            const uint8_t *src = load_b_src + b_off;
+            lds_xb_scale[slot] = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+            const uint8_t *qs = src + 2;
+            _Pragma("unroll")
+            for (int kk = 0; kk < 32; kk++) lds_xb_qs[slot][kk] = qs[kk];
+        }
+        __syncthreads();
+
+        const uint16_t w_scale_bits  = lds_w_scale[row_in_tile];
+        const uint16_t xa_scale_bits = lds_xa_scale[col_in_tile];
+        const uint16_t xb_scale_bits = lds_xb_scale[col_in_tile];
+        const float w_scale  = rocm_f16_to_f32(w_scale_bits);
+        const float xa_scale = rocm_f16_to_f32(xa_scale_bits);
+        const float xb_scale = rocm_f16_to_f32(xb_scale_bits);
+        const float combined_a = w_scale * xa_scale;
+        const float combined_b = w_scale * xb_scale;
+
+        rocm_v16i8 a1, bv1a, bv1b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a1[kk]   = (int8_t)lds_w_qs[row_in_tile][kk];
+            bv1a[kk] = (int8_t)lds_xa_qs[col_in_tile][kk];
+            bv1b[kk] = (int8_t)lds_xb_qs[col_in_tile][kk];
+        }
+        rocm_v8i32 acc_a1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        rocm_v8i32 acc_b1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        acc_a1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bv1a, acc_a1, false);
+        acc_b1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bv1b, acc_b1, false);
+
+        rocm_v16i8 a2, bv2a, bv2b;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk]   = (int8_t)lds_w_qs[row_in_tile][16 + kk];
+            bv2a[kk] = (int8_t)lds_xa_qs[col_in_tile][16 + kk];
+            bv2b[kk] = (int8_t)lds_xb_qs[col_in_tile][16 + kk];
+        }
+        rocm_v8i32 acc_a2 = {0, 0, 0, 0, 0, 0, 0, 0};
+        rocm_v8i32 acc_b2 = {0, 0, 0, 0, 0, 0, 0, 0};
+        acc_a2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2a, acc_a2, false);
+        acc_b2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2b, acc_b2, false);
+
+        _Pragma("unroll")
+        for (int i = 0; i < 8; i++) {
+            ca[i] += (float)(acc_a1[i] + acc_a2[i]) * combined_a;
+            cb[i] += (float)(acc_b1[i] + acc_b2[i]) * combined_b;
+        }
+        __syncthreads();
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r  = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t ta = t0 + col_in_tile;
+        const uint32_t tb = t0 + 16u + col_in_tile;
+        if (r < rank) {
+            if (ta < n_tokens) low[((uint64_t)ta * n_groups + g) * rank + r] = ca[i];
+            if (tb < n_tokens) low[((uint64_t)tb * n_groups + g) * rank + r] = cb[i];
+        }
+    }
+}
+
 static int rocm_attention_output_low_q8_dispatch(
         ds4_metal_tensor       *low,
         const void             *model_map,
@@ -4433,15 +4574,36 @@ static int rocm_attention_output_low_q8_dispatch(
                     const dim3 wgrid((unsigned)((rank + 15u) / 16u),
                                      (unsigned)n_groups,
                                      (unsigned)((n_tokens + 31u) / 32u));
-                    hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_wide_i8_kernel,
-                                       wgrid, wblock, 0, g_stream,
-                                       (float *)tensor_u8(low),
-                                       (const uint8_t *)w_dev,
-                                       g_act_q8_scratch,
-                                       (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
-                                       row_bytes, group_w_bytes, heads_row_bytes);
-                    ok = rocm_launch_done("attn out low Q8 wmma_wide_i8 launch",
-                                          "attn out low Q8 wmma_wide_i8 completion");
+                    /* DS4_ROCM_ATTN_OUT_LDS: LDS-stage shared weight + token
+                     * activation rows once per K-block instead of issuing
+                     * 2x redundant global loads across lanes L and L+16.
+                     * Default ON; DS4_ROCM_ATTN_OUT_LDS=0 reverts. */
+                    static int g_attn_out_lds_cached = -1;
+                    if (g_attn_out_lds_cached < 0) {
+                        const char *env = getenv("DS4_ROCM_ATTN_OUT_LDS");
+                        g_attn_out_lds_cached = (env && env[0] == '0') ? 0 : 1;
+                    }
+                    if (g_attn_out_lds_cached) {
+                        hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_wide_i8_lds_kernel,
+                                           wgrid, wblock, 0, g_stream,
+                                           (float *)tensor_u8(low),
+                                           (const uint8_t *)w_dev,
+                                           g_act_q8_scratch,
+                                           (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                                           row_bytes, group_w_bytes, heads_row_bytes);
+                        ok = rocm_launch_done("attn out low Q8 wmma_wide_i8_lds launch",
+                                              "attn out low Q8 wmma_wide_i8_lds completion");
+                    } else {
+                        hipLaunchKernelGGL(rocm_attn_out_low_q8_wmma_wide_i8_kernel,
+                                           wgrid, wblock, 0, g_stream,
+                                           (float *)tensor_u8(low),
+                                           (const uint8_t *)w_dev,
+                                           g_act_q8_scratch,
+                                           (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens,
+                                           row_bytes, group_w_bytes, heads_row_bytes);
+                        ok = rocm_launch_done("attn out low Q8 wmma_wide_i8 launch",
+                                              "attn out low Q8 wmma_wide_i8 completion");
+                    }
                     dispatched_attn_i8 = 1;
                 }
             }

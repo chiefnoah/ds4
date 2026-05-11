@@ -1,0 +1,43 @@
+Re-bench MTP speculative decoding with WMMA-small-n_tok hole closed
+
+STATUS: open. Successor to project_mtp_rocm_negative.md.
+
+CONTEXT: MTP regressed -14..-78% in the prior attempt because the verify-N
+matmul/attn_out kernels fell into the WMMA threshold gap at n_tok=2..15
+and ran on the scalar tile kernel at ~17% peak FLOPS. That gap is now
+closed by commit eb99f50 (lowered WMMA threshold to n_tok>=2). Microbench
+shows 3-9x speedup on (4096,4096) and (8192,4096) Q8_0/F16 matmuls at
+n_tok=8. The MoE wave_n8 path naturally scales with n_tokens via the
+grid axis so it should not be in a hole.
+
+GOAL: positive decode throughput (t/s) with --mtp-draft K for some K
+in {2, 4, 8}, vs autoregressive baseline.
+
+NEXT STEPS:
+1. Capture autoregressive decode baseline.
+2. Run with --mtp-draft 2, 4, 8 (--temp 0). Verify byte-identical output.
+   Report decode t/s and accept-rate at each K.
+3. If a K wins: check DS4_ROCM_TIME=1 histogram to confirm bottleneck moved.
+4. If all K regress: profile + sync_each to find remaining hole.
+   Likely: MoE wave_n8, attention prefill kernels, compressor/RoPE/norm.
+5. Land best K as default for decode if win >10%.
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test -- must end OK (40 tests)
+- ./ds4 --backend rocm -p '<long prompt>' -n 200 --temp 0 --seed 42
+- temp=0 output with --mtp-draft K must equal baseline byte-for-byte.
+
+RISKS:
+- MoE wave_n8 may have hidden small-n_tok overhead.
+- Attention prefill br16/raw_heads thresholds also at n_tok=16; may be in hole.
+- Quality at temp>0 needs separate validation.
+
+UPPER BOUND: theoretical floor ~1.4 t/s pure-DRAM; actual much higher;
+K=4 accepted draft tokens could yield 2-3x decode speedup.
+
+RELATED:
+- project_mtp_rocm_negative.md (prior failure)
+- feedback_wmma_paths.md
+- feedback_microbench.md
+- commit eb99f50

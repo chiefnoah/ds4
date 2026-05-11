@@ -1,0 +1,36 @@
+Rebuild non-MoE Q8_0 matmuls as Q4_K/Q5_K -- requires new weights
+
+STATUS: open.  Mid-leverage quant swap.
+
+CONTEXT: matmul_q8_0_tensor accounts for 20% of prefill wall (302 calls
+at 1.5 ms/call avg).  Tensors involved (per ds4.c):
+  - attn_q_a (Q8_0): DSv4 query down-projection
+  - attn_kv (Q8_0): KV-pair projection
+  - attn_output_a / attn_output_b (Q8_0): O up + down via 2-stage
+  - shared expert gate/up/down (Q8_0)
+  - lm_head (Q8_0)
+
+All are at MemUnitBusy ~98% per feedback memory.  Quant swap to Q4_K
+(4.5 bits/elt vs Q8's 8.5 bits/elt) cuts DRAM 1.9x.  Q5_K is 5.5 bits,
+cuts 1.55x.  Pick per tensor based on quality sensitivity:
+  - attn_output (residual stream contributor): Q5_K (safer)
+  - shared experts (mid feature space): Q4_K  
+  - lm_head: stay Q8_0 (final logit quality)
+
+PER-TENSOR ESTIMATE: weighted avg ~1.7x DRAM cut -> matmul_q8_0 portion
+drops from 20% to ~12% = -8% wall.
+
+INTERACTION: this works ADDITIVELY with IQ1_S MoE rebuild.  Combined
+weight savings on the same prefill = ~32% wall reduction.
+
+PLAN:
+  1. Add Q4_K and Q5_K dequant kernels to ds4_rocm.c (block_q4_K is 16
+     elt scales + 12 byte qs vs Q8's 2-byte scale + 32-byte qs).
+  2. Add per-tensor quant-type metadata to GGUF parse path.
+  3. Add WMMA variants matching the existing Q8_0 WMMA paths.
+  4. A/B kernel benchmarks.
+
+SUCCESS CRITERIA:
+  - matmul kernel test green for all new quant variants.
+  - Long prefill +5 to +8 t/s.
+  - Output remains coherent.

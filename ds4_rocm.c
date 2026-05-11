@@ -6546,72 +6546,16 @@ int ds4_metal_attention_decode_heads_tensor(
     return ok;
 }
 
-/* prefill_raw_heads: n_tokens parallel decode steps where token t attends
- * to a sliding window of the linearly-stored raw KV (no ring).  Each grid
- * tile is one (token, head) pair. */
-__global__ static void rocm_attn_prefill_raw_heads_kernel(
-        float *out,
-        const float *q,
-        const float *raw_kv,
-        const float *sinks,
-        uint32_t n_tokens,
-        uint32_t window,
-        uint32_t n_head,
-        uint32_t head_dim) {
-    extern __shared__ float smem[];
-    const uint32_t t = blockIdx.x;
-    const uint32_t h = blockIdx.y;
-    if (t >= n_tokens || h >= n_head) return;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t bs = blockDim.x;
-
-    const uint32_t r0 = (t + 1u > window) ? t + 1u - window : 0u;
-    const uint32_t n_kv = t + 1u - r0;
-    float *scores = smem;
-    float *part = smem + n_kv;
-
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    const float kq_scale = rsqrtf((float)head_dim);
-
-    for (uint32_t i = tid; i < n_kv; i += bs) {
-        const float *kv = raw_kv + (uint64_t)(r0 + i) * head_dim;
-        float s = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) s += qh[d] * kv[d];
-        scores[i] = s * kq_scale;
-    }
-    __syncthreads();
-
-    float lmax = -1.0e30f;
-    for (uint32_t i = tid; i < n_kv; i += bs) if (scores[i] > lmax) lmax = scores[i];
-    if (tid == 0 && sinks[h] > lmax) lmax = sinks[h];
-    part[tid] = lmax;
-    __syncthreads();
-    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
-        if (tid < s) part[tid] = fmaxf(part[tid], part[tid + s]);
-        __syncthreads();
-    }
-    const float maxs = part[0];
-
-    for (uint32_t i = tid; i < n_kv; i += bs) scores[i] = expf(scores[i] - maxs);
-    __syncthreads();
-
-    float lsum = (tid == 0) ? expf(sinks[h] - maxs) : 0.0f;
-    for (uint32_t i = tid; i < n_kv; i += bs) lsum += scores[i];
-    part[tid] = lsum;
-    __syncthreads();
-    for (uint32_t s = bs / 2; s > 0; s >>= 1) {
-        if (tid < s) part[tid] += part[tid + s];
-        __syncthreads();
-    }
-    const float denom = part[0];
-
-    float *out_th = out + ((uint64_t)t * n_head + h) * head_dim;
-    for (uint32_t d = tid; d < head_dim; d += bs) {
-        float acc = 0.0f;
-        for (uint32_t i = 0; i < n_kv; i++) acc += scores[i] * raw_kv[(uint64_t)(r0 + i) * head_dim + d];
-        out_th[d] = acc / denom;
-    }
-}
+static int rocm_attn_batch_dispatch(
+        ds4_metal_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_metal_tensor *q,
+        const ds4_metal_tensor *raw_kv, const ds4_metal_tensor *comp_kv,
+        const ds4_metal_tensor *comp_mask, const ds4_metal_tensor *topk,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, uint32_t pos0,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t top_k, int use_topk, int use_comp_mask, int mode_static,
+        const char *what);
 
 int ds4_metal_attention_prefill_raw_heads_tensor(
         ds4_metal_tensor       *heads,
@@ -6630,30 +6574,18 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
     if (!heads || !model_map || !q || !raw_kv ||
         n_tokens == 0 || window == 0 || n_head == 0 || head_dim == 0) return 0;
 
-    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
-    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
-        q->bytes < q_bytes || raw_kv->bytes < kv_bytes || heads->bytes < q_bytes) return 0;
-
-    void *sink_h = NULL, *sink_d = NULL;
-    if (!rocm_upload_mapped((const uint8_t *)model_map + sinks_offset, sink_bytes,
-                            &sink_h, &sink_d, "prefill raw sinks upload")) return 0;
-
-    const uint32_t threads = 128;
-    const uint64_t smem_bytes = ((uint64_t)window + threads) * sizeof(float);
-    dim3 grid(n_tokens, n_head, 1);
-    dim3 block(threads, 1, 1);
-    hipLaunchKernelGGL(rocm_attn_prefill_raw_heads_kernel, grid, block,
-                       (uint32_t)smem_bytes, g_stream,
-                       (float *)tensor_u8(heads),
-                       (const float *)tensor_u8_const(q),
-                       (const float *)tensor_u8_const(raw_kv),
-                       (const float *)sink_d,
-                       n_tokens, window, n_head, head_dim);
-    int ok = rocm_launch_done("attn prefill raw launch", "attn prefill raw completion");
-    rocm_defer_free(sink_h);
-    return ok;
+    /* Reuse the FA streaming-softmax batch dispatch for the static prefill
+     * raw-K path.  mode_static=1, n_raw=n_tokens, pos0=0, no comp keys.
+     * The FA kernel parallelizes the QK dot across a wave (32 lanes) and
+     * amortizes K reads over BR Q rows -- both wins the legacy
+     * rocm_attn_prefill_raw_heads_kernel lacked (it ran serial 512-FMA
+     * dots on one thread). */
+    return rocm_attn_batch_dispatch(heads, model_map, model_size, sinks_offset,
+                                    q, raw_kv, NULL, NULL, NULL,
+                                    n_tokens, n_head, head_dim, 0u,
+                                    n_tokens, n_tokens, 0u,
+                                    0u, window, 1u, 0u, 0, 0, 1,
+                                    "prefill_raw");
 }
 
 /* Batch attention kernel.  Handles all five remaining attention variants by

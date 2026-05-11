@@ -8940,6 +8940,185 @@ static void rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel(
     }
 }
 
+/* Persistent variant with LDS-staged iq2xxs grid + ksigns.  Same body as
+ * rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel; LDS staging happens
+ * once at block start (outside the grid-stride tile loop) so the cost
+ * amortizes across every tile this persistent block handles. */
+__global__ __launch_bounds__(32, 8)
+static void rocm_moe_gate_up_iq2xxs_wmma_persistent_lds_grid_kernel(
+        float *mid,
+        const uint8_t *gate_pool,
+        const uint8_t *up_pool,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        const float *x,
+        const uint32_t *expert_ids,
+        const uint32_t *expert_pair_offsets,
+        const uint32_t *pair_token,
+        const uint32_t *pair_slot,
+        const float    *pair_weight,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint32_t n_row_blocks,
+        uint32_t n_experts_dense,
+        float clamp) {
+    __shared__ uint64_t lds_grid[256];
+    __shared__ uint8_t  lds_ksigns[128];
+
+    const uint32_t lane = threadIdx.x & 31u;
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t idx = lane + (uint32_t)i * 32u;
+        lds_grid[idx] = rocm_iq2xxs_grid[idx];
+    }
+    _Pragma("unroll")
+    for (int i = 0; i < 4; i++) {
+        const uint32_t idx = lane + (uint32_t)i * 32u;
+        lds_ksigns[idx] = rocm_ksigns_iq2xs[idx];
+    }
+    __syncthreads();
+
+    const uint32_t pid = blockIdx.x;
+    const uint32_t stride = gridDim.x;
+    const uint32_t total_tiles = n_row_blocks * n_experts_dense;
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t nb         = in_dim / DS4_QK_K;
+    const uint32_t total_subs = nb * 8u;
+
+    for (uint32_t tile = pid; tile < total_tiles; tile += stride) {
+        const uint32_t e_dense  = tile / n_row_blocks;
+        const uint32_t row_block = tile - e_dense * n_row_blocks;
+
+        const uint32_t pair_start = expert_pair_offsets[e_dense];
+        const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u];
+        if (pair_start >= pair_end) continue;
+        const uint32_t e = expert_ids[e_dense];
+
+        const uint32_t row_base = row_block * 16u;
+        if (row_base >= mid_dim) continue;
+        const uint32_t out_row  = row_base + row_in_tile;
+        const uint32_t safe_row = (out_row < mid_dim) ? out_row : (mid_dim - 1u);
+
+        const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *)
+            (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)safe_row * gate_row_bytes);
+        const rocm_block_iq2_xxs *up_row_p   = (const rocm_block_iq2_xxs *)
+            (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)safe_row * up_row_bytes);
+
+        for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += 16u) {
+            const uint32_t p_in_tile     = lane & 15u;
+            const uint32_t pair_idx_raw  = pair_base + p_in_tile;
+            const int      pair_valid    = (pair_idx_raw < pair_end);
+            const uint32_t pair_clamped  = pair_valid ? pair_idx_raw : (pair_end - 1u);
+            const uint32_t token         = pair_token[pair_clamped];
+            const float   *x_pair        = x + (uint64_t)token * in_dim;
+
+            rocm_v8f32 c_gate = {0,0,0,0,0,0,0,0};
+            rocm_v8f32 c_up   = {0,0,0,0,0,0,0,0};
+
+            for (uint32_t sub = 0; sub < total_subs; sub++) {
+                const uint32_t bi   = sub >> 3;
+                const uint32_t ib32 = sub & 7u;
+
+                const rocm_block_iq2_xxs *gb = gate_row_p + bi;
+                const float    gd     = rocm_f16_to_f32(gb->d);
+                const uint16_t *gq    = gb->qs + ib32 * 4u;
+                const uint32_t ag     = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16);
+                const uint32_t asg    = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16);
+                const float    gscale = gd * (0.5f + (float)(asg >> 28)) * 0.25f;
+                const _Float16 gsh    = (_Float16)gscale;
+                const uint64_t g0u64  = lds_grid[(uint32_t)(uint8_t)(ag >>  0)];
+                const uint64_t g1u64  = lds_grid[(uint32_t)(uint8_t)(ag >>  8)];
+                const uint64_t g2u64  = lds_grid[(uint32_t)(uint8_t)(ag >> 16)];
+                const uint64_t g3u64  = lds_grid[(uint32_t)(uint8_t)(ag >> 24)];
+                const uint8_t gs0 = lds_ksigns[(asg >>  0) & 127u];
+                const uint8_t gs1 = lds_ksigns[(asg >>  7) & 127u];
+                const uint8_t gs2 = lds_ksigns[(asg >> 14) & 127u];
+                const uint8_t gs3 = lds_ksigns[(asg >> 21) & 127u];
+
+                rocm_v16f16 a_gate1, a_gate2;
+                _Pragma("unroll")
+                for (int j = 0; j < 8; j++) {
+                    const float v0 = (float)(uint8_t)(g0u64 >> (j * 8)) * (((gs0 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v1 = (float)(uint8_t)(g1u64 >> (j * 8)) * (((gs1 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v2 = (float)(uint8_t)(g2u64 >> (j * 8)) * (((gs2 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v3 = (float)(uint8_t)(g3u64 >> (j * 8)) * (((gs3 >> j) & 1u) ? -1.0f : 1.0f);
+                    a_gate1[j]      = gsh * (_Float16)v0;
+                    a_gate1[j + 8]  = gsh * (_Float16)v1;
+                    a_gate2[j]      = gsh * (_Float16)v2;
+                    a_gate2[j + 8]  = gsh * (_Float16)v3;
+                }
+
+                const rocm_block_iq2_xxs *ub = up_row_p + bi;
+                const float    ud     = rocm_f16_to_f32(ub->d);
+                const uint16_t *uq    = ub->qs + ib32 * 4u;
+                const uint32_t uag    = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16);
+                const uint32_t uas    = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16);
+                const float    uscale = ud * (0.5f + (float)(uas >> 28)) * 0.25f;
+                const _Float16 ush    = (_Float16)uscale;
+                const uint64_t u0u64  = lds_grid[(uint32_t)(uint8_t)(uag >>  0)];
+                const uint64_t u1u64  = lds_grid[(uint32_t)(uint8_t)(uag >>  8)];
+                const uint64_t u2u64  = lds_grid[(uint32_t)(uint8_t)(uag >> 16)];
+                const uint64_t u3u64  = lds_grid[(uint32_t)(uint8_t)(uag >> 24)];
+                const uint8_t us0 = lds_ksigns[(uas >>  0) & 127u];
+                const uint8_t us1 = lds_ksigns[(uas >>  7) & 127u];
+                const uint8_t us2 = lds_ksigns[(uas >> 14) & 127u];
+                const uint8_t us3 = lds_ksigns[(uas >> 21) & 127u];
+
+                rocm_v16f16 a_up1, a_up2;
+                _Pragma("unroll")
+                for (int j = 0; j < 8; j++) {
+                    const float v0 = (float)(uint8_t)(u0u64 >> (j * 8)) * (((us0 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v1 = (float)(uint8_t)(u1u64 >> (j * 8)) * (((us1 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v2 = (float)(uint8_t)(u2u64 >> (j * 8)) * (((us2 >> j) & 1u) ? -1.0f : 1.0f);
+                    const float v3 = (float)(uint8_t)(u3u64 >> (j * 8)) * (((us3 >> j) & 1u) ? -1.0f : 1.0f);
+                    a_up1[j]      = ush * (_Float16)v0;
+                    a_up1[j + 8]  = ush * (_Float16)v1;
+                    a_up2[j]      = ush * (_Float16)v2;
+                    a_up2[j + 8]  = ush * (_Float16)v3;
+                }
+
+                const float *xb = x_pair + (uint64_t)sub * 32u;
+                rocm_v16f16 bv1, bv2;
+                _Pragma("unroll")
+                for (int j = 0; j < 16; j++) {
+                    bv1[j] = (_Float16)xb[j];
+                    bv2[j] = (_Float16)xb[j + 16];
+                }
+
+                c_gate = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_gate1, bv1, c_gate);
+                c_gate = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_gate2, bv2, c_gate);
+                c_up   = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_up1,   bv1, c_up);
+                c_up   = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_up2,   bv2, c_up);
+            }
+
+            const uint32_t p = pair_base + p_in_tile;
+            if (p < pair_end) {
+                const uint32_t slot = pair_slot[p];
+                const uint32_t tok  = pair_token[p];
+                const float    w    = pair_weight[p];
+                _Pragma("unroll")
+                for (int i = 0; i < 8; i++) {
+                    const uint32_t r = row_base + (lane >> 4) + (uint32_t)i * 2u;
+                    if (r < mid_dim) {
+                        float gv = c_gate[i];
+                        float uv = c_up[i];
+                        if (clamp > 1.0e-6f) {
+                            if (gv > clamp) gv = clamp;
+                            if (uv > clamp) uv = clamp;
+                            if (uv < -clamp) uv = -clamp;
+                        }
+                        mid[((uint64_t)tok * n_used + slot) * mid_dim + r] = rocm_silu(gv) * uv * w;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* WMMA_I8 routed-MoE gate_up (IQ2_XXS).  Companion to the WMMA_F16 kernel
  * above.  Both gate and up weights are stored as raw signed int8 (sign
  * applied per-bit from the IQ2_XXS sign byte; grid magnitudes top out
@@ -9065,6 +9244,184 @@ static void rocm_moe_gate_up_iq2xxs_wmma_i8_kernel(
                 a_up1[j + 8]  = (int8_t)((int)u1[j] * (((us1 >> j) & 1u) ? -1 : 1));
                 a_up2[j]      = (int8_t)((int)u2[j] * (((us2 >> j) & 1u) ? -1 : 1));
                 a_up2[j + 8]  = (int8_t)((int)u3[j] * (((us3 >> j) & 1u) ? -1 : 1));
+            }
+
+            rocm_v8i32 acc_g1 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_g2 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_u1 = {0,0,0,0,0,0,0,0};
+            rocm_v8i32 acc_u2 = {0,0,0,0,0,0,0,0};
+            acc_g1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_gate1, true, bv1, acc_g1, false);
+            acc_g2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_gate2, true, bv2, acc_g2, false);
+            acc_u1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_up1,   true, bv1, acc_u1, false);
+            acc_u2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_up2,   true, bv2, acc_u2, false);
+
+            const float combined_g = gscale * x_scale;
+            const float combined_u = uscale * x_scale;
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) {
+                c_gate[i] += (float)(acc_g1[i] + acc_g2[i]) * combined_g;
+                c_up[i]   += (float)(acc_u1[i] + acc_u2[i]) * combined_u;
+            }
+        }
+
+        const uint32_t p = pair_base + p_in_tile;
+        if (p < pair_end) {
+            const uint32_t slot = pair_slot[p];
+            const uint32_t tok  = pair_token[p];
+            const float    w    = pair_weight[p];
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) {
+                const uint32_t r = row_base + (lane >> 4) + (uint32_t)i * 2u;
+                if (r < mid_dim) {
+                    float gv = c_gate[i];
+                    float uv = c_up[i];
+                    if (clamp > 1.0e-6f) {
+                        if (gv > clamp) gv = clamp;
+                        if (uv > clamp) uv = clamp;
+                        if (uv < -clamp) uv = -clamp;
+                    }
+                    mid[((uint64_t)tok * n_used + slot) * mid_dim + r] = rocm_silu(gv) * uv * w;
+                }
+            }
+        }
+    }
+}
+
+/* I8 variant of the gate_up kernel with iq2xxs grid + ksigns staged into
+ * LDS (mirrors rocm_moe_gate_up_iq2xxs_wmma_lds_grid_kernel for the F16
+ * path).  Per feedback_wmma_i8_path.md, the I8 MoE bottleneck is
+ * memory-instruction throughput, which is exactly what LDS-staging
+ * attacks. */
+__global__ __launch_bounds__(32, 8)
+static void rocm_moe_gate_up_iq2xxs_wmma_i8_lds_grid_kernel(
+        float *mid,
+        const uint8_t *gate_pool,
+        const uint8_t *up_pool,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        const uint8_t *x_q8,
+        uint64_t       x_row_bytes,
+        const uint32_t *expert_ids,
+        const uint32_t *expert_pair_offsets,
+        const uint32_t *pair_token,
+        const uint32_t *pair_slot,
+        const float    *pair_weight,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        float clamp) {
+    __shared__ uint64_t lds_grid[256];
+    __shared__ uint8_t  lds_ksigns[128];
+
+    const uint32_t lane = threadIdx.x & 31u;
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t idx = lane + (uint32_t)i * 32u;
+        lds_grid[idx] = rocm_iq2xxs_grid[idx];
+    }
+    _Pragma("unroll")
+    for (int i = 0; i < 4; i++) {
+        const uint32_t idx = lane + (uint32_t)i * 32u;
+        lds_ksigns[idx] = rocm_ksigns_iq2xs[idx];
+    }
+    __syncthreads();
+
+    const uint32_t e_dense    = blockIdx.y;
+    const uint32_t pair_start = expert_pair_offsets[e_dense];
+    const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u];
+    if (pair_start >= pair_end) return;
+    const uint32_t e          = expert_ids[e_dense];
+
+    const uint32_t row_base = blockIdx.x * 16u;
+    if (row_base >= mid_dim) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t out_row     = row_base + row_in_tile;
+    const uint32_t safe_row    = (out_row < mid_dim) ? out_row : (mid_dim - 1u);
+
+    const rocm_block_iq2_xxs *gate_row_p = (const rocm_block_iq2_xxs *)
+        (gate_pool + (uint64_t)e * gate_expert_bytes + (uint64_t)safe_row * gate_row_bytes);
+    const rocm_block_iq2_xxs *up_row_p   = (const rocm_block_iq2_xxs *)
+        (up_pool   + (uint64_t)e * up_expert_bytes   + (uint64_t)safe_row * up_row_bytes);
+
+    const uint32_t nb         = in_dim / DS4_QK_K;
+    const uint32_t total_subs = nb * 8u;
+
+    for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += 16u) {
+        const uint32_t p_in_tile     = lane & 15u;
+        const uint32_t pair_idx_raw  = pair_base + p_in_tile;
+        const int      pair_valid    = (pair_idx_raw < pair_end);
+        const uint32_t pair_clamped  = pair_valid ? pair_idx_raw : (pair_end - 1u);
+        const uint32_t token         = pair_token[pair_clamped];
+        const uint8_t *x_pair        = x_q8 + (uint64_t)token * x_row_bytes;
+
+        rocm_v8f32 c_gate = {0,0,0,0,0,0,0,0};
+        rocm_v8f32 c_up   = {0,0,0,0,0,0,0,0};
+
+        for (uint32_t sub = 0; sub < total_subs; sub++) {
+            const uint32_t bi   = sub >> 3;
+            const uint32_t ib32 = sub & 7u;
+
+            const uint8_t *xblk = x_pair + (uint64_t)sub * 34u;
+            const uint16_t x_scale_bits = (uint16_t)xblk[0] | ((uint16_t)xblk[1] << 8);
+            const float x_scale = rocm_f16_to_f32(x_scale_bits);
+            const int8_t *xqs = (const int8_t *)(xblk + 2);
+            rocm_v16i8 bv1, bv2;
+            _Pragma("unroll")
+            for (int kk = 0; kk < 16; kk++) {
+                bv1[kk] = xqs[kk];
+                bv2[kk] = xqs[16 + kk];
+            }
+
+            const rocm_block_iq2_xxs *gb = gate_row_p + bi;
+            const float    gd     = rocm_f16_to_f32(gb->d);
+            const uint16_t *gq    = gb->qs + ib32 * 4u;
+            const uint32_t ag     = (uint32_t)gq[0] | ((uint32_t)gq[1] << 16);
+            const uint32_t asg    = (uint32_t)gq[2] | ((uint32_t)gq[3] << 16);
+            const float    gscale = gd * (0.5f + (float)(asg >> 28)) * 0.25f;
+            const uint64_t g0u64  = lds_grid[(uint32_t)(uint8_t)(ag >>  0)];
+            const uint64_t g1u64  = lds_grid[(uint32_t)(uint8_t)(ag >>  8)];
+            const uint64_t g2u64  = lds_grid[(uint32_t)(uint8_t)(ag >> 16)];
+            const uint64_t g3u64  = lds_grid[(uint32_t)(uint8_t)(ag >> 24)];
+            const uint8_t gs0 = lds_ksigns[(asg >>  0) & 127u];
+            const uint8_t gs1 = lds_ksigns[(asg >>  7) & 127u];
+            const uint8_t gs2 = lds_ksigns[(asg >> 14) & 127u];
+            const uint8_t gs3 = lds_ksigns[(asg >> 21) & 127u];
+
+            rocm_v16i8 a_gate1, a_gate2;
+            _Pragma("unroll")
+            for (int j = 0; j < 8; j++) {
+                a_gate1[j]      = (int8_t)((int)(uint8_t)(g0u64 >> (j * 8)) * (((gs0 >> j) & 1u) ? -1 : 1));
+                a_gate1[j + 8]  = (int8_t)((int)(uint8_t)(g1u64 >> (j * 8)) * (((gs1 >> j) & 1u) ? -1 : 1));
+                a_gate2[j]      = (int8_t)((int)(uint8_t)(g2u64 >> (j * 8)) * (((gs2 >> j) & 1u) ? -1 : 1));
+                a_gate2[j + 8]  = (int8_t)((int)(uint8_t)(g3u64 >> (j * 8)) * (((gs3 >> j) & 1u) ? -1 : 1));
+            }
+
+            const rocm_block_iq2_xxs *ub = up_row_p + bi;
+            const float    ud     = rocm_f16_to_f32(ub->d);
+            const uint16_t *uq    = ub->qs + ib32 * 4u;
+            const uint32_t uag    = (uint32_t)uq[0] | ((uint32_t)uq[1] << 16);
+            const uint32_t uas    = (uint32_t)uq[2] | ((uint32_t)uq[3] << 16);
+            const float    uscale = ud * (0.5f + (float)(uas >> 28)) * 0.25f;
+            const uint64_t u0u64  = lds_grid[(uint32_t)(uint8_t)(uag >>  0)];
+            const uint64_t u1u64  = lds_grid[(uint32_t)(uint8_t)(uag >>  8)];
+            const uint64_t u2u64  = lds_grid[(uint32_t)(uint8_t)(uag >> 16)];
+            const uint64_t u3u64  = lds_grid[(uint32_t)(uint8_t)(uag >> 24)];
+            const uint8_t us0 = lds_ksigns[(uas >>  0) & 127u];
+            const uint8_t us1 = lds_ksigns[(uas >>  7) & 127u];
+            const uint8_t us2 = lds_ksigns[(uas >> 14) & 127u];
+            const uint8_t us3 = lds_ksigns[(uas >> 21) & 127u];
+
+            rocm_v16i8 a_up1, a_up2;
+            _Pragma("unroll")
+            for (int j = 0; j < 8; j++) {
+                a_up1[j]      = (int8_t)((int)(uint8_t)(u0u64 >> (j * 8)) * (((us0 >> j) & 1u) ? -1 : 1));
+                a_up1[j + 8]  = (int8_t)((int)(uint8_t)(u1u64 >> (j * 8)) * (((us1 >> j) & 1u) ? -1 : 1));
+                a_up2[j]      = (int8_t)((int)(uint8_t)(u2u64 >> (j * 8)) * (((us2 >> j) & 1u) ? -1 : 1));
+                a_up2[j + 8]  = (int8_t)((int)(uint8_t)(u3u64 >> (j * 8)) * (((us3 >> j) & 1u) ? -1 : 1));
             }
 
             rocm_v8i32 acc_g1 = {0,0,0,0,0,0,0,0};
@@ -9480,6 +9837,14 @@ static int rocm_moe_run(
              * blocks past n_unique bail on pair_start >= pair_end. */
             const uint32_t gu_grid_y = (max_dense < (uint32_t)total_experts)
                                         ? max_dense : (uint32_t)total_experts;
+            /* Shared LDS-grid cache: governs whether all WMMA gate_up variants
+             * (F16, I8, persistent) stage the iq2xxs grid + ksigns into LDS.
+             * Default ON; DS4_ROCM_MOE_LDS_GRID=0 reverts. */
+            static int g_moe_lds_grid_cached = -1;
+            if (g_moe_lds_grid_cached < 0) {
+                const char *env = getenv("DS4_ROCM_MOE_LDS_GRID");
+                g_moe_lds_grid_cached = (env && env[0] == '0') ? 0 : 1;
+            }
             /* I8 path: microquantize activations once then run WMMA_I8 gate_up.
              * Default on (set DS4_ROCM_MOE_WMMA_I8=0 to disable).  Mirrors the
              * matmul_q8_0 WMMA_I8 path: replaces per-weight fp16 scaling with
@@ -9504,20 +9869,37 @@ static int rocm_moe_run(
                                        expert_in_dim, n_tokens);
                     dim3 gu_grid(gu_row_blocks, gu_grid_y, 1);
                     dim3 gu_block(32u, 1, 1);
-                    hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_i8_kernel,
-                                       gu_grid, gu_block, 0, g_stream,
-                                       (float *)tensor_u8(mid),
-                                       (const uint8_t *)gate_d,
-                                       (const uint8_t *)up_d,
-                                       gate_expert_bytes, gate_row_bytes,
-                                       up_expert_bytes, up_row_bytes,
-                                       g_act_q8_scratch,
-                                       (uint64_t)blocks_per_row * 34ull,
-                                       sched_expert_ids, sched_expert_pair_off,
-                                       sched_pair_token, sched_pair_slot, sched_pair_weight,
-                                       expert_in_dim, expert_mid_dim, n_used, clamp);
-                    wm_ok = rocm_launch_done("moe wmma_i8 gate_up launch",
-                                             "moe wmma_i8 gate_up completion");
+                    if (g_moe_lds_grid_cached) {
+                        hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_i8_lds_grid_kernel,
+                                           gu_grid, gu_block, 0, g_stream,
+                                           (float *)tensor_u8(mid),
+                                           (const uint8_t *)gate_d,
+                                           (const uint8_t *)up_d,
+                                           gate_expert_bytes, gate_row_bytes,
+                                           up_expert_bytes, up_row_bytes,
+                                           g_act_q8_scratch,
+                                           (uint64_t)blocks_per_row * 34ull,
+                                           sched_expert_ids, sched_expert_pair_off,
+                                           sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                           expert_in_dim, expert_mid_dim, n_used, clamp);
+                        wm_ok = rocm_launch_done("moe wmma_i8_lds_grid gate_up launch",
+                                                 "moe wmma_i8_lds_grid gate_up completion");
+                    } else {
+                        hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_i8_kernel,
+                                           gu_grid, gu_block, 0, g_stream,
+                                           (float *)tensor_u8(mid),
+                                           (const uint8_t *)gate_d,
+                                           (const uint8_t *)up_d,
+                                           gate_expert_bytes, gate_row_bytes,
+                                           up_expert_bytes, up_row_bytes,
+                                           g_act_q8_scratch,
+                                           (uint64_t)blocks_per_row * 34ull,
+                                           sched_expert_ids, sched_expert_pair_off,
+                                           sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                           expert_in_dim, expert_mid_dim, n_used, clamp);
+                        wm_ok = rocm_launch_done("moe wmma_i8 gate_up launch",
+                                                 "moe wmma_i8 gate_up completion");
+                    }
                     dispatched_gu_i8 = 1;
                 }
             }
@@ -9543,30 +9925,38 @@ static int rocm_moe_run(
                 const uint32_t n_persist = g_moe_persist_n;
                 dim3 gu_grid(n_persist, 1, 1);
                 dim3 gu_block(32u, 1, 1);
-                hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel,
-                                   gu_grid, gu_block, 0, g_stream,
-                                   (float *)tensor_u8(mid),
-                                   (const uint8_t *)gate_d,
-                                   (const uint8_t *)up_d,
-                                   gate_expert_bytes, gate_row_bytes,
-                                   up_expert_bytes, up_row_bytes,
-                                   (const float *)tensor_u8_const(x),
-                                   sched_expert_ids, sched_expert_pair_off,
-                                   sched_pair_token, sched_pair_slot, sched_pair_weight,
-                                   expert_in_dim, expert_mid_dim, n_used,
-                                   gu_row_blocks, gu_grid_y, clamp);
-                wm_ok = rocm_launch_done("moe wmma persistent gate_up launch",
-                                         "moe wmma persistent gate_up completion");
+                if (g_moe_lds_grid_cached) {
+                    hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_persistent_lds_grid_kernel,
+                                       gu_grid, gu_block, 0, g_stream,
+                                       (float *)tensor_u8(mid),
+                                       (const uint8_t *)gate_d,
+                                       (const uint8_t *)up_d,
+                                       gate_expert_bytes, gate_row_bytes,
+                                       up_expert_bytes, up_row_bytes,
+                                       (const float *)tensor_u8_const(x),
+                                       sched_expert_ids, sched_expert_pair_off,
+                                       sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                       expert_in_dim, expert_mid_dim, n_used,
+                                       gu_row_blocks, gu_grid_y, clamp);
+                    wm_ok = rocm_launch_done("moe wmma_persistent_lds_grid gate_up launch",
+                                             "moe wmma_persistent_lds_grid gate_up completion");
+                } else {
+                    hipLaunchKernelGGL(rocm_moe_gate_up_iq2xxs_wmma_persistent_kernel,
+                                       gu_grid, gu_block, 0, g_stream,
+                                       (float *)tensor_u8(mid),
+                                       (const uint8_t *)gate_d,
+                                       (const uint8_t *)up_d,
+                                       gate_expert_bytes, gate_row_bytes,
+                                       up_expert_bytes, up_row_bytes,
+                                       (const float *)tensor_u8_const(x),
+                                       sched_expert_ids, sched_expert_pair_off,
+                                       sched_pair_token, sched_pair_slot, sched_pair_weight,
+                                       expert_in_dim, expert_mid_dim, n_used,
+                                       gu_row_blocks, gu_grid_y, clamp);
+                    wm_ok = rocm_launch_done("moe wmma persistent gate_up launch",
+                                             "moe wmma persistent gate_up completion");
+                }
                 dispatched_gu_persist = 1;
-            }
-            /* LDS-grid variant: stages iq2xxs grid + ksigns into LDS to move
-             * the LUT off the vector memory unit (rocprofv3 shows the default
-             * wmma_kernel sits at MemUnitBusy >= 99.4%).  Default ON; set
-             * DS4_ROCM_MOE_LDS_GRID=0 to fall back to the original kernel. */
-            static int g_moe_lds_grid_cached = -1;
-            if (g_moe_lds_grid_cached < 0) {
-                const char *env = getenv("DS4_ROCM_MOE_LDS_GRID");
-                g_moe_lds_grid_cached = (env && env[0] == '0') ? 0 : 1;
             }
             if (wm_ok && gu_grid_y > 0u && !dispatched_gu_i8 && !dispatched_gu_persist) {
                 dim3 gu_grid(gu_row_blocks, gu_grid_y, 1);

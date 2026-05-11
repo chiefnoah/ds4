@@ -6689,9 +6689,16 @@ int ds4_metal_attention_prefill_raw_heads_tensor(
  */
 /* Macro-instantiated FA kernel: BR Q rows per block, one wave per row.
  * BR=4 keeps decode-batch (small n_tokens) responsive; BR=16 amortizes
- * the per-K LDS load + memory latency across 4x more rows on prefill. */
-#define ROCM_DEFINE_ATTN_FA(BR_VAL) \
-__global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
+ * the per-K LDS load + memory latency across 4x more rows on prefill.
+ *
+ * DPL_VAL = head_dim / 32 = dim_per_lane.  When 0, the kernel handles
+ * any head_dim at runtime (32-iter unrolled loop with predicated tail).
+ * When > 0, the inner K/V loops collapse to DPL iterations and o_acc
+ * shrinks to DPL VGPRs — measured win on gfx1151 for the prefill main
+ * attention (head_dim=512 -> DPL=16) where the generic kernel wastes
+ * half of the inner loop and half of the V accumulator register space. */
+#define ROCM_DEFINE_ATTN_FA_VARIANT(SUFFIX, BR_VAL, DPL_VAL, USE_DPL) \
+__global__ static void rocm_attn_fa_kernel_##SUFFIX( \
         float *out, \
         const float *q, \
         const float *raw_kv, \
@@ -6740,9 +6747,10 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
     const uint32_t n_visible_comp = ratio == 0u ? 0u : (qpos + 1u) / ratio; \
     float m = active ? sinks[h] : -1.0e30f; \
     float l = active ? 1.0f      :  0.0f; \
-    const uint32_t dim_per_lane = head_dim >> 5; \
-    float o_acc[32]; \
-    for (int i = 0; i < 32; i++) o_acc[i] = 0.0f; \
+    const uint32_t dim_per_lane = USE_DPL ? (uint32_t)(DPL_VAL) : (head_dim >> 5); \
+    float o_acc[USE_DPL ? (DPL_VAL) : 32]; \
+    _Pragma("unroll") \
+    for (int i = 0; i < (USE_DPL ? (DPL_VAL) : 32); i++) o_acc[i] = 0.0f; \
     for (uint32_t r = 0; r < n_raw; r++) { \
         const uint32_t actual = mode_static ? r : (raw_start + r) % raw_cap; \
         const float *kv_src   = raw_kv + (uint64_t)actual * head_dim; \
@@ -6757,8 +6765,9 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
                 score = -1.0e30f; \
             } else { \
                 float partial = 0.0f; \
-                for (uint32_t i = 0; i < 32; i++) { \
-                    if (i < dim_per_lane) { \
+                _Pragma("unroll") \
+                for (uint32_t i = 0; i < (USE_DPL ? (DPL_VAL) : 32u); i++) { \
+                    if (USE_DPL || i < dim_per_lane) { \
                         const uint32_t d = i * 32u + lane; \
                         partial += q_lds[wave * head_dim + d] * kv_buf[d]; \
                     } \
@@ -6772,8 +6781,9 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
             const float vs    = (score <= -5.0e29f) ? 0.0f : __expf(score - m_new); \
             l = l * alpha + vs; \
             m = m_new; \
-            for (uint32_t i = 0; i < 32; i++) { \
-                if (i < dim_per_lane) { \
+            _Pragma("unroll") \
+            for (uint32_t i = 0; i < (USE_DPL ? (DPL_VAL) : 32u); i++) { \
+                if (USE_DPL || i < dim_per_lane) { \
                     const uint32_t d = i * 32u + lane; \
                     o_acc[i] = o_acc[i] * alpha + vs * kv_buf[d]; \
                 } \
@@ -6791,8 +6801,9 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
                 score = -1.0e30f; \
             } else { \
                 float partial = 0.0f; \
-                for (uint32_t i = 0; i < 32; i++) { \
-                    if (i < dim_per_lane) { \
+                _Pragma("unroll") \
+                for (uint32_t i = 0; i < (USE_DPL ? (DPL_VAL) : 32u); i++) { \
+                    if (USE_DPL || i < dim_per_lane) { \
                         const uint32_t d = i * 32u + lane; \
                         partial += q_lds[wave * head_dim + d] * kv_buf[d]; \
                     } \
@@ -6806,8 +6817,9 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
             const float vs    = (score <= -5.0e29f) ? 0.0f : __expf(score - m_new); \
             l = l * alpha + vs; \
             m = m_new; \
-            for (uint32_t i = 0; i < 32; i++) { \
-                if (i < dim_per_lane) { \
+            _Pragma("unroll") \
+            for (uint32_t i = 0; i < (USE_DPL ? (DPL_VAL) : 32u); i++) { \
+                if (USE_DPL || i < dim_per_lane) { \
                     const uint32_t d = i * 32u + lane; \
                     o_acc[i] = o_acc[i] * alpha + vs * kv_buf[d]; \
                 } \
@@ -6818,8 +6830,9 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
     if (active) { \
         float *out_th     = out + ((uint64_t)t * n_head + h) * head_dim; \
         const float inv_l = 1.0f / l; \
-        for (uint32_t i = 0; i < 32; i++) { \
-            if (i < dim_per_lane) { \
+        _Pragma("unroll") \
+        for (uint32_t i = 0; i < (USE_DPL ? (DPL_VAL) : 32u); i++) { \
+            if (USE_DPL || i < dim_per_lane) { \
                 const uint32_t d = i * 32u + lane; \
                 out_th[d] = o_acc[i] * inv_l; \
             } \
@@ -6827,8 +6840,13 @@ __global__ static void rocm_attn_fa_kernel_br##BR_VAL( \
     } \
 }
 
-ROCM_DEFINE_ATTN_FA(4)
-ROCM_DEFINE_ATTN_FA(16)
+/* Generic (any head_dim) and head_dim-specialized variants. */
+ROCM_DEFINE_ATTN_FA_VARIANT(br4,        4,  0, 0)
+ROCM_DEFINE_ATTN_FA_VARIANT(br16,      16,  0, 0)
+ROCM_DEFINE_ATTN_FA_VARIANT(br4_dpl4,   4,  4, 1)
+ROCM_DEFINE_ATTN_FA_VARIANT(br4_dpl16,  4, 16, 1)
+ROCM_DEFINE_ATTN_FA_VARIANT(br16_dpl4, 16,  4, 1)
+ROCM_DEFINE_ATTN_FA_VARIANT(br16_dpl16,16, 16, 1)
 
 __global__ static void rocm_attn_batch_kernel(
         float *out,
@@ -7015,10 +7033,55 @@ static int rocm_attn_batch_dispatch(
         const uint32_t BR = use_br16 ? 16u : 4u;
         const uint32_t threads = BR * 32u;
         const uint64_t smem_bytes = (uint64_t)(BR + 1u) * head_dim * sizeof(float);
+        const uint32_t dpl = head_dim >> 5;
         dim3 grid((n_tokens + BR - 1u) / BR, n_head, 1);
         dim3 block(threads, 1, 1);
-        if (use_br16) {
+        /* Specialized variants cut VALU work and o_acc VGPR pressure for the
+         * production head_dim values: 512 (DPL=16, main attention) and 128
+         * (DPL=4, indexer). Fall through to the generic kernel for other
+         * sizes (test paths, future model variants). */
+        if (use_br16 && dpl == 16u) {
+            hipLaunchKernelGGL(rocm_attn_fa_kernel_br16_dpl16, grid, block, (uint32_t)smem_bytes, g_stream,
+                               (float *)tensor_u8(heads),
+                               (const float *)tensor_u8_const(q),
+                               (const float *)tensor_u8_const(raw_kv),
+                               n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                               use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                               (const float *)sink_d,
+                               n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                               n_comp, window, ratio, use_comp_mask, mode_static);
+        } else if (use_br16 && dpl == 4u) {
+            hipLaunchKernelGGL(rocm_attn_fa_kernel_br16_dpl4, grid, block, (uint32_t)smem_bytes, g_stream,
+                               (float *)tensor_u8(heads),
+                               (const float *)tensor_u8_const(q),
+                               (const float *)tensor_u8_const(raw_kv),
+                               n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                               use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                               (const float *)sink_d,
+                               n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                               n_comp, window, ratio, use_comp_mask, mode_static);
+        } else if (use_br16) {
             hipLaunchKernelGGL(rocm_attn_fa_kernel_br16, grid, block, (uint32_t)smem_bytes, g_stream,
+                               (float *)tensor_u8(heads),
+                               (const float *)tensor_u8_const(q),
+                               (const float *)tensor_u8_const(raw_kv),
+                               n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                               use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                               (const float *)sink_d,
+                               n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                               n_comp, window, ratio, use_comp_mask, mode_static);
+        } else if (dpl == 16u) {
+            hipLaunchKernelGGL(rocm_attn_fa_kernel_br4_dpl16, grid, block, (uint32_t)smem_bytes, g_stream,
+                               (float *)tensor_u8(heads),
+                               (const float *)tensor_u8_const(q),
+                               (const float *)tensor_u8_const(raw_kv),
+                               n_comp ? (const float *)tensor_u8_const(comp_kv) : (const float *)NULL,
+                               use_comp_mask ? (const float *)tensor_u8_const(comp_mask) : (const float *)NULL,
+                               (const float *)sink_d,
+                               n_tokens, n_head, head_dim, pos0, n_raw, raw_cap, raw_start,
+                               n_comp, window, ratio, use_comp_mask, mode_static);
+        } else if (dpl == 4u) {
+            hipLaunchKernelGGL(rocm_attn_fa_kernel_br4_dpl4, grid, block, (uint32_t)smem_bytes, g_stream,
                                (float *)tensor_u8(heads),
                                (const float *)tensor_u8_const(q),
                                (const float *)tensor_u8_const(raw_kv),

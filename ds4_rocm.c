@@ -9903,16 +9903,18 @@ static int rocm_moe_run(
                     dispatched_gu_i8 = 1;
                 }
             }
-            /* Persistent grouped-MoE gate_up: opt-in via
-             * DS4_ROCM_MOE_PERSISTENT=1.  Launches N blocks that grid-stride
-             * over all (row_block, expert) tiles in expert-major order.
+            /* Persistent grouped-MoE gate_up: launches N blocks that
+             * grid-stride over all (row_block, expert) tiles in
+             * expert-major order.  Default ON when LDS-grid is on (the
+             * combo wins +5-8% prefill across tested prompt lengths);
+             * DS4_ROCM_MOE_PERSISTENT=0 reverts to non-persistent.
              * Default N = 320 (= 40 CUs * 8 waves/CU resident).  Tunable via
              * DS4_ROCM_MOE_PERSISTENT_N. */
             static int g_moe_persist_cached = -1;
             static uint32_t g_moe_persist_n = 320u;
             if (g_moe_persist_cached < 0) {
                 const char *env = getenv("DS4_ROCM_MOE_PERSISTENT");
-                g_moe_persist_cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+                g_moe_persist_cached = (env && env[0] == '0') ? 0 : 1;
                 const char *env_n = getenv("DS4_ROCM_MOE_PERSISTENT_N");
                 if (env_n && env_n[0]) {
                     long v = strtol(env_n, NULL, 10);

@@ -8408,6 +8408,112 @@ __global__ static void rocm_moe_gate_up_iq2xxs_wmma_kernel(
     }
 }
 
+/* WMMA-gather routed-MoE down (Q2_K).  Mirrors the gate_up kernel: each
+ * block produces a 16-row x 16-pair output tile via v_wmma_*.  Per K-step
+ * (one Q2_K sub-block = 16 elements) lane L=(L%16) dequants its row's 16
+ * weights as F16 with the q2_K offset baked in (w = d*scale*q - dmin*minv),
+ * then runs one WMMA against the lane-column's mid[] slice.
+ *
+ * Multiple experts contribute to the same out[token, row]; we use atomicAdd
+ * to merge.  Caller zeroes out[] before launching. */
+__global__ static void rocm_moe_down_q2k_wmma_kernel(
+        float *out,
+        const uint8_t *down_pool,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        const float *mid,
+        const uint32_t *expert_ids,
+        const uint32_t *expert_pair_offsets,
+        const uint32_t *pair_token,
+        const uint32_t *pair_slot,
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        uint32_t n_used) {
+    const uint32_t e_dense    = blockIdx.y;
+    const uint32_t pair_start = expert_pair_offsets[e_dense];
+    const uint32_t pair_end   = expert_pair_offsets[e_dense + 1u];
+    if (pair_start >= pair_end) return;
+    const uint32_t e          = expert_ids[e_dense];
+
+    const uint32_t row_base = blockIdx.x * 16u;
+    if (row_base >= out_dim) return;
+
+    const uint32_t lane        = threadIdx.x & 31u;
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t out_row     = row_base + row_in_tile;
+    const uint32_t safe_row    = (out_row < out_dim) ? out_row : (out_dim - 1u);
+
+    const rocm_block_q2_K *down_row_p = (const rocm_block_q2_K *)
+        (down_pool + (uint64_t)e * down_expert_bytes + (uint64_t)safe_row * down_row_bytes);
+
+    const uint32_t nb         = mid_dim / DS4_QK_K;
+    const uint32_t total_qb   = nb * 16u;
+
+    for (uint32_t pair_base = pair_start; pair_base < pair_end; pair_base += 16u) {
+        const uint32_t p_in_tile     = lane & 15u;
+        const uint32_t pair_idx_raw  = pair_base + p_in_tile;
+        const int      pair_valid    = (pair_idx_raw < pair_end);
+        const uint32_t pair_clamped  = pair_valid ? pair_idx_raw : (pair_end - 1u);
+        const uint32_t token         = pair_token[pair_clamped];
+        const uint32_t slot          = pair_slot[pair_clamped];
+        const float   *mid_slot      = mid + ((uint64_t)token * n_used + slot) * mid_dim;
+
+        rocm_v8f32 c = {0,0,0,0,0,0,0,0};
+
+        for (uint32_t qb = 0; qb < total_qb; qb++) {
+            const uint32_t bi     = qb >> 4;
+            const uint32_t inn    = qb & 15u;
+            const uint32_t k      = inn >> 3;
+            const uint32_t inneri = inn & 7u;
+            const uint32_t jstep  = inneri >> 1;
+            const uint32_t half   = inneri & 1u;
+            const uint32_t shift  = jstep * 2u;
+
+            const rocm_block_q2_K *xb = down_row_p + bi;
+            const float    d        = rocm_f16_to_f32(xb->d);
+            const float    dmin     = rocm_f16_to_f32(xb->dmin);
+            const uint8_t  sc       = xb->scales[inn];
+            const float    scale    = (float)(sc & 0x0F);
+            const float    minv     = (float)(sc >> 4);
+            const float    offset_f = -dmin * minv;       /* added to each weight */
+            const float    coef_f   = d * scale;
+            const uint8_t *q        = xb->qs + k * 32u + half * 16u;
+
+            rocm_v16f16 a;
+            _Pragma("unroll")
+            for (int i = 0; i < 16; i++) {
+                const float q_val = (float)((q[i] >> shift) & 0x3);
+                a[i] = (_Float16)(coef_f * q_val + offset_f);
+            }
+
+            const uint64_t mid_off = (uint64_t)bi * DS4_QK_K
+                                      + (uint64_t)k * 128u
+                                      + (uint64_t)jstep * 32u
+                                      + (uint64_t)half * 16u;
+            const float *yb = mid_slot + mid_off;
+            rocm_v16f16 bv;
+            _Pragma("unroll")
+            for (int i = 0; i < 16; i++) {
+                bv[i] = (_Float16)yb[i];
+            }
+
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, c);
+        }
+
+        const uint32_t p = pair_base + p_in_tile;
+        if (p < pair_end) {
+            const uint32_t tok = pair_token[p];
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) {
+                const uint32_t r = row_base + (lane >> 4) + (uint32_t)i * 2u;
+                if (r < out_dim) {
+                    atomicAdd(&out[(uint64_t)tok * out_dim + r], c[i]);
+                }
+            }
+        }
+    }
+}
+
 /* Persistent device-side scratch for expert-major routed-MoE schedule.
  * Allocated lazily; reused across rocm_moe_run() calls.  Sized for the
  * largest n_tokens / n_used / n_total_experts seen so far. */
@@ -8636,7 +8742,9 @@ static int rocm_moe_run(
                               (up_type   == DS4_TENSOR_TYPE_IQ2_XXS) &&
                               (down_type == DS4_TENSOR_TYPE_Q2_K) &&
                               ((expert_mid_dim & 15u) == 0u) &&
-                              ((expert_in_dim % DS4_QK_K) == 0u);
+                              ((expert_in_dim % DS4_QK_K) == 0u) &&
+                              ((expert_mid_dim % DS4_QK_K) == 0u) &&
+                              ((out_dim & 15u) == 0u);
     if (wmma_moe_path) {
         const uint32_t max_dense   = n_tokens * n_used;
         const size_t   hdr_bytes   = sizeof(uint32_t) * (2u + (uint32_t)total_experts + (max_dense + 1u));
@@ -8688,27 +8796,27 @@ static int rocm_moe_run(
                 wm_ok = rocm_launch_done("moe wmma gate_up launch",
                                          "moe wmma gate_up completion");
             }
-            /* down kernel: legacy wave-n8 (reads mid produced by WMMA gate_up). */
+            /* down kernel: WMMA-gather Q2_K.  Multiple experts atomicAdd into
+             * the same out[t, r], so we zero out[] first. */
             if (wm_ok) {
-                if (down_type == DS4_TENSOR_TYPE_Q2_K) {
-                    const uint32_t nrows = 8u;
-                    const uint32_t row_blocks = (out_dim + nrows - 1u) / nrows;
-                    dim3 grid(row_blocks, n_tokens, 1);
-                    dim3 block(nrows * 32u, 1, 1);
-                    hipLaunchKernelGGL(rocm_moe_down_q2k_wave_n8_kernel,
-                                       grid, block, 0, g_stream,
-                                       (float *)tensor_u8(out),
-                                       (const uint8_t *)down_d,
-                                       down_expert_bytes, down_row_bytes,
-                                       (const float *)tensor_u8_const(mid),
-                                       (const int32_t *)tensor_u8_const(selected),
-                                       expert_mid_dim, out_dim, n_used, n_tokens,
-                                       (uint32_t)total_experts);
-                    wm_ok = rocm_launch_done("moe wmma down launch",
-                                             "moe wmma down completion");
-                } else {
-                    wm_ok = 0;
-                }
+                const size_t out_bytes = (size_t)n_tokens * out_dim * sizeof(float);
+                wm_ok = (hipMemsetAsync(tensor_u8(out), 0, out_bytes, g_stream) == hipSuccess);
+            }
+            if (wm_ok && gu_grid_y > 0u) {
+                const uint32_t dn_row_blocks = (out_dim + 15u) / 16u;
+                dim3 dn_grid(dn_row_blocks, gu_grid_y, 1);
+                dim3 dn_block(32u, 1, 1);
+                hipLaunchKernelGGL(rocm_moe_down_q2k_wmma_kernel,
+                                   dn_grid, dn_block, 0, g_stream,
+                                   (float *)tensor_u8(out),
+                                   (const uint8_t *)down_d,
+                                   down_expert_bytes, down_row_bytes,
+                                   (const float *)tensor_u8_const(mid),
+                                   sched_expert_ids, sched_expert_pair_off,
+                                   sched_pair_token, sched_pair_slot,
+                                   expert_mid_dim, out_dim, n_used);
+                wm_ok = rocm_launch_done("moe wmma down launch",
+                                         "moe wmma down completion");
             }
 
             rocm_defer_free(gate_h);

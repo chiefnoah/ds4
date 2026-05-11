@@ -1,0 +1,57 @@
+attn_out stage 1: LDS multi-wave block restructure
+
+Chosen direction: LDS multi-wave block (option 1 from old tsk-58/59).
+Rejected alternatives: 64-tok wide tile (regresses -7% prefill,
+landed as negative finding in feedback_attn_out_stage1_wide_dead_end.md);
+FA layout restructure (touches decode/prefill/batch FA variants, risks
+regressing decode which is already exhausted per
+feedback_decode_exhausted_may2026.md).
+
+Goal: get stage 1 to parity with stage 2 (~7 ms/call) by sharing the
+per-(group, token_tile) activation slab across rank tiles via LDS
+instead of refetching from L2 each block.
+
+Baseline: stage 1 = 10.25 ms/call at n_tokens=600;
+long-prompt prefill = 70.02 t/s (commit 37ba6c9).
+stage 1 is ~9% of total prefill wall, so the upper bound on this
+rewrite is ~+10% prefill (74-77 t/s).
+
+Approach:
+* Block size 256 threads = 8 waves.  Each wave handles 1 rank tile
+  (16 rows).  Grid: ((rank+127)/128, n_groups, (n_tokens+31)/32).
+* LDS staging: per K=32 step, cooperatively load the activation slab
+  for one block (32 tokens x 32 floats = 4 KB) to LDS as f16.
+  Total LDS usage ~4 KB per K-step (single-buffer) or 8 KB
+  (double-buffer with async loads).  Well under the 64 KB LDS limit.
+* Each wave reads its WMMA B operand from LDS instead of DRAM.
+  Accumulators stay per-wave in registers (2 v8f32 per wave for the
+  current wide32 layout, same as today).
+* Grid order stays (rank, group, token) for the same activation-reuse
+  reasons as the existing wide32.
+
+First concrete step (before kernel work):
+  1. Confirm the bottleneck.  Add a microbench like
+     tests/ds4_rocm_matmul_bench but for attention_output_low_q8,
+     so we can iterate at sub-second cycle time (skipping the 21s
+     model load).  Validate it matches the in-app stage 1 ms/call
+     (~10.25 ms at n_tokens=600, group_dim=4096, rank=1024,
+     n_groups=8).
+  2. Profile with rocprofv3 + SQ_WAVES, SQ_INSTS_VALU, MemUnitBusy
+     to confirm we are occupancy/latency-bound and not
+     memory-bound.  If MemUnitBusy >70%, LDS will not help and
+     this approach is wrong.
+  3. Implement the LDS-staged multi-wave kernel.  Gate behind
+     DS4_ROCM_ATTN_OUT_LDS env (default 0 until validated).
+  4. Kernel test + long-prompt prefill validation.
+
+Success criterion:
+  stage 1 <= 7 ms/call at n_tokens=600 (parity with stage 2)
+  long-prompt prefill >= 74 t/s (vs 70.02 baseline)
+  kernel test 40/40 still passes
+  no decode regression
+
+Deferred priority: top bucket is routed_moe_batch (~62 ms/call,
+MemUnitBusy=93% per feedback_moe_at_memory_unit_limit.md).  Per-kernel
+MoE rewrites have ~0% ceiling, so cross-kernel fusion / quant swap /
+custom HIP graph is the bigger lever.  Only return here if MoE work
+is blocked or completed.

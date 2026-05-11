@@ -1895,6 +1895,160 @@ int main(void) {
         free(model);
     }
 
+    STEP("routed_moe_batch WMMA-gather path (n_tokens=128)");
+    {
+        /* Exercises the WMMA-gather prefill path: dispatcher requires
+         * n_tokens>=128 (sparsity gate — see ds4_rocm.c).  IQ2_XXS gate/up
+         * + Q2_K down, mid_dim multiple of 16, in_dim multiple of QK_K. */
+        const uint32_t in_dim = 256;
+        const uint32_t mid_dim = 256;
+        const uint32_t out_dim = 256;
+        const uint32_t n_used = 4;
+        const uint32_t n_total = 256;
+        const uint32_t n_tokens = 128;
+        const float clamp = 2.5f;
+        const uint32_t n_pairs = n_tokens * n_used;
+
+        const uint64_t gate_row_bytes = sizeof(moe_block_iq2_xxs);
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = sizeof(moe_block_q2_K);
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_pool = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_pool = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t model_size = gate_pool + gate_pool + down_pool;
+        uint8_t *model = (uint8_t *)calloc(1, (size_t)model_size);
+        require(model != NULL, "moe wmma model alloc");
+
+        moe_block_iq2_xxs *gate_pool_p = (moe_block_iq2_xxs *)(model + 0);
+        moe_block_iq2_xxs *up_pool_p   = (moe_block_iq2_xxs *)(model + gate_pool);
+        moe_block_q2_K    *down_pool_p = (moe_block_q2_K    *)(model + gate_pool + gate_pool);
+
+        int32_t *selected_vals = (int32_t *)malloc((size_t)n_pairs * sizeof(int32_t));
+        float   *weights_vals  = (float   *)malloc((size_t)n_pairs * sizeof(float));
+        require(selected_vals && weights_vals, "moe wmma pair alloc");
+        for (uint32_t i = 0; i < n_pairs; i++) {
+            /* (i * 13) % 251 mixes 251 unique experts across 512 pairs,
+             * ~2 pairs each on average; some experts get up to 4 pairs,
+             * exercising the multi-pair-tile inner loop. */
+            selected_vals[i] = (int32_t)((i * 13u) % 251u);
+            weights_vals[i]  = 0.05f + 0.001f * (float)i;
+        }
+        int *seen = (int *)calloc(n_total, sizeof(int));
+        require(seen != NULL, "moe wmma seen alloc");
+        for (uint32_t i = 0; i < n_pairs; i++) {
+            const int32_t e = selected_vals[i];
+            if (seen[e]) continue;
+            seen[e] = 1;
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                moe_build_iq2xxs_block(&gate_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1009u + r * 7u);
+                moe_build_iq2xxs_block(&up_pool_p[(uint64_t)e * mid_dim + r],
+                                       (uint32_t)e * 1013u + r * 11u);
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                moe_build_q2_K_block(&down_pool_p[(uint64_t)e * out_dim + r],
+                                     (uint32_t)e * 1019u + r * 13u);
+            }
+        }
+        free(seen);
+
+        float *xv = (float *)malloc((size_t)n_tokens * in_dim * sizeof(float));
+        require(xv != NULL, "moe wmma xv alloc");
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < in_dim; i++) {
+                xv[t * in_dim + i] = 0.015f * (float)((int)((i + t * 5) % 23) - 11);
+            }
+        }
+
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc((uint64_t)n_tokens * in_dim * sizeof(float));
+        ds4_metal_tensor *tsel = ds4_metal_tensor_alloc((uint64_t)n_pairs * sizeof(int32_t));
+        ds4_metal_tensor *twts = ds4_metal_tensor_alloc((uint64_t)n_pairs * sizeof(float));
+        ds4_metal_tensor *tmid = ds4_metal_tensor_alloc((uint64_t)n_tokens * n_used * mid_dim * sizeof(float));
+        ds4_metal_tensor *tout_moe = ds4_metal_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+        require(tx && tsel && twts && tmid && tout_moe, "moe wmma tensor alloc");
+        require(ds4_metal_tensor_write(tx, 0, xv, (uint64_t)n_tokens * in_dim * sizeof(float)), "moe wmma x write");
+        require(ds4_metal_tensor_write(tsel, 0, selected_vals, (uint64_t)n_pairs * sizeof(int32_t)), "moe wmma sel write");
+        require(ds4_metal_tensor_write(twts, 0, weights_vals, (uint64_t)n_pairs * sizeof(float)), "moe wmma wts write");
+
+        require(ds4_metal_routed_moe_batch_tensor(tout_moe, NULL, NULL, tmid, NULL,
+                                                   model, model_size,
+                                                   0, gate_pool, gate_pool + gate_pool,
+                                                   16u /* gate_type IQ2_XXS */,
+                                                   10u /* down_type Q2_K */,
+                                                   gate_expert_bytes, gate_row_bytes,
+                                                   down_expert_bytes, down_row_bytes,
+                                                   in_dim, mid_dim, out_dim,
+                                                   tsel, twts, n_used, clamp, tx, n_tokens),
+                "moe wmma routed_moe_batch");
+
+        float *ref_mid = (float *)malloc((size_t)n_tokens * n_used * mid_dim * sizeof(float));
+        require(ref_mid != NULL, "moe wmma ref_mid alloc");
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t s = 0; s < n_used; s++) {
+                const int32_t e = selected_vals[t * n_used + s];
+                const float w  = weights_vals[t * n_used + s];
+                for (uint32_t r = 0; r < mid_dim; r++) {
+                    float gate_v = moe_iq2xxs_dot_block_cpu(&gate_pool_p[(uint64_t)e * mid_dim + r], xv + t * in_dim);
+                    float up_v   = moe_iq2xxs_dot_block_cpu(&up_pool_p[(uint64_t)e * mid_dim + r],   xv + t * in_dim);
+                    if (gate_v > clamp) gate_v = clamp;
+                    if (up_v > clamp) up_v = clamp;
+                    if (up_v < -clamp) up_v = -clamp;
+                    const float silu = gate_v / (1.0f + expf(-gate_v));
+                    ref_mid[(t * n_used + s) * mid_dim + r] = silu * up_v * w;
+                }
+            }
+        }
+
+        float *got_mid = (float *)malloc((size_t)n_tokens * n_used * mid_dim * sizeof(float));
+        require(got_mid != NULL, "moe wmma got_mid alloc");
+        read_tensor(tmid, got_mid, n_tokens * n_used * mid_dim);
+        /* F16-quantized intermediate: each WMMA input is downcast to F16
+         * then summed in F32.  Per-element error is bounded by O(2^-10 *
+         * max|w*x|) over the in_dim=256 dot.  Measured max_err ~0.02 on
+         * this fixture; production model activations stay similar
+         * magnitude.  Tolerance 5e-2 leaves 2x headroom. */
+        for (uint32_t i = 0; i < n_tokens * n_used * mid_dim; i++) {
+            require(nearf(got_mid[i], ref_mid[i], 5e-2f), "moe wmma mid value");
+        }
+
+        float *ref_out = (float *)calloc((size_t)n_tokens * out_dim, sizeof(float));
+        require(ref_out != NULL, "moe wmma ref_out alloc");
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float acc = 0.0f;
+                for (uint32_t s = 0; s < n_used; s++) {
+                    const int32_t e = selected_vals[t * n_used + s];
+                    acc += moe_q2_K_dot_block_cpu(&down_pool_p[(uint64_t)e * out_dim + r],
+                                                  ref_mid + (uint64_t)(t * n_used + s) * mid_dim);
+                }
+                ref_out[t * out_dim + r] = acc;
+            }
+        }
+        float *got_out = (float *)malloc((size_t)n_tokens * out_dim * sizeof(float));
+        require(got_out != NULL, "moe wmma got_out alloc");
+        read_tensor(tout_moe, got_out, n_tokens * out_dim);
+        /* Out is a Q2_K dot over n_used=4 slots' mid[] values; F16 mid
+         * errors compound through the down-projection sum.  Tolerance 5e-1
+         * is loose vs production logits noise floor. */
+        for (uint32_t i = 0; i < n_tokens * out_dim; i++) {
+            require(nearf(got_out[i], ref_out[i], 5e-1f), "moe wmma out value");
+        }
+
+        free(got_out);
+        free(ref_out);
+        free(got_mid);
+        free(ref_mid);
+        free(xv);
+        free(weights_vals);
+        free(selected_vals);
+        ds4_metal_tensor_free(tout_moe);
+        ds4_metal_tensor_free(tmid);
+        ds4_metal_tensor_free(twts);
+        ds4_metal_tensor_free(tsel);
+        ds4_metal_tensor_free(tx);
+        free(model);
+    }
+
     STEP("routed_moe_one with Q4_K gate/up format");
     {
         /* Mirrors the IQ2_XXS test but uses Q4_K for gate/up to exercise that

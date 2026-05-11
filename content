@@ -1,0 +1,40 @@
+MTP ROCm: re-bench negative again after WMMA n_tok>=2 (closed)
+
+CLOSED 2026-05-11 negative. Re-bench after commit eb99f50 (WMMA threshold
+lowered to n_tok>=2) still regresses MTP decode at all K.
+
+Measurements (ds4flash + DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32, --temp 0 --seed 42,
+standard validation prompt, -n 200):
+
+  baseline               prefill 57.64 t/s  decode 15.73 t/s
+  --mtp-draft 2          prefill 58.82 t/s  decode 14.01 t/s   -10.9%
+  --mtp-draft 2 quality  prefill 58.39 t/s  decode 12.82 t/s   -18.5%
+  --mtp-draft 4          prefill 58.43 t/s  decode  6.65 t/s   -57.7%
+  --mtp-draft 8          prefill 58.54 t/s  decode  4.88 t/s   -69.0%
+
+K=2 improved marginally (prior -13.6% -> -10.9%); K=4 and K=8 essentially
+unchanged from prior -61%/-78%.
+
+DS4_MTP_TIMING decomposition (K=2):
+  draft (MTP forward):          ~6 ms / token
+  verify-batch-2 (n_tok=2):     ~120 ms (1.9x baseline ~63 ms decode)
+  margin-skip 1-tok verify:     ~62 ms (== baseline)
+  partial-accept (prefix1):     ~127 ms total / 1 token committed
+
+WMMA-at-n_tok=2 microbench wins (3-9x on (4096,4096) Q8_0/F16) do NOT
+translate to wall-clock decode wins because decode is launch-overhead
+bound, not FLOPS-bound (29k matmul_q8_0 + 27k rope_tail + 21k rms_norm
+calls per 200-tok run).
+
+See project_mtp_rocm_negative.md for full decomposition. Memory updated
+with 2026-05-11 numbers.
+
+Default decode remains --mtp-draft 1 (off). Do NOT change.
+
+Future structural paths if MTP is revisited:
+  1. HIP-graph capture for the verify pass (~0.3 ms savings est, not enough alone)
+  2. Cross-kernel fusion for verify-2 (large surface, untested)
+  3. Faster MTP draft (<2 ms; currently 6 ms; hard)
+
+Related: project_mtp_rocm_negative.md, feedback_wmma_paths.md,
+feedback_hip_graph_low_value.md, commit eb99f50.

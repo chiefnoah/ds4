@@ -1,0 +1,38 @@
+attn_out_q8_batch stage 1: further wins past grid swap
+
+After commit 37ba6c9 the stage 1 grid-swap landed (rank, group, token):
+  stage 1: 14.68 -> 10.25 ms/call (-30%) on n_tokens=600
+  stage 2:  7.89 ms/call (unchanged)
+  prefill: 51 -> 70.6 t/s cumulative this session
+
+Stage 1 is still 30% slower than stage 2 per call despite identical
+FLOPs and weight bytes.  Remaining gap is the strided heads layout
+(128 KB token stride for stage 1 vs 32 KB for stage 2).  Further
+optimizations to try:
+
+1. LDS staging of activations in 32 KB-chunked K tiles to ensure
+   each 32-token slab is loaded once per (token tile, group) and
+   reused across rank tiles.  Hypothesis: even with the cache-edge
+   working set the actual DRAM activation reads should be ~1 MB
+   per (token, group); a more disciplined load pattern may halve
+   the time.
+
+2. Wide-rank tile (32 rank rows per block instead of 16) to halve
+   block count.  Needs 4 WMMA accumulators per block; check VGPR
+   pressure on gfx1151 (limit ~256 before spills).
+
+3. 64-token wide tile (vs current 32) — 2x weight reuse per block
+   but trailing-partial waste at n_tokens=600 is only ~40% of one
+   tile.
+
+4. Restructure FA prefill to write heads in [group, token, group_dim]
+   layout directly.  Token stride within a group drops to 16 KB.
+   Risks: touches multiple FA variants (prefill, decode, batch).
+
+Validation gate: kernel test + --seed 42 --temp 0 long prompt.
+Profile with DS4_ROCM_SYNC_EACH=1 DS4_ROCM_TIME=1 and confirm
+attn_out_low_q8_wmma_wide_kernel drops in ms/call.
+
+Note: top bucket is now routed_moe_batch (~62 ms/call) and
+matmul_q8_0_tensor (1.34 ms/call avg, ~600 calls).  attn_out stage 1
+is the third-largest at 10.25 ms/call × 43 = 440 ms total per prefill.

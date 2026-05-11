@@ -1,0 +1,28 @@
+WMMA-tile attention_output_q8_batch stage 2 fusion
+
+Status: open. Next-tier prefill lever after WMMA-gather MoE landed.
+
+Profile after WMMA MoE (long prompt n_tokens=855):
+  routed_moe_batch      31.81%  96 ms/call (was 159; -40%)
+  matmul_q8_0           22.59%  4.27 ms/call (avg, mostly QKV + shared)
+  attention_output_q8   22.06%  67 ms/call
+  attention_prefill     11.38%  36 ms/call (BR=16 already)
+
+attention_output_q8_batch is 2 sequential matmuls:
+  stage 1: Wa @ heads  (per-group, n_groups=8, group_dim=4096, rank=1024)
+  stage 2: Wb @ low    (single matmul: in=8192, out=4096)
+
+Both already use WMMA q8_0 with wide-tile.  Yet stage 2 alone should hit
+~3 ms at WMMA peak (57 GFLOPs / 27.6 TFLOPS).  Actual stage 1+2 = 67 ms.
+Something is wrong - likely activation-read overhead or grid sizing.
+
+Next steps:
+1. Profile stage 1 vs stage 2 separately.
+2. Verify wide_kernel is firing for stage 2 (in_dim=8192 >= 6144 yes).
+3. Try fusing stage 1 + stage 2 into one kernel - the intermediate low
+   tensor does not need to materialize.
+
+Expected impact if stage 2 hits WMMA peak: ~2.4 sec saved across 43 layers.
+At current 67 t/s long prompt -> ~85-95 t/s.
+
+Validation: kernel test + end-to-end --seed 42 --temp 0.

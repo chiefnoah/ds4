@@ -1,0 +1,23 @@
+Investigate fewer active experts (n_used 6 -> 4 or 3) - speculative quality tradeoff
+
+STATUS: open exploration.  Cuts MoE wall linearly but quality risk.
+
+CONTEXT: DSv4 uses n_used=6 experts per token out of 256.  routed_moe
+wall = 46% of prefill.  Cutting to 4 = -15% wall, to 3 = -23% wall.
+
+QUALITY: DS authors chose 6 for accuracy; cutting reduces capacity
+per token.  Test by measuring perplexity on a held-out test set.
+
+PLAN:
+  1. Add a runtime flag `--n-experts-used N` clamping the router top-k.
+  2. Run held-out perplexity at n_used=6, 5, 4, 3.
+  3. Run subjective coherence on chat-style prompts.
+  4. If quality acceptable at n_used=4, document the tradeoff and use
+     as a "fast" mode.
+
+SUCCESS CRITERIA:
+  - Perplexity delta < 0.5 BPB at chosen n_used.
+  - Long prefill scales as expected (+10 to +15 t/s at n_used=4).
+
+NOTE: this is a separate "fast vs slow" preset, not a default change.
+Keeps full quality available.

@@ -1,0 +1,72 @@
+Cross-layer persistent kernel: fuse MoE gate_up/down across layer boundaries
+
+STATUS: design sketch, untried.  Speculative next swing at 150 t/s prefill
+ceiling.  Builds on tsk-71 (current ceiling 81-91 t/s) and the persistent
+gate_up kernel landed in commit 155032e.
+
+GOAL: a single persistent kernel that processes MoE gate_up + down for
+layer L AND prefetches/computes the attention norm + Q/KV projections for
+layer L+1, keeping intermediate state (mid, router selections, etc.) in
+LDS or registers across what is currently a layer-boundary kernel launch.
+
+WHY this is the next credible structural lever:
+- The non-cross-layer persistent kernel regresses (-1.7 to -2.7%) because
+  per-tile work is too small to amortize loop overhead, and there is no
+  state to share within a layer (256 experts x ~4-10 pairs each, pair tile
+  saturates in 1 outer iter -- see feedback_persistent_moe_no_win.md).
+- Cross-LAYER persistence is different.  The current layer-major prefill
+  schedule kicks off a new kernel for every per-layer op, and the GPU is
+  99.7% dispatch-busy single-stream (per feedback_no_multistream_win_uma.md).
+  Each kernel boundary forces global memory round-trips for mid, ffn_out,
+  attn_norm, etc.
+- A persistent kernel that holds activation tiles in LDS across layers
+  could eliminate the global write/read for layer-N out -> layer-(N+1) in.
+  This is the only remaining lever that touches more than per-kernel work.
+
+EVIDENCE points:
+- routed_moe_batch_tensor: 1.747 s = 64% of wall at n_tok=184 (final state,
+  WMMA_I8 default on for Q8_0; see commits f83b8bc, 8c08a77, 221ad0b).
+- routed MoE bytes per layer: ~1.19 GiB (IQ2_XXS gate+up + Q2_K down).
+- mid buffer (intermediate gate_up -> down) is ~5 MiB/layer in global,
+  which currently round-trips through L2/IC.
+- 32 MB Infinity Cache could hold mid + one expert's weights + adjacent
+  layer's first-stage activations.
+
+NEXT STEPS (in order):
+1. Scope the in-kernel state machine: one persistent block walks all
+   (e_dense, row_block) tiles for layer L, accumulates mid in registers
+   per (token, expert) pair, then dispatches the down matmul + atomicAdd
+   to out[token] without leaving the kernel.  This first step replaces
+   the gate_up + down kernel boundary.
+2. Measure step 1 vs current routed_moe_batch_tensor (1.747 s baseline).
+   Target -10..-20%.  If it regresses, abort (same family as tsk-71).
+3. If step 1 wins, extend the kernel to also include layer L+1's
+   attn_norm + Q/KV projection.  Requires the per-token hc-mix and
+   sinkhorn weighted-sum to be expressible per-token in-kernel.
+4. Validate the kernel test (must end with OK, 40 tests) and run the
+   standard validation gate prompt for end-to-end coherence.
+
+VALIDATION COMMANDS:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test  # must end OK
+- time ./ds4 --backend rocm -p \"Briefly explain what makes the AMD Strix
+  Halo APU well-suited for running large language models on a single
+  chip.\" -n 200 --temp 0 --seed 42
+- bench: ./ds4 --backend rocm -p \"\$(cat /tmp/long_prompt.txt)\" -n 1
+  --temp 0 --seed 42  (target prefill > 91 t/s)
+
+RISKS:
+- LDS budget is 16 KB/block on RDNA 3.5; mid for one (token, expert)
+  pair is mid_dim * 4 = 8 KB if held as fp32.  Tight.
+- atomicAdd contention for out[token] could throttle the kernel.
+- Cross-layer fusion likely requires reordering work so layer N+1's
+  attn norm sees layer N's out before all layers finish.  Wave-level
+  sync is needed but cooperative groups grid-sync is expensive.
+- May need to restructure ds4.c's per-layer dispatch to call a single
+  fused kernel instead of the current per-op sequence.
+
+RELATED:
+- tsk-71 (current ceiling 81-91 t/s, closed)
+- feedback_persistent_moe_no_win.md
+- feedback_no_multistream_win_uma.md (rules out multi-stream alternative)
+- feedback_prefill_ceiling_locked_weights.md

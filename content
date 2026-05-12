@@ -1,0 +1,23 @@
+Tune DS4_ROCM_MOE_PERSISTENT_N after LDS_W landing
+
+DS4_ROCM_MOE_PERSISTENT_N is currently 320 (40 CUs * 8 waves/CU resident).  That value was tuned before LDS_W landed (commit ba7d59f), which changed the kernel's LDS footprint from ~2.1 KiB/block to ~4.3 KiB/block.  Compiler may now be downgrading occupancy under the hood; explicit N tuning could reclaim some perf.
+
+STATUS: open.  Lower priority than tsk-83 (down qs LDS) and tsk-84 (WMMA_I8 re-bench).
+
+GOAL: find the post-LDS_W optimal N.  Threshold to land: >= +0.5% prefill.
+
+NEXT STEPS:
+1. Sweep DS4_ROCM_MOE_PERSISTENT_N in {160, 240, 320, 400, 480} — 3 runs each, /tmp/long_prompt.txt -n 1 --temp 0 --seed 42.
+2. If a non-320 value wins by >= 0.5%, update the default in g_moe_persist_n.
+3. Also worth: profile VGPR count and actual blocks/CU resident with rocprofv3 to verify occupancy state.
+
+VALIDATION GATES:
+- Existing build, just env-var sweep
+- ./ds4_rocm_kernel_test (smoke)
+- 3x prefill bench per N value
+
+RELATED:
+- feedback_persistent_moe_no_win.md (reversed by current win)
+- feedback_moe_gate_up_lds_w_win.md (the LDS_W landing that may have changed occupancy)
+
+UPPER BOUND: 1% wall.  Quick experiment, low-risk.

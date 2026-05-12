@@ -1,0 +1,31 @@
+Re-bench WMMA_I8 MoE gate_up now that LDS_W landed
+
+Re-evaluate DS4_ROCM_MOE_WMMA_I8 for routed-MoE gate_up after the LDS_W kernel landed (commit ba7d59f).
+
+STATUS: open.
+
+CONTEXT: WMMA_I8 path for MoE gate_up was tested previously and gave ~0% (feedback_wmma_i8_path.md): "Q8_0 matmul + attn_out_low_wide default on; MoE I8 opt-in only (bottleneck is memory-instruction throughput, not scale-mul VALU)".  That measurement was taken BEFORE the LDS_W win which now reduces VMEM instruction count.  The bottleneck mix may have shifted.
+
+The I8 path is a parallel kernel rocm_moe_gate_up_iq2xxs_wmma_i8_kernel (and _lds_grid variant) which microquantizes activations once per layer then runs v_wmma_i32_16x16x16_iu8.  It elides per-weight fp16 scale mults but doesn't currently combine with LDS_W staging.
+
+GOAL: verify whether enabling I8 still gives 0% or has shifted positive post-LDS_W.  If positive, port the LDS_W pattern (LDS-stage iq2 blocks once per bi) to the I8 kernel.
+
+NEXT STEPS:
+1. Bench with DS4_ROCM_MOE_WMMA_I8=1 enabled.  5 runs on /tmp/long_prompt.txt.  Compare to current default (LDS_W only).
+2. If I8 wins, also write rocm_moe_gate_up_iq2xxs_wmma_i8_lds_w_kernel mirroring the F16 _w pattern, and bench that combination.
+3. If neither wins, close as confirmed-no-win.
+
+Threshold to land: >= +1.5% prefill.
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test (40 OK)
+- 5x prefill bench: /tmp/long_prompt.txt -n 1 --temp 0 --seed 42
+- Coherence: validation prompt -n 200
+
+RELATED:
+- feedback_wmma_i8_path.md (the prior negative measurement)
+- feedback_moe_gate_up_lds_w_win.md (the LDS_W landing that may have shifted the bottleneck)
+- ds4_rocm.c rocm_moe_gate_up_iq2xxs_wmma_i8_kernel (line ~9296 in current source)
+
+UPPER BOUND: 2% wall.

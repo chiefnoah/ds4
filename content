@@ -1,0 +1,37 @@
+LDS-stage Q2_K qs in routed-MoE down kernel
+
+LDS-stage the 64-byte qs payload per Q2_K block in rocm_moe_down_q2k_wmma_persistent_lds_scales_kernel.
+
+STATUS: open.  Direct follow-on to commits 21836a5 (attn_out _lds) and ba7d59f (gate_up _w).
+
+CONTEXT: down kernel is 20.73% of GPU wall (7907 us/call at n_tok=184).  It already stages d / dmin / scales[16] in LDS (commit a4182b4) but the 64-byte qs region per Q2_K block is still hitting global per lane.  Lanes L and L+16 share down_row_p (safe_row = row_base + (lane & 15)) so qs reads are 2x redundant — same structural lever that just won +1.97% prefill on gate_up.
+
+Per the L1-hot-data lesson (feedback_lds_staging_not_for_l1_hot_data.md): Q2_K qs reads are divergent across 16 rows (each lane reads a different cache line per bi), so they are L1-cold and SHOULD benefit from staging.  Do NOT extend to staging mid_slot — that's the sequential-per-lane activation path that flopped on gate_up _wx.
+
+File: ds4_rocm.c rocm_moe_down_q2k_wmma_persistent_lds_scales_kernel (search by name).  The base non-persistent variant rocm_moe_down_q2k_wmma_lds_scales_kernel mirrors it for the non-persistent dispatch path; both should be updated.
+
+GOAL: positive prefill delta from LDS-staging the qs.  Threshold to land: >= +0.5% prefill (= ~3% kernel speedup; lower bar than gate_up because down is half the wall fraction).
+
+NEXT STEPS:
+1. Add 16x64-byte qs LDS array to the persistent_lds_scales kernel.
+2. Cooperative stage on bi boundary: lanes 0..15 each load their row's qs[0..63] (64 bytes per lane).  Lanes 16..31 idle on stage (matches the _w pattern; alternatively split across 32 lanes if useful, but _w showed 32-lane split didn't help).
+3. ONE __syncthreads after staging.  CRITICAL: do NOT add a trailing __syncthreads at the end of the inn loop — that pattern killed gate_up by -5% (feedback_moe_gate_up_lds_w_win.md).
+4. Replace `q = xb->qs + k*32 + half*16` with `q = &lds_qs[row_in_tile][k*32 + half*16]`.
+5. Bank-conflict check the layout: 64 bytes per row = 16 dwords.  Row stride 16 dwords causes 2-way conflicts on 16-byte reads.  Pad to 17 dwords per row if perf falls short.
+
+VALIDATION GATES:
+- DS4_ROCM=1 make ds4 ds4_rocm_kernel_test
+- ./ds4_rocm_kernel_test (40 tests OK)
+- 5 baseline runs + 5 LDS runs on /tmp/long_prompt.txt -n 1 --temp 0 --seed 42
+- PMC: rocprofv3 --kernel-trace --stats; compare avg us/call for rocm_moe_down_q2k_wmma_persistent_lds_scales*
+
+Env gate: DS4_ROCM_MOE_DOWN_LDS_QS (default OFF initially, flip to ON if landing).
+
+RELATED:
+- feedback_attn_out_lds_staging_win.md (the template lever)
+- feedback_moe_gate_up_lds_w_win.md (gate_up _w landed; same pattern)
+- feedback_lds_staging_not_for_l1_hot_data.md (DO NOT extend to mid_slot)
+- feedback_down_persistent_lds_scales_win.md (the existing LDS-scales work this builds on)
+- commit ba7d59f (gate_up _w reference implementation)
+
+UPPER BOUND: 1% wall.  down is 20.73% wall; a 5% kernel speedup is ~1% wall.

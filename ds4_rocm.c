@@ -966,6 +966,100 @@ static int rocm_act_q8_scratch_ensure(uint64_t needed) {
 typedef int8_t rocm_v16i8 __attribute__((ext_vector_type(16)));
 typedef int    rocm_v8i32 __attribute__((ext_vector_type(8)));
 
+/* tsk-86: LDS-staged twin of rocm_matmul_q8_0_wmma_i8_kernel.  Lanes
+ * 0..15 and 16..31 share rows (row_in_tile = lane & 15) and lanes
+ * 0..15 and 16..31 share x cols (col_in_tile = lane & 15), so both the
+ * weight block (34 B) and the x block (34 B) are 2x redundant per K
+ * iter.  Cooperative stage: lanes 0..15 stage weight for row=lane,
+ * lanes 16..31 stage x for col=lane-16.  Single leading __syncthreads
+ * after stage; intentionally no trailing sync (per gate_up _w pattern,
+ * the redundant end-of-loop sync costs -5% in single-wave blocks). */
+__global__ __launch_bounds__(32, 8)
+static void rocm_matmul_q8_0_wmma_i8_lds_kernel(
+        float *out, const uint8_t *w, const uint8_t *x_q8,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ uint16_t lds_w_scale[16];
+    __shared__ uint32_t lds_w_qs[16][9];   /* 8 dwords + 1 pad */
+    __shared__ uint16_t lds_x_scale[16];
+    __shared__ uint32_t lds_x_qs[16][9];
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t r0   = blockIdx.x * 16u;
+    const uint32_t t0   = blockIdx.y * 16u;
+    if (r0 >= out_dim || t0 >= n_tok) return;
+
+    const uint32_t row_in_tile = lane & 15u;
+    const uint32_t col_in_tile = lane & 15u;
+    const uint32_t out_row = r0 + row_in_tile;
+    const uint32_t tok     = t0 + col_in_tile;
+    const uint32_t blocks  = in_dim >> 5;
+    const uint64_t x_row_bytes = (uint64_t)blocks * 34ull;
+
+    const uint32_t safe_row = (out_row < out_dim) ? out_row : (out_dim - 1u);
+    const uint32_t safe_tok = (tok     < n_tok)  ? tok     : (n_tok   - 1u);
+    const uint8_t *wr = w     + (uint64_t)safe_row * row_bytes;
+    const uint8_t *xr = x_q8  + (uint64_t)safe_tok * x_row_bytes;
+
+    rocm_v8f32 c = {0,0,0,0,0,0,0,0};
+
+    for (uint32_t b = 0; b < blocks; b++) {
+        if (lane < 16u) {
+            const uint8_t *wblk_src = wr + (uint64_t)b * 34u;
+            lds_w_scale[lane] = *(const uint16_t *)wblk_src;
+            const uint32_t *qs_src = (const uint32_t *)(wblk_src + 2);
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) lds_w_qs[lane][i] = qs_src[i];
+        } else {
+            const uint32_t col = lane - 16u;
+            const uint8_t *xblk_src = xr + (uint64_t)b * 34u;
+            lds_x_scale[col] = *(const uint16_t *)xblk_src;
+            const uint32_t *qs_src = (const uint32_t *)(xblk_src + 2);
+            _Pragma("unroll")
+            for (int i = 0; i < 8; i++) lds_x_qs[col][i] = qs_src[i];
+        }
+        __syncthreads();
+
+        const float w_scale = rocm_f16_to_f32(lds_w_scale[row_in_tile]);
+        const float x_scale = rocm_f16_to_f32(lds_x_scale[col_in_tile]);
+        const float combined = w_scale * x_scale;
+        const int8_t *wqs = (const int8_t *)&lds_w_qs[row_in_tile][0];
+        const int8_t *xqs = (const int8_t *)&lds_x_qs[col_in_tile][0];
+
+        rocm_v16i8 a, bv;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a[kk]  = wqs[kk];
+            bv[kk] = xqs[kk];
+        }
+        rocm_v8i32 acc1 = {0,0,0,0,0,0,0,0};
+        acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bv, acc1, false);
+
+        rocm_v16i8 a2, bv2;
+        _Pragma("unroll")
+        for (int kk = 0; kk < 16; kk++) {
+            a2[kk]  = wqs[16 + kk];
+            bv2[kk] = xqs[16 + kk];
+        }
+        rocm_v8i32 acc2 = {0,0,0,0,0,0,0,0};
+        acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, bv2, acc2, false);
+
+        _Pragma("unroll")
+        for (int i = 0; i < 8; i++) {
+            c[i] += (float)(acc1[i] + acc2[i]) * combined;
+        }
+    }
+
+    _Pragma("unroll")
+    for (int i = 0; i < 8; i++) {
+        const uint32_t r = r0 + (lane / 16u) + (uint32_t)i * 2u;
+        const uint32_t t = t0 + col_in_tile;
+        if (r < out_dim && t < n_tok) {
+            out[(uint64_t)t * out_dim + r] = c[i];
+        }
+    }
+}
+
 __global__ static void rocm_matmul_q8_0_wmma_i8_kernel(
         float *out, const uint8_t *w, const uint8_t *x_q8,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
@@ -2920,6 +3014,18 @@ int ds4_metal_matmul_q8_0_tensor(
                 const char *env = getenv("DS4_ROCM_WMMA_I8");
                 g_wmma_i8_enabled_cached = (env && env[0] == '0') ? 0 : 1;
             }
+            /* DS4_ROCM_MATMUL_Q8_LDS: LDS-staged Q8_0 WMMA_I8 path.
+             * Cooperative stage of weight + x blocks once per K iter
+             * (lanes 0..15 stage weight for row=lane, lanes 16..31 stage
+             * x for col=lane-16; same L/L+16 lever as attn_out _lds and
+             * down _qs).  Default ON: microbench shows -20% kernel and
+             * end-to-end +2.8% prefill (125.31 -> 128.84 t/s).  Set =0
+             * to revert to the non-staged kernel. */
+            static int g_matmul_q8_lds_cached = -1;
+            if (g_matmul_q8_lds_cached < 0) {
+                const char *env = getenv("DS4_ROCM_MATMUL_Q8_LDS");
+                g_matmul_q8_lds_cached = (env && env[0] == '0') ? 0 : 1;
+            }
             int dispatched_wmma_i8 = 0;
             if (wmma_ok && g_wmma_i8_enabled_cached) {
                 const uint32_t blocks_per_row = (uint32_t)(in_dim / 32u);
@@ -2935,15 +3041,27 @@ int ds4_metal_matmul_q8_0_tensor(
                     const dim3 wblock(32u);
                     const dim3 wgrid((unsigned)((out_dim + 15u) / 16u),
                                      (unsigned)((n_tok   + 15u) / 16u));
-                    hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_i8_kernel,
-                                       wgrid, wblock, 0, g_stream,
-                                       (float *)tensor_u8(out),
-                                       (const uint8_t *)w_dev,
-                                       g_act_q8_scratch,
-                                       (uint32_t)in_dim, (uint32_t)out_dim,
-                                       (uint32_t)n_tok, row_bytes);
-                    ok = rocm_launch_done("Q8_0 matmul wmma_i8 launch",
-                                          "Q8_0 matmul wmma_i8 completion");
+                    if (g_matmul_q8_lds_cached) {
+                        hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_i8_lds_kernel,
+                                           wgrid, wblock, 0, g_stream,
+                                           (float *)tensor_u8(out),
+                                           (const uint8_t *)w_dev,
+                                           g_act_q8_scratch,
+                                           (uint32_t)in_dim, (uint32_t)out_dim,
+                                           (uint32_t)n_tok, row_bytes);
+                        ok = rocm_launch_done("Q8_0 matmul wmma_i8_lds launch",
+                                              "Q8_0 matmul wmma_i8_lds completion");
+                    } else {
+                        hipLaunchKernelGGL(rocm_matmul_q8_0_wmma_i8_kernel,
+                                           wgrid, wblock, 0, g_stream,
+                                           (float *)tensor_u8(out),
+                                           (const uint8_t *)w_dev,
+                                           g_act_q8_scratch,
+                                           (uint32_t)in_dim, (uint32_t)out_dim,
+                                           (uint32_t)n_tok, row_bytes);
+                        ok = rocm_launch_done("Q8_0 matmul wmma_i8 launch",
+                                              "Q8_0 matmul wmma_i8 completion");
+                    }
                     dispatched_wmma_i8 = 1;
                 }
                 /* fall through to WMMA_F16 if scratch alloc failed */
